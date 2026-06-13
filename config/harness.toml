@@ -6,7 +6,7 @@ target_dir   = "/work/target"
 scratch_root = "/work/scratch"
 out_dir      = "/work/out"
 # Max hunters running at once.
-concurrency  = 50
+concurrency  =10
 # Per-agent wall-clock timeout.
 agent_timeout_secs = 1800
 
