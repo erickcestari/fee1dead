@@ -75,10 +75,21 @@ pub struct RunConfig {
     /// Per-agent wall-clock timeout in seconds.
     #[serde(default = "default_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// Fork each hunter from the recon agent's session so it inherits recon's
+    /// codebase context instead of re-reading the architecture doc. Only the
+    /// claude-code provider supports this; others ignore it. Forks run in
+    /// recon's directory, so recon's history is a shared, cached prefix across
+    /// hunters (cache-read rates) when they start within the cache window.
+    #[serde(default = "default_fork_hunters")]
+    pub fork_hunters: bool,
 }
 
 fn default_concurrency() -> usize {
     50
+}
+
+fn default_fork_hunters() -> bool {
+    true
 }
 
 fn default_timeout_secs() -> u64 {
@@ -196,7 +207,10 @@ impl Config {
         match self.report.sink {
             SinkKind::Sqlite | SinkKind::Jsonl => {
                 if self.report.path.is_none() {
-                    bail!("report.path is required for the {:?} sink", self.report.sink);
+                    bail!(
+                        "report.path is required for the {:?} sink",
+                        self.report.sink
+                    );
                 }
             }
             SinkKind::Http => {

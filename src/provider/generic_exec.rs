@@ -86,6 +86,8 @@ impl AgentRunner for ExecRunner {
             structured,
             exit_code,
             cost_usd: None,
+            // Exec providers have no session concept; nothing to fork from.
+            session_id: None,
         })
     }
 }
@@ -109,9 +111,6 @@ mod tests {
             ExecOutput::Text,
         );
         let args = r.render_args("find bugs", &PathBuf::from("/work/scratch/t1"));
-        assert_eq!(
-            args,
-            vec!["exec", "--cd", "/work/scratch/t1", "find bugs"]
-        );
+        assert_eq!(args, vec!["exec", "--cd", "/work/scratch/t1", "find bugs"]);
     }
 }

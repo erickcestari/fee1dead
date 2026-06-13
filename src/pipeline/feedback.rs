@@ -26,19 +26,24 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let validations: Vec<Validation> = ctx.artifacts.read_jsonl(names::VALIDATED)?;
     let gaps: Vec<GapMarker> = ctx.artifacts.read_jsonl(names::GAPS)?;
 
-    let by_id: HashMap<&str, &Finding> =
-        candidates.iter().map(|f| (f.id.as_str(), f)).collect();
+    let by_id: HashMap<&str, &Finding> = candidates.iter().map(|f| (f.id.as_str(), f)).collect();
 
     // New seeds from this run, freshest signal first.
     let mut new_seeds: Vec<Task> = Vec::new();
 
     // Variant hunts around confirmed bugs.
-    for v in validations.iter().filter(|v| v.verdict == Verdict::TruePositive) {
+    for v in validations
+        .iter()
+        .filter(|v| v.verdict == Verdict::TruePositive)
+    {
         if let Some(f) = by_id.get(v.finding_id.as_str()) {
             new_seeds.push(Task {
                 id: String::new(), // assigned after dedupe
                 attack_class: f.attack_class.clone(),
-                scope_hint: format!("variants of confirmed bug \"{}\" near {}", f.title, f.location),
+                scope_hint: format!(
+                    "variants of confirmed bug \"{}\" near {}",
+                    f.title, f.location
+                ),
                 origin: TaskOrigin::Feedback,
             });
         }
@@ -72,7 +77,10 @@ fn merge_and_cap(new_seeds: Vec<Task>, existing: Vec<Task>, max: usize) -> Vec<T
         if out.len() >= max {
             break;
         }
-        let key = (seed.attack_class.to_lowercase(), seed.scope_hint.to_lowercase());
+        let key = (
+            seed.attack_class.to_lowercase(),
+            seed.scope_hint.to_lowercase(),
+        );
         if seen.insert(key) {
             out.push(seed);
         }

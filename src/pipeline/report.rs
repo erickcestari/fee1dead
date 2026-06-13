@@ -94,11 +94,11 @@ async fn build_report(
             skills: Vec::new(),
             timeout,
             max_turns: None,
+            resume: None,
         };
 
         let result = ctx.runner.run(req).await?;
-        let json = extract_json_block(&result.stdout)
-            .context("report output had no json block")?;
+        let json = extract_json_block(&result.stdout).context("report output had no json block")?;
         let payload: Value = match serde_json::from_str(json) {
             Ok(v) => v,
             Err(e) => {

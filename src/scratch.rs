@@ -1,7 +1,9 @@
 //! Per-task scratch directories.
 //!
-//! Each hunter runs in its own scratch dir so concurrent tasks cannot clobber
-//! each other's proof-of-concept code. The dir is the agent's working dir.
+//! Each hunter gets its own scratch dir so concurrent tasks cannot clobber each
+//! other's proof-of-concept code. A cold hunter runs in it directly; a hunter
+//! forked from recon's session runs in the target dir and writes PoCs here via
+//! an additional allowed directory.
 
 use std::path::{Path, PathBuf};
 
@@ -36,7 +38,13 @@ impl ScratchRoot {
 /// Keep task ids filesystem-safe without collapsing distinct ids.
 fn sanitize(id: &str) -> String {
     id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

@@ -25,13 +25,17 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     if candidates.is_empty() {
         warn!("no candidate findings to validate");
-        ctx.artifacts.write_jsonl::<Validation>(names::VALIDATED, &[])?;
+        ctx.artifacts
+            .write_jsonl::<Validation>(names::VALIDATED, &[])?;
         return Ok(());
     }
 
     let target = ctx.config.run.target_dir.to_string_lossy().into_owned();
     let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
-    let skills: Vec<String> = skills::skills_for("validate").iter().map(|s| s.to_string()).collect();
+    let skills: Vec<String> = skills::skills_for("validate")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let mut validations = Vec::new();
     let (mut confirmed, mut refuted) = (0usize, 0usize);
@@ -54,6 +58,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             skills: skills.clone(),
             timeout,
             max_turns: None,
+            resume: None,
         };
 
         match validate_one(ctx, req).await {
@@ -81,7 +86,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
 async fn validate_one(ctx: &StageCtx, req: AgentRequest) -> Result<RawVerdict> {
     let result = ctx.runner.run(req).await?;
-    let json = extract_json_block(&result.stdout)
-        .context("validator output had no json block")?;
+    let json = extract_json_block(&result.stdout).context("validator output had no json block")?;
     serde_json::from_str(json).context("validator output was not valid json")
 }

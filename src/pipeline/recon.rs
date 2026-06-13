@@ -32,19 +32,30 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         system: None,
         working_dir: target.clone(),
         allowed_tools: Vec::new(),
-        skills: skills::skills_for("recon").iter().map(|s| s.to_string()).collect(),
+        skills: skills::skills_for("recon")
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         timeout: Duration::from_secs(ctx.config.run.agent_timeout_secs),
         max_turns: None,
+        resume: None,
     };
 
     let result = ctx.runner.run(req).await.context("recon agent failed")?;
 
     // The whole response is the architecture document.
-    ctx.artifacts.write_text(names::ARCHITECTURE, &result.stdout)?;
+    ctx.artifacts
+        .write_text(names::ARCHITECTURE, &result.stdout)?;
+
+    // Persist recon's session id so hunters can fork from its codebase context.
+    // Providers without a session concept leave this unset; hunters then fall
+    // back to the architecture doc alone.
+    if let Some(session_id) = &result.session_id {
+        ctx.artifacts.write_text(names::RECON_SESSION, session_id)?;
+    }
 
     // Parse the task queue from the embedded json block.
-    let json = extract_json_block(&result.stdout)
-        .context("recon output had no json task block")?;
+    let json = extract_json_block(&result.stdout).context("recon output had no json task block")?;
     let seeds: Vec<SeedTask> =
         serde_json::from_str(json).context("recon task block was not a valid task array")?;
 
@@ -62,7 +73,12 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let fresh = tasks.len();
     let carried = merge_feedback_seeds(ctx, &mut tasks)?;
 
-    info!(fresh, carried, total = tasks.len(), "recon assembled hunt queue");
+    info!(
+        fresh,
+        carried,
+        total = tasks.len(),
+        "recon assembled hunt queue"
+    );
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
     Ok(())
 }
@@ -82,7 +98,10 @@ fn merge_feedback_seeds(ctx: &StageCtx, tasks: &mut Vec<Task>) -> Result<usize> 
 
     let mut carried = 0;
     for seed in seeds {
-        let key = (seed.attack_class.to_lowercase(), seed.scope_hint.to_lowercase());
+        let key = (
+            seed.attack_class.to_lowercase(),
+            seed.scope_hint.to_lowercase(),
+        );
         if seen.insert(key) {
             tasks.push(seed);
             carried += 1;

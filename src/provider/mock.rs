@@ -17,6 +17,8 @@ use super::{AgentRequest, AgentResult, AgentRunner};
 pub struct CannedReply {
     pub match_substr: Option<String>,
     pub stdout: String,
+    /// Session id this reply reports, mimicking a real provider's envelope.
+    pub session_id: Option<String>,
 }
 
 pub struct MockRunner {
@@ -24,6 +26,9 @@ pub struct MockRunner {
     replies: Vec<CannedReply>,
     /// Records every prompt seen, for assertions.
     pub seen: Mutex<VecDeque<String>>,
+    /// Records the session id each request asked to fork from (None when not
+    /// forking), for assertions about session wiring.
+    pub seen_resume: Mutex<Vec<Option<String>>>,
 }
 
 impl MockRunner {
@@ -32,6 +37,7 @@ impl MockRunner {
             name: "mock".into(),
             replies,
             seen: Mutex::new(VecDeque::new()),
+            seen_resume: Mutex::new(Vec::new()),
         }
     }
 }
@@ -44,6 +50,10 @@ impl AgentRunner for MockRunner {
 
     async fn run(&self, req: AgentRequest) -> Result<AgentResult> {
         self.seen.lock().unwrap().push_back(req.prompt.clone());
+        self.seen_resume
+            .lock()
+            .unwrap()
+            .push(req.resume.as_ref().map(|r| r.session_id.clone()));
         let reply = self
             .replies
             .iter()
@@ -58,6 +68,7 @@ impl AgentRunner for MockRunner {
                 structured: None,
                 exit_code: 0,
                 cost_usd: Some(0.0),
+                session_id: r.session_id,
             }),
             None => bail!("mock runner has no canned reply for prompt"),
         }

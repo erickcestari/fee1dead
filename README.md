@@ -14,7 +14,7 @@ per-task scratch space, and validates/persists results.
 | Stage      | Status   | What it does |
 |------------|----------|--------------|
 | Recon      | built    | Reads the repo top-down, emits `ARCHITECTURE.md` and seeds the hunt queue. |
-| Hunt       | built    | One hunter per task (attack class + scope hint), run concurrently, each in its own scratch dir. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
+| Hunt       | built    | One hunter per task (attack class + scope hint), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context, not just `ARCHITECTURE.md`. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
 | Validate   | built    | Independent agent re-reads the code and tries to **disprove** each finding (`fp-check` skill). Emits verdicts only. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |

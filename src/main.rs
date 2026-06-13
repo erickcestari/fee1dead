@@ -8,7 +8,10 @@ use fee1dead::config::Config;
 use fee1dead::pipeline::Pipeline;
 
 #[derive(Parser)]
-#[command(name = "fee1dead", about = "AI-CLI-agnostic vulnerability discovery harness")]
+#[command(
+    name = "fee1dead",
+    about = "AI-CLI-agnostic vulnerability discovery harness"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -39,8 +42,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

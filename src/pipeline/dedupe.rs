@@ -20,8 +20,14 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     let before = candidates.len();
     let (representatives, collapsed) = dedupe_findings(candidates);
-    ctx.artifacts.write_jsonl(names::CANDIDATES, &representatives)?;
-    info!(before, after = representatives.len(), collapsed, "dedupe complete");
+    ctx.artifacts
+        .write_jsonl(names::CANDIDATES, &representatives)?;
+    info!(
+        before,
+        after = representatives.len(),
+        collapsed,
+        "dedupe complete"
+    );
     Ok(())
 }
 
@@ -92,7 +98,10 @@ mod tests {
         assert_eq!(collapsed, 1);
         assert_eq!(kept.len(), 2);
         // The high-severity finding in p.rs is the survivor for that cluster.
-        let p = kept.iter().find(|f| f.location.starts_with("src/p.rs")).unwrap();
+        let p = kept
+            .iter()
+            .find(|f| f.location.starts_with("src/p.rs"))
+            .unwrap();
         assert_eq!(p.id, "b");
     }
 

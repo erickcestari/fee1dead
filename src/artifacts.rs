@@ -25,10 +25,21 @@ pub mod names {
     /// Durable cross-run feedback memory: seed tasks distilled from past runs.
     /// Unlike the others, this artifact is NOT reset between runs.
     pub const SEEDS: &str = "feedback-seeds.jsonl";
+    /// The recon agent's session id, so hunters can fork from its context.
+    /// Holds a single line of text, not JSONL.
+    pub const RECON_SESSION: &str = "recon-session.txt";
 
     /// Artifacts produced fresh by a single run (everything except SEEDS).
     /// Cleared at the start of a run that includes recon.
-    pub const PER_RUN: &[&str] = &[ARCHITECTURE, QUEUE, CANDIDATES, GAPS, VALIDATED, HUNTED];
+    pub const PER_RUN: &[&str] = &[
+        ARCHITECTURE,
+        QUEUE,
+        CANDIDATES,
+        GAPS,
+        VALIDATED,
+        HUNTED,
+        RECON_SESSION,
+    ];
 }
 
 /// Handle to a run's output directory.
@@ -52,8 +63,7 @@ impl Artifacts {
     /// Overwrite a JSONL file with `items`.
     pub fn write_jsonl<T: Serialize>(&self, name: &str, items: &[T]) -> Result<()> {
         let path = self.path(name);
-        let mut f = File::create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        let mut f = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         for item in items {
             let line = serde_json::to_string(item)?;
             writeln!(f, "{line}")?;

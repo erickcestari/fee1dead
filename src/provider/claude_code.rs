@@ -44,6 +44,18 @@ impl AgentRunner for ClaudeCodeRunner {
             .arg("--add-dir")
             .arg(&req.working_dir);
 
+        // Forking a prior session must run in that session's project dir, since
+        // claude scopes `--resume` lookup to the current directory. The agent's
+        // own working dir is still added so it stays writable for PoCs; absent a
+        // resume we simply run in the working dir.
+        let cwd = match &req.resume {
+            Some(r) => {
+                cmd.arg("--resume").arg(&r.session_id).arg("--fork-session");
+                r.project_dir.clone()
+            }
+            None => req.working_dir.clone(),
+        };
+
         if let Some(model) = &self.model {
             cmd.arg("--model").arg(model);
         }
@@ -58,7 +70,7 @@ impl AgentRunner for ClaudeCodeRunner {
         }
         cmd.args(&self.extra_args);
 
-        cmd.current_dir(&req.working_dir)
+        cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -88,7 +100,10 @@ impl AgentRunner for ClaudeCodeRunner {
         if envelope.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
             bail!(
                 "claude reported an error: {}",
-                envelope.get("result").and_then(|v| v.as_str()).unwrap_or("")
+                envelope
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
             );
         }
 
@@ -100,12 +115,17 @@ impl AgentRunner for ClaudeCodeRunner {
             .unwrap_or_else(|| raw.clone());
 
         let cost_usd = envelope.get("total_cost_usd").and_then(|v| v.as_f64());
+        let session_id = envelope
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
 
         Ok(AgentResult {
             stdout,
             structured: Some(envelope),
             exit_code,
             cost_usd,
+            session_id,
         })
     }
 }

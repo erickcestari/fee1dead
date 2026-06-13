@@ -41,6 +41,20 @@ pub struct AgentRequest {
     pub timeout: Duration,
     /// Max agent turns, when supported.
     pub max_turns: Option<u32>,
+    /// When set, fork a prior agent session so this run inherits its
+    /// conversation context. Providers without a session concept ignore it.
+    pub resume: Option<ResumeSession>,
+}
+
+/// A prior session to fork from.
+///
+/// `session_id` identifies the conversation; `project_dir` is the directory it
+/// was created in. Session lookup is scoped to that directory, so a forking
+/// provider must run there rather than in the request's `working_dir`.
+#[derive(Debug, Clone)]
+pub struct ResumeSession {
+    pub session_id: String,
+    pub project_dir: PathBuf,
 }
 
 /// The result of an agent run.
@@ -53,6 +67,9 @@ pub struct AgentResult {
     pub exit_code: i32,
     /// Reported cost in USD, when the provider exposes it.
     pub cost_usd: Option<f64>,
+    /// This run's session id, when the provider exposes one. Lets a later stage
+    /// fork from this conversation (see [`ResumeSession`]).
+    pub session_id: Option<String>,
 }
 
 /// The single seam between the harness and any AI CLI.

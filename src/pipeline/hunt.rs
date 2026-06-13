@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use super::StageCtx;
 use crate::artifacts::{Artifacts, extract_json_block, names};
 use crate::domain::{Finding, GapMarker, Severity, Task};
-use crate::provider::{AgentRequest, AgentRunner};
+use crate::provider::{AgentRequest, AgentRunner, ResumeSession};
 use crate::skills;
 
 const PROMPT: &str = include_str!("../../prompts/hunt.md");
@@ -74,10 +74,41 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         return Ok(());
     }
 
+    // Fork each hunter from recon's session so it inherits the codebase context
+    // recon built up, not just the architecture doc. Absent a recorded session
+    // (e.g. a provider without sessions, or forking disabled), hunters run cold.
+    let recon_session = if ctx.config.run.fork_hunters {
+        ctx.artifacts
+            .read_text(names::RECON_SESSION)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    if recon_session.is_some() {
+        info!("hunters will fork from recon's session");
+    }
+
+    // A forked hunter already carries recon's full exploration (the architecture
+    // doc included) in its conversation history, shared as a cached prefix
+    // across hunters. Re-injecting the doc would re-bill those tokens per hunter
+    // at full price, so forked hunters get a pointer instead of the text.
+    let arch_context = if recon_session.is_some() {
+        "You explored this repository as the recon agent earlier in this \
+         session; rely on that analysis rather than re-reading from scratch."
+            .to_string()
+    } else {
+        architecture
+    };
+
     let sem = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let target = ctx.config.run.target_dir.clone();
     let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
-    let skills: Vec<String> = skills::skills_for("hunt").iter().map(|s| s.to_string()).collect();
+    let skills: Vec<String> = skills::skills_for("hunt")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let mut handles = Vec::new();
     for task in tasks {
@@ -88,8 +119,15 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             .replace("{attack_class}", &task.attack_class)
             .replace("{scope_hint}", &task.scope_hint)
             .replace("{target_dir}", &target.to_string_lossy())
-            .replace("{architecture}", &architecture);
+            .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
+            .replace("{architecture}", &arch_context);
         let skills = skills.clone();
+        // A forked hunter runs in recon's project dir (the target), so PoCs go
+        // to the scratch dir by absolute path; a cold hunter runs in scratch.
+        let resume = recon_session.clone().map(|session_id| ResumeSession {
+            session_id,
+            project_dir: target.clone(),
+        });
 
         handles.push(tokio::spawn(async move {
             let _permit = permit; // released on drop
@@ -101,6 +139,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 skills,
                 timeout,
                 max_turns: None,
+                resume,
             };
             let out = run_hunter(runner.as_ref(), req).await;
             (task, out)
@@ -156,8 +195,7 @@ async fn run_hunter(
     req: AgentRequest,
 ) -> Result<(Vec<RawFinding>, Vec<RawGap>)> {
     let result = runner.run(req).await?;
-    let json = extract_json_block(&result.stdout)
-        .context("hunter output had no json block")?;
+    let json = extract_json_block(&result.stdout).context("hunter output had no json block")?;
     let out: HunterOutput =
         serde_json::from_str(json).context("hunter output was not valid json")?;
     Ok((out.findings, out.gaps))

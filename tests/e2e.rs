@@ -11,7 +11,8 @@ use fee1dead::provider::{CannedReply, MockRunner};
 /// Canned agent responses keyed by a substring unique to each stage's prompt.
 fn replies() -> Vec<CannedReply> {
     vec![
-        // Recon: architecture doc + a one-task queue.
+        // Recon: architecture doc + a one-task queue. Reports a session id so
+        // the fork-from-recon path is exercised.
         CannedReply {
             match_substr: Some("You are the Recon agent".into()),
             stdout: r#"# Architecture
@@ -22,6 +23,7 @@ Build: `cargo build`. Entry point: src/parse.rs.
 [{"attack_class": "integer overflow", "scope_hint": "src/parse.rs decode loop"}]
 ```"#
                 .into(),
+            session_id: Some(RECON_SESSION_ID.into()),
         },
         // Hunter: one finding, one gap.
         CannedReply {
@@ -37,6 +39,7 @@ Build: `cargo build`. Entry point: src/parse.rs.
 }
 ```"#
                 .into(),
+            session_id: None,
         },
         // Validator: confirm it.
         CannedReply {
@@ -45,6 +48,7 @@ Build: `cargo build`. Entry point: src/parse.rs.
 {"verdict": "true_positive", "evidence": "len*4 wraps for len > u32::MAX/4"}
 ```"#
                 .into(),
+            session_id: None,
         },
         // Report: a schema-valid record.
         CannedReply {
@@ -62,9 +66,13 @@ Build: `cargo build`. Entry point: src/parse.rs.
 }
 ```"#
                 .into(),
+            session_id: None,
         },
     ]
 }
+
+/// Session id the mock recon agent reports; hunters must fork from it.
+const RECON_SESSION_ID: &str = "recon-sess-abc123";
 
 fn config_toml(target: &str, scratch: &str, out: &str, db: &str, stages: &str) -> String {
     format!(
@@ -173,8 +181,7 @@ async fn feedback_carries_seeds_into_next_run() {
         .await
         .unwrap();
 
-    let seeds: Vec<Task> =
-        read_jsonl(&out.join("feedback-seeds.jsonl"));
+    let seeds: Vec<Task> = read_jsonl(&out.join("feedback-seeds.jsonl"));
     assert_eq!(seeds.len(), 2, "expected one variant seed + one gap seed");
 
     // Run 2: reuses the same out_dir; recon must merge the 2 carried seeds.
@@ -186,10 +193,95 @@ async fn feedback_carries_seeds_into_next_run() {
         .unwrap();
 
     let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
-    assert_eq!(queue.len(), 3, "1 fresh recon task + 2 carried feedback seeds");
     assert_eq!(
-        queue.iter().filter(|t| t.origin == TaskOrigin::Feedback).count(),
+        queue.len(),
+        3,
+        "1 fresh recon task + 2 carried feedback seeds"
+    );
+    assert_eq!(
+        queue
+            .iter()
+            .filter(|t| t.origin == TaskOrigin::Feedback)
+            .count(),
         2
+    );
+}
+
+/// Recon records its session id, and the hunter forks from it.
+#[tokio::test]
+async fn hunters_fork_from_recon_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = tmp.path().join("out");
+    let db = out.join("findings.db");
+
+    let cfg_path = tmp.path().join("harness.toml");
+    std::fs::write(
+        &cfg_path,
+        config_toml(
+            target.to_str().unwrap(),
+            tmp.path().join("scratch").to_str().unwrap(),
+            out.to_str().unwrap(),
+            db.to_str().unwrap(),
+            r#""recon", "hunt""#,
+        ),
+    )
+    .unwrap();
+
+    let cfg = Config::load(&cfg_path).unwrap();
+    let runner = Arc::new(MockRunner::new(replies()));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    // Recon persisted its session id for downstream stages.
+    let recorded = std::fs::read_to_string(out.join("recon-session.txt")).unwrap();
+    assert_eq!(recorded.trim(), RECON_SESSION_ID);
+
+    // The hunter asked to fork from exactly that session; recon itself did not.
+    let resumes = runner.seen_resume.lock().unwrap();
+    assert!(
+        resumes.contains(&Some(RECON_SESSION_ID.to_string())),
+        "a hunter should have forked from recon's session, saw: {resumes:?}"
+    );
+    assert_eq!(resumes.first(), Some(&None), "recon runs without forking");
+}
+
+/// With forking disabled, recon still records its session but hunters run cold.
+#[tokio::test]
+async fn fork_hunters_false_disables_forking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = tmp.path().join("out");
+    let db = out.join("findings.db");
+
+    let cfg_path = tmp.path().join("harness.toml");
+    let mut toml = config_toml(
+        target.to_str().unwrap(),
+        tmp.path().join("scratch").to_str().unwrap(),
+        out.to_str().unwrap(),
+        db.to_str().unwrap(),
+        r#""recon", "hunt""#,
+    );
+    toml = toml.replace("concurrency = 4", "concurrency = 4\nfork_hunters = false");
+    std::fs::write(&cfg_path, toml).unwrap();
+
+    let cfg = Config::load(&cfg_path).unwrap();
+    let runner = Arc::new(MockRunner::new(replies()));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    let resumes = runner.seen_resume.lock().unwrap();
+    assert!(
+        resumes.iter().all(|r| r.is_none()),
+        "no agent should fork when fork_hunters = false, saw: {resumes:?}"
     );
 }
 

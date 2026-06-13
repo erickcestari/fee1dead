@@ -39,8 +39,10 @@ impl Pipeline {
     pub fn new(config: Config) -> Result<Self> {
         let artifacts = Artifacts::new(&config.run.out_dir)?;
         let scratch = ScratchRoot::new(&config.run.scratch_root)?;
-        let runner: Arc<dyn AgentRunner> =
-            Arc::from(build_runner(&config.provider.default, config.default_provider()));
+        let runner: Arc<dyn AgentRunner> = Arc::from(build_runner(
+            &config.provider.default,
+            config.default_provider(),
+        ));
         Ok(Self {
             ctx: StageCtx {
                 config,
@@ -82,7 +84,11 @@ impl Pipeline {
             }
         }
 
-        info!(provider = self.ctx.runner.name(), ?stages, "starting pipeline");
+        info!(
+            provider = self.ctx.runner.name(),
+            ?stages,
+            "starting pipeline"
+        );
         for stage in &stages {
             info!(stage = %stage, "stage start");
             run_stage(stage, &self.ctx).await?;

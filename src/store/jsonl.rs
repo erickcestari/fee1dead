@@ -43,8 +43,8 @@ impl JsonlSink {
     }
 
     fn flush(&self) -> Result<()> {
-        let mut f = File::create(&self.path)
-            .with_context(|| format!("writing {}", self.path.display()))?;
+        let mut f =
+            File::create(&self.path).with_context(|| format!("writing {}", self.path.display()))?;
         for v in self.records.values() {
             writeln!(f, "{}", serde_json::to_string(v)?)?;
         }
@@ -54,7 +54,8 @@ impl JsonlSink {
 
 impl ReportSink for JsonlSink {
     fn write(&mut self, record: &ReportRecord) -> Result<()> {
-        self.records.insert(record.id.clone(), record.payload.clone());
+        self.records
+            .insert(record.id.clone(), record.payload.clone());
         self.flush()
     }
 

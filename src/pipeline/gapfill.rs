@@ -25,16 +25,16 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
     // Avoid re-queuing an area an existing task already scopes. Cheap textual
     // containment is enough to stop obvious duplicates.
-    let mut covered: HashSet<String> = queue
-        .iter()
-        .map(|t| t.scope_hint.to_lowercase())
-        .collect();
+    let mut covered: HashSet<String> = queue.iter().map(|t| t.scope_hint.to_lowercase()).collect();
 
     let mut next = queue.len() + 1;
     let mut added = 0usize;
     for gap in gaps {
         let area_key = gap.area.to_lowercase();
-        if covered.iter().any(|c| c.contains(&area_key) || area_key.contains(c.as_str())) {
+        if covered
+            .iter()
+            .any(|c| c.contains(&area_key) || area_key.contains(c.as_str()))
+        {
             continue;
         }
         let task = Task {
