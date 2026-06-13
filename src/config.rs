@@ -82,6 +82,13 @@ pub struct RunConfig {
     /// hunters (cache-read rates) when they start within the cache window.
     #[serde(default = "default_fork_hunters")]
     pub fork_hunters: bool,
+    /// Whether hunters write, compile, and run proof-of-concept code to confirm
+    /// findings. The PoC loop is the most token-hungry part of hunting, so it is
+    /// off by default: hunters substantiate by close reading instead, trading
+    /// confirmation strength for far lower token cost. Enable it to have hunters
+    /// produce runnable PoCs at higher cost.
+    #[serde(default = "default_require_poc")]
+    pub require_poc: bool,
 }
 
 fn default_concurrency() -> usize {
@@ -90,6 +97,10 @@ fn default_concurrency() -> usize {
 
 fn default_fork_hunters() -> bool {
     true
+}
+
+fn default_require_poc() -> bool {
+    false
 }
 
 fn default_timeout_secs() -> u64 {

@@ -15,6 +15,11 @@ agent_timeout_secs = 1800
 # recon's history as a cached prefix (cache-read rates) when hunters start
 # within the cache window. Set false to opt out.
 fork_hunters = true
+# Whether hunters write, compile, and run proof-of-concept code to confirm
+# findings. This is the most token-hungry part of hunting, so it is off by
+# default: hunters substantiate by close reading instead (cheaper, but weaker
+# confirmation). Set true to have hunters produce runnable PoCs at higher cost.
+require_poc = false
 
 # Optional: clone the target into run.target_dir at startup instead of mounting
 # it. The git host MUST be in [firewall].allow (the clone runs after the

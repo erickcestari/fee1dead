@@ -102,6 +102,27 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         architecture
     };
 
+    // PoC confirmation is the most token-hungry part of hunting (compile/run
+    // loops). When disabled, hunters substantiate by close reading instead.
+    let (poc_intro, poc_rule, poc_step) = if ctx.config.run.require_poc {
+        (
+            "Write, compile, and run any proof-of-concept code in your private \
+             scratch dir `{scratch_dir}`. ",
+            "- Confirm with a PoC when you can: write it in the scratch dir, \
+             compile and run\n  it, and report only if it behaves as the bug \
+             predicts.",
+            "- [ ] Attempt a PoC in the scratch dir; compile and run it",
+        )
+    } else {
+        (
+            "",
+            "- Do not write proof-of-concept code. Substantiate findings by \
+             tracing the data\n  flow in the source and citing exact \
+             locations; leave `poc_path` unset.",
+            "- [ ] Substantiate the hypothesis by close reading; cite exact lines",
+        )
+    };
+
     let sem = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let target = ctx.config.run.target_dir.clone();
     let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
@@ -119,6 +140,10 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             .replace("{attack_class}", &task.attack_class)
             .replace("{scope_hint}", &task.scope_hint)
             .replace("{target_dir}", &target.to_string_lossy())
+            .replace("{poc_intro}", poc_intro)
+            .replace("{poc_rule}", poc_rule)
+            .replace("{poc_step}", poc_step)
+            // After poc_intro, since it may embed {scratch_dir}.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &arch_context);
         let skills = skills.clone();
