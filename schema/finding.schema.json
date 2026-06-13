@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Finding",
+  "description": "A validated vulnerability finding emitted by the harness.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "title",
+    "attack_class",
+    "severity",
+    "location",
+    "description",
+    "impact",
+    "recommendation"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable unique identifier for the finding."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attack_class": {
+      "type": "string",
+      "minLength": 1
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["info", "low", "medium", "high", "critical"]
+    },
+    "location": {
+      "type": "string",
+      "description": "Code location in path:line form.",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "impact": {
+      "type": "string",
+      "description": "What an attacker gains; concrete consequence.",
+      "minLength": 1
+    },
+    "recommendation": {
+      "type": "string",
+      "description": "How to fix or mitigate.",
+      "minLength": 1
+    },
+    "poc_path": {
+      "type": "string",
+      "description": "Optional path to a proof-of-concept artifact."
+    },
+    "evidence": {
+      "type": "string",
+      "description": "Validator evidence supporting the finding."
+    }
+  }
+}

@@ -1,0 +1,72 @@
+# fee1dead harness — per-run configuration.
+# Paths are container paths; mount your target repo at run.target_dir.
+
+[run]
+target_dir   = "/work/target"
+scratch_root = "/work/scratch"
+out_dir      = "/work/out"
+# Max hunters running at once.
+concurrency  = 50
+# Per-agent wall-clock timeout.
+agent_timeout_secs = 1800
+
+# Optional: clone the target into run.target_dir at startup instead of mounting
+# it. The git host MUST be in [firewall].allow (the clone runs after the
+# firewall comes up). Omit this section to use a mounted target_dir.
+# [target]
+# repo = "https://github.com/org/name.git"
+# ref  = "main"        # branch, tag, or commit SHA; defaults to the default branch
+
+[provider]
+# Which [providers.*] block to use. Only "claude-code" is implemented as a
+# built-in adapter today; others are added via type = "exec" (zero code).
+default = "claude-code"
+
+[providers.claude-code]
+type       = "claude-code"
+model      = "claude-opus-4-8"
+# The container is the security boundary, so the agent runs unrestricted.
+extra_args = ["--dangerously-skip-permissions"]
+
+# Example: add any other CLI with no Rust changes. {prompt} and {working_dir}
+# are substituted per task.
+# [providers.codex]
+# type    = "exec"
+# command = "codex"
+# args    = ["exec", "--cd", "{working_dir}", "{prompt}"]
+# output  = "json"
+
+[firewall]
+# Default-deny egress; only these hosts are reachable (see docker/init-firewall.sh).
+# Add the package registries your target's PoC toolchain needs.
+allow = [
+  "api.anthropic.com",
+  "registry.npmjs.org",
+  "static.crates.io",
+  "index.crates.io",
+  # Add your git host here when using [target].repo, e.g.:
+  # "github.com",
+  # "codeload.github.com",
+]
+
+[report]
+sink = "sqlite"            # sqlite | jsonl | http
+path = "/work/out/findings.db"
+# For the http sink instead:
+# sink      = "http"
+# url       = "https://ingest.example.com/findings"
+# token_env = "INGEST_TOKEN"   # bearer token read from this env var
+
+# Cross-run feedback memory (see [stages] "feedback").
+[feedback]
+# Cap on seeds carried between runs, so the memory stays bounded.
+max_seeds = 200
+
+[stages]
+# Stages run in the listed order; a stage name may repeat. To exploit gapfill,
+# run hunt again after it, e.g.:
+#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "validate", "report", "feedback"]
+# feedback runs last: it distils this run into feedback-seeds.jsonl, which the
+# next run's recon merges back into the queue. Keep the same out_dir to retain
+# that memory across runs.
+enabled = ["recon", "hunt", "dedupe", "validate", "report", "feedback"]
