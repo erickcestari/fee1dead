@@ -141,7 +141,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 max_turns: None,
                 resume,
             };
+            info!(task = %task.id, attack_class = %task.attack_class, "hunter started");
             let out = run_hunter(runner.as_ref(), req).await;
+            info!(task = %task.id, ok = out.is_ok(), "hunter finished");
             (task, out)
         }));
     }
