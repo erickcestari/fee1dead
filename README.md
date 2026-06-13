@@ -1,5 +1,7 @@
 # fee1dead
 
+<img src="./assets/fee1dead.png" alt="fee1dead project icon" width="300" align="right" />
+
 An AI-CLI-agnostic vulnerability discovery harness. An orchestrator drives AI
 coding CLIs through a staged pipeline, running many narrow agent tasks in
 parallel and turning their output into queryable, schema-validated findings.
