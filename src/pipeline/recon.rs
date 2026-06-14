@@ -42,6 +42,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     };
 
     let result = ctx.runner.run(req).await.context("recon agent failed")?;
+    ctx.cost.record("recon", "recon", result.cost_usd);
 
     // The whole response is the architecture document.
     ctx.artifacts

@@ -62,7 +62,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         };
 
         match validate_one(ctx, req).await {
-            Ok(raw) => {
+            Ok((raw, cost_usd)) => {
+                ctx.cost.record("validate", &finding.id, cost_usd);
                 match raw.verdict {
                     Verdict::TruePositive => confirmed += 1,
                     Verdict::FalsePositive => refuted += 1,
@@ -84,8 +85,10 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-async fn validate_one(ctx: &StageCtx, req: AgentRequest) -> Result<RawVerdict> {
+async fn validate_one(ctx: &StageCtx, req: AgentRequest) -> Result<(RawVerdict, Option<f64>)> {
     let result = ctx.runner.run(req).await?;
     let json = extract_json_block(&result.stdout).context("validator output had no json block")?;
-    serde_json::from_str(json).context("validator output was not valid json")
+    let raw: RawVerdict =
+        serde_json::from_str(json).context("validator output was not valid json")?;
+    Ok((raw, result.cost_usd))
 }

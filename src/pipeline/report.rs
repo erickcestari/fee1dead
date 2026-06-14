@@ -98,6 +98,7 @@ async fn build_report(
         };
 
         let result = ctx.runner.run(req).await?;
+        ctx.cost.record("report", &finding.id, result.cost_usd);
         let json = extract_json_block(&result.stdout).context("report output had no json block")?;
         let payload: Value = match serde_json::from_str(json) {
             Ok(v) => v,

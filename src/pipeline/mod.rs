@@ -4,6 +4,7 @@
 //! order. Each stage is a self-contained function over [`StageCtx`]; they
 //! communicate only through artifacts, so the orchestrator just sequences them.
 
+mod cost;
 mod dedupe;
 mod feedback;
 mod gapfill;
@@ -11,6 +12,8 @@ mod hunt;
 mod recon;
 mod report;
 mod validate;
+
+pub use cost::CostMeter;
 
 use std::sync::Arc;
 
@@ -28,6 +31,8 @@ pub struct StageCtx {
     pub artifacts: Artifacts,
     pub scratch: ScratchRoot,
     pub runner: Arc<dyn AgentRunner>,
+    /// Tallies the cost of every agent spawn, across all stages.
+    pub cost: Arc<CostMeter>,
 }
 
 pub struct Pipeline {
@@ -49,6 +54,7 @@ impl Pipeline {
                 artifacts,
                 scratch,
                 runner,
+                cost: Arc::new(CostMeter::new()),
             },
         })
     }
@@ -64,6 +70,7 @@ impl Pipeline {
                 artifacts,
                 scratch,
                 runner,
+                cost: Arc::new(CostMeter::new()),
             },
         })
     }
@@ -92,8 +99,10 @@ impl Pipeline {
         for stage in &stages {
             info!(stage = %stage, "stage start");
             run_stage(stage, &self.ctx).await?;
+            self.ctx.cost.log_stage(stage);
             info!(stage = %stage, "stage done");
         }
+        self.ctx.cost.log_total();
         Ok(())
     }
 }
