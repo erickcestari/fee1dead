@@ -28,6 +28,10 @@ run clears those per-run artifacts at startup; `feedback-seeds.jsonl` is the one
 durable artifact and survives, carrying learning between runs. **Reuse the same
 `out_dir` (mount) across runs to keep the feedback memory.**
 
+Every agent run also appends a row to `out_dir/costs.jsonl`
+(`{stage, label, cost_usd, duration_secs}`), so a run can be profiled after the
+fact to find which stage or task dominates cost and wall-clock time.
+
 ## Architecture
 
 Single Rust binary, modularized:

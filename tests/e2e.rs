@@ -136,6 +136,18 @@ async fn full_skeleton_pipeline_with_mock() {
     assert!(out.join("gaps.jsonl").exists(), "gaps missing");
     assert!(out.join("validated.jsonl").exists(), "validations missing");
 
+    // Per-agent telemetry persisted: one row per agent run (recon, hunt,
+    // review, report), each carrying stage, label, cost, and duration.
+    let costs = std::fs::read_to_string(out.join("costs.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = costs
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 4, "expected one cost row per agent run");
+    assert!(rows.iter().all(|r| r.get("duration_secs").is_some()));
+    assert!(rows.iter().any(|r| r["stage"] == "hunt"));
+
     // One finding made it all the way into the store.
     let conn = rusqlite::Connection::open(&db).unwrap();
     let n: i64 = conn

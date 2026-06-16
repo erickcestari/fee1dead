@@ -10,15 +10,38 @@
 //! can record into it from their own tasks.
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tracing::info;
+use serde_json::json;
+use tracing::{info, warn};
 
 /// Thread-safe tally of agent-spawn costs, grouped by stage.
+///
+/// Besides the in-memory tally, when built with [`CostMeter::with_log`] it
+/// appends one JSONL row per agent run to a file, so a run can be profiled
+/// afterwards to find which tasks dominate cost/time.
 #[derive(Default)]
 pub struct CostMeter {
     by_stage: Mutex<BTreeMap<String, StageCost>>,
+    /// Serializes telemetry appends. A row is written with several `write`
+    /// calls (serde's `Display` emits the JSON incrementally), so concurrent
+    /// hunters sharing the file would interleave partial lines — `O_APPEND`
+    /// keeps bytes from being overwritten but does NOT keep a line intact.
+    /// Holding this lock for the whole write is what guarantees one line per row.
+    writer: Mutex<TelemetryWriter>,
+}
+
+/// File sink for per-agent rows; `path: None` disables persistence (tests).
+#[derive(Default)]
+struct TelemetryWriter {
+    path: Option<PathBuf>,
+    /// Opened lazily on first row so the open lands after the per-run artifact
+    /// reset has cleared any stale file, then reused for the rest of the run.
+    file: Option<std::fs::File>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -35,6 +58,18 @@ impl CostMeter {
         Self::default()
     }
 
+    /// Build a meter that also appends a JSONL telemetry row per agent to
+    /// `log_path`.
+    pub fn with_log(log_path: PathBuf) -> Self {
+        Self {
+            by_stage: Mutex::new(BTreeMap::new()),
+            writer: Mutex::new(TelemetryWriter {
+                path: Some(log_path),
+                file: None,
+            }),
+        }
+    }
+
     /// Record one finished agent under `stage`, logging its individual cost and
     /// wall-clock duration.
     ///
@@ -44,11 +79,13 @@ impl CostMeter {
     pub fn record(&self, stage: &str, label: &str, cost_usd: Option<f64>, duration: Duration) {
         let cost = cost_usd.unwrap_or(0.0);
         let secs = duration.as_secs_f64();
-        let mut by_stage = self.by_stage.lock().unwrap();
-        let entry = by_stage.entry(stage.to_string()).or_default();
-        entry.spawns += 1;
-        entry.cost_usd += cost;
-        entry.secs += secs;
+        {
+            let mut by_stage = self.by_stage.lock().unwrap();
+            let entry = by_stage.entry(stage.to_string()).or_default();
+            entry.spawns += 1;
+            entry.cost_usd += cost;
+            entry.secs += secs;
+        }
         info!(
             stage,
             label,
@@ -56,6 +93,38 @@ impl CostMeter {
             duration_secs = secs,
             "agent finished"
         );
+        self.append_row(stage, label, cost, secs);
+    }
+
+    /// Append one telemetry row, serialized so concurrent agents cannot
+    /// interleave lines. Best-effort: a telemetry write must never abort a run,
+    /// so failures are warned and swallowed.
+    fn append_row(&self, stage: &str, label: &str, cost_usd: f64, duration_secs: f64) {
+        let mut w = self.writer.lock().unwrap();
+        let Some(path) = w.path.clone() else {
+            return;
+        };
+        // Open once, after the per-run reset; reuse the handle thereafter.
+        if w.file.is_none() {
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(f) => w.file = Some(f),
+                Err(e) => {
+                    warn!(error = %e, path = %path.display(), "failed to open cost telemetry");
+                    return;
+                }
+            }
+        }
+        let row = json!({
+            "stage": stage,
+            "label": label,
+            "cost_usd": cost_usd,
+            "duration_secs": duration_secs,
+        });
+        if let Some(f) = w.file.as_mut()
+            && let Err(e) = writeln!(f, "{row}")
+        {
+            warn!(error = %e, path = %path.display(), "failed to write cost telemetry row");
+        }
     }
 
     /// Log the running subtotal for `stage`. No-op if the stage spawned nothing
@@ -122,5 +191,69 @@ mod tests {
         assert!((meter.total_usd() - 0.35).abs() < 1e-9);
         // Durations sum across stages (agent-seconds).
         assert!((meter.total_secs() - 11.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn writes_one_jsonl_row_per_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("costs.jsonl");
+        let meter = CostMeter::with_log(path.clone());
+        meter.record("hunt", "T-0001", Some(0.1), Duration::from_secs(3));
+        // A missing cost is persisted as 0.0; sub-second durations are preserved.
+        meter.record("report", "batch-0", None, Duration::from_millis(1500));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["stage"], "hunt");
+        assert_eq!(rows[0]["label"], "T-0001");
+        assert_eq!(rows[0]["cost_usd"], 0.1);
+        assert_eq!(rows[0]["duration_secs"], 3.0);
+        assert_eq!(rows[1]["cost_usd"], 0.0);
+        assert_eq!(rows[1]["duration_secs"], 1.5);
+    }
+
+    #[test]
+    fn concurrent_records_do_not_interleave_rows() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("costs.jsonl");
+        let meter = Arc::new(CostMeter::with_log(path.clone()));
+
+        let handles: Vec<_> = (0..50)
+            .map(|i| {
+                let m = Arc::clone(&meter);
+                thread::spawn(move || {
+                    m.record("hunt", &format!("T-{i:04}"), Some(0.01), Duration::from_millis(1));
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 50);
+        // Each line must be a complete, parseable object: proof no two writers
+        // interleaved their bytes.
+        for l in &lines {
+            let v: serde_json::Value = serde_json::from_str(l).expect("each line is intact JSON");
+            assert_eq!(v["stage"], "hunt");
+        }
+    }
+
+    #[test]
+    fn no_log_path_means_no_file() {
+        // The default meter (used in unit tests) must not touch the filesystem.
+        let meter = CostMeter::new();
+        meter.record("hunt", "T-0001", Some(0.1), Duration::from_secs(1));
+        assert_eq!(meter.total_spawns(), 1);
     }
 }

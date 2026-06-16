@@ -48,13 +48,16 @@ impl Pipeline {
             &config.provider.default,
             config.default_provider(),
         ));
+        let cost = Arc::new(CostMeter::with_log(
+            artifacts.path(crate::artifacts::names::COSTS),
+        ));
         Ok(Self {
             ctx: StageCtx {
                 config,
                 artifacts,
                 scratch,
                 runner,
-                cost: Arc::new(CostMeter::new()),
+                cost,
             },
         })
     }
@@ -64,13 +67,16 @@ impl Pipeline {
     pub fn with_runner(config: Config, runner: Arc<dyn AgentRunner>) -> Result<Self> {
         let artifacts = Artifacts::new(&config.run.out_dir)?;
         let scratch = ScratchRoot::new(&config.run.scratch_root)?;
+        let cost = Arc::new(CostMeter::with_log(
+            artifacts.path(crate::artifacts::names::COSTS),
+        ));
         Ok(Self {
             ctx: StageCtx {
                 config,
                 artifacts,
                 scratch,
                 runner,
-                cost: Arc::new(CostMeter::new()),
+                cost,
             },
         })
     }

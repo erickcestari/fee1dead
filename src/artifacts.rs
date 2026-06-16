@@ -28,6 +28,9 @@ pub mod names {
     /// The recon agent's session id, so hunters can fork from its context.
     /// Holds a single line of text, not JSONL.
     pub const RECON_SESSION: &str = "recon-session.txt";
+    /// Per-agent telemetry: one JSONL row per agent run (stage, label, cost,
+    /// duration). Lets a run be profiled after the fact to find bottlenecks.
+    pub const COSTS: &str = "costs.jsonl";
 
     /// Artifacts produced fresh by a single run (everything except SEEDS).
     /// Cleared at the start of a run that includes recon.
@@ -39,6 +42,7 @@ pub mod names {
         VALIDATED,
         HUNTED,
         RECON_SESSION,
+        COSTS,
     ];
 }
 
