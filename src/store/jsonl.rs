@@ -63,3 +63,40 @@ impl ReportSink for JsonlSink {
         Ok(self.records.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rec(id: &str, title: &str) -> ReportRecord {
+        ReportRecord {
+            id: id.into(),
+            payload: json!({"id": id, "title": title}),
+        }
+    }
+
+    #[test]
+    fn upserts_by_id_and_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("findings.jsonl");
+
+        let mut sink = JsonlSink::open(&path).unwrap();
+        sink.write(&rec("F-1", "first")).unwrap();
+        sink.write(&rec("F-2", "second")).unwrap();
+        sink.write(&rec("F-1", "updated")).unwrap(); // upsert, not append
+        assert_eq!(sink.count().unwrap(), 2);
+
+        // Reopen: existing lines are loaded back and keyed by id.
+        let reopened = JsonlSink::open(&path).unwrap();
+        assert_eq!(reopened.count().unwrap(), 2);
+        assert_eq!(reopened.records["F-1"]["title"], "updated");
+    }
+
+    #[test]
+    fn open_missing_file_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = JsonlSink::open(&dir.path().join("nope.jsonl")).unwrap();
+        assert_eq!(sink.count().unwrap(), 0);
+    }
+}

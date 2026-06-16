@@ -60,16 +60,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let seeds: Vec<SeedTask> =
         serde_json::from_str(json).context("recon task block was not a valid task array")?;
 
-    let mut tasks: Vec<Task> = seeds
-        .into_iter()
-        .enumerate()
-        .map(|(i, s)| Task {
-            id: format!("T-{:04}", i + 1),
-            attack_class: s.attack_class,
-            scope_hint: s.scope_hint,
-            origin: TaskOrigin::Recon,
-        })
-        .collect();
+    let mut tasks = assign_ids(seeds);
 
     let fresh = tasks.len();
     let carried = merge_feedback_seeds(ctx, &mut tasks)?;
@@ -82,6 +73,21 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     );
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
     Ok(())
+}
+
+/// Assign stable, ordered ids to recon's seed tasks. Recon emits attack
+/// class + scope only; ids and origin are the harness's to set.
+fn assign_ids(seeds: Vec<SeedTask>) -> Vec<Task> {
+    seeds
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| Task {
+            id: format!("T-{:04}", i + 1),
+            attack_class: s.attack_class,
+            scope_hint: s.scope_hint,
+            origin: TaskOrigin::Recon,
+        })
+        .collect()
 }
 
 /// Merge durable feedback seeds from past runs into this run's queue, skipping
@@ -109,4 +115,42 @@ fn merge_feedback_seeds(ctx: &StageCtx, tasks: &mut Vec<Task>) -> Result<usize> 
         }
     }
     Ok(carried)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed(class: &str, hint: &str) -> SeedTask {
+        SeedTask {
+            attack_class: class.into(),
+            scope_hint: hint.into(),
+        }
+    }
+
+    #[test]
+    fn assigns_padded_sequential_ids_and_recon_origin() {
+        let tasks = assign_ids(vec![seed("overflow", "src/a.rs"), seed("auth", "src/b.rs")]);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].id, "T-0001");
+        assert_eq!(tasks[1].id, "T-0002");
+        assert_eq!(tasks[0].attack_class, "overflow");
+        assert_eq!(tasks[1].scope_hint, "src/b.rs");
+        assert!(tasks.iter().all(|t| matches!(t.origin, TaskOrigin::Recon)));
+    }
+
+    #[test]
+    fn empty_seeds_yield_no_tasks() {
+        assert!(assign_ids(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn parses_seed_array_from_agent_json_block() {
+        let out = "prose\n```json\n[{\"attack_class\":\"x\",\"scope_hint\":\"y\"}]\n```";
+        let json = extract_json_block(out).unwrap();
+        let seeds: Vec<SeedTask> = serde_json::from_str(json).unwrap();
+        let tasks = assign_ids(seeds);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].attack_class, "x");
+    }
 }

@@ -110,11 +110,7 @@ async fn build_report(
             }
         };
 
-        let errors: Vec<String> = schema
-            .validate(&payload)
-            .err()
-            .map(|it| it.map(|e| e.to_string()).collect())
-            .unwrap_or_default();
+        let errors = schema_errors(schema, &payload);
 
         if errors.is_empty() {
             return Ok(payload);
@@ -135,4 +131,93 @@ fn severity_str(f: &Finding) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "medium".into())
+}
+
+/// Collect schema-validation error messages for a payload (empty == valid).
+fn schema_errors(schema: &JSONSchema, payload: &Value) -> Vec<String> {
+    schema
+        .validate(payload)
+        .err()
+        .map(|it| it.map(|e| e.to_string()).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Severity;
+    use serde_json::json;
+
+    fn compiled_schema() -> JSONSchema {
+        let value: Value = serde_json::from_str(SCHEMA_SRC).unwrap();
+        JSONSchema::compile(&value).unwrap()
+    }
+
+    fn finding(sev: Severity) -> Finding {
+        Finding {
+            id: "F-1".into(),
+            task_id: "T".into(),
+            title: "t".into(),
+            attack_class: "c".into(),
+            severity: sev,
+            location: "a.rs:1".into(),
+            description: "d".into(),
+            poc_path: None,
+        }
+    }
+
+    #[test]
+    fn embedded_schema_compiles() {
+        // Guards the build artifact: a malformed schema/finding.schema.json
+        // would break every report run, so fail loudly in tests instead.
+        let _ = compiled_schema();
+    }
+
+    #[test]
+    fn complete_payload_passes_schema() {
+        let schema = compiled_schema();
+        let payload = json!({
+            "id": "F-1",
+            "title": "Integer overflow",
+            "attack_class": "overflow",
+            "severity": "high",
+            "location": "src/a.rs:10",
+            "description": "adds two attacker-controlled u32s",
+            "impact": "panic / wrong accounting",
+            "recommendation": "use checked_add"
+        });
+        assert!(schema_errors(&schema, &payload).is_empty());
+    }
+
+    #[test]
+    fn missing_required_fields_reported() {
+        let schema = compiled_schema();
+        // Missing impact + recommendation (both required).
+        let payload = json!({
+            "id": "F-1",
+            "title": "x",
+            "attack_class": "c",
+            "severity": "low",
+            "location": "a.rs:1",
+            "description": "d"
+        });
+        assert!(!schema_errors(&schema, &payload).is_empty());
+    }
+
+    #[test]
+    fn invalid_severity_enum_reported() {
+        let schema = compiled_schema();
+        let payload = json!({
+            "id": "F-1", "title": "x", "attack_class": "c",
+            "severity": "catastrophic", "location": "a.rs:1",
+            "description": "d", "impact": "i", "recommendation": "r"
+        });
+        assert!(!schema_errors(&schema, &payload).is_empty());
+    }
+
+    #[test]
+    fn severity_renders_as_schema_enum_value() {
+        assert_eq!(severity_str(&finding(Severity::Critical)), "critical");
+        assert_eq!(severity_str(&finding(Severity::Info)), "info");
+    }
 }

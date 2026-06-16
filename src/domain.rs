@@ -92,3 +92,59 @@ pub struct GapMarker {
     /// Why it was left uncovered, and what an attack class might be.
     pub reason: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn severity_orders_ascending() {
+        // Dedupe relies on this ordering to pick the representative finding.
+        assert!(Severity::Info < Severity::Low);
+        assert!(Severity::Low < Severity::Medium);
+        assert!(Severity::Medium < Severity::High);
+        assert!(Severity::High < Severity::Critical);
+        let mut v = [Severity::High, Severity::Info, Severity::Critical, Severity::Low];
+        v.sort();
+        assert_eq!(v, [Severity::Info, Severity::Low, Severity::High, Severity::Critical]);
+    }
+
+    #[test]
+    fn severity_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&Severity::Critical).unwrap(), "\"critical\"");
+        let s: Severity = serde_json::from_str("\"info\"").unwrap();
+        assert_eq!(s, Severity::Info);
+    }
+
+    #[test]
+    fn verdict_uses_snake_case_on_the_wire() {
+        assert_eq!(serde_json::to_string(&Verdict::TruePositive).unwrap(), "\"true_positive\"");
+        assert_eq!(serde_json::to_string(&Verdict::FalsePositive).unwrap(), "\"false_positive\"");
+    }
+
+    #[test]
+    fn task_origin_defaults_to_recon_when_absent() {
+        // Older queue files predate the `origin` field; they must still load.
+        let t: Task = serde_json::from_str(
+            "{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}",
+        )
+        .unwrap();
+        assert!(matches!(t.origin, TaskOrigin::Recon));
+    }
+
+    #[test]
+    fn finding_omits_poc_path_when_none() {
+        let f = Finding {
+            id: "F-1".into(),
+            task_id: "T".into(),
+            title: "t".into(),
+            attack_class: "c".into(),
+            severity: Severity::Low,
+            location: "a.rs:1".into(),
+            description: "d".into(),
+            poc_path: None,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("poc_path"), "got: {json}");
+    }
+}

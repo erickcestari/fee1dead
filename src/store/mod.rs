@@ -61,3 +61,39 @@ pub fn build_sink(cfg: &ReportConfig) -> Result<Box<dyn ReportSink>> {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(sink: SinkKind, path: Option<&str>, url: Option<&str>) -> ReportConfig {
+        ReportConfig {
+            sink,
+            path: path.map(Into::into),
+            url: url.map(Into::into),
+            token_env: None,
+        }
+    }
+
+    #[test]
+    fn builds_file_and_http_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let jsonl = dir.path().join("f.jsonl");
+        let db = dir.path().join("f.db");
+
+        let s = build_sink(&cfg(SinkKind::Jsonl, jsonl.to_str(), None)).unwrap();
+        assert_eq!(s.count().unwrap(), 0);
+        let s = build_sink(&cfg(SinkKind::Sqlite, db.to_str(), None)).unwrap();
+        assert_eq!(s.count().unwrap(), 0);
+        // The http sink does not connect at construction.
+        assert!(build_sink(&cfg(SinkKind::Http, None, Some("https://x/y"))).is_ok());
+    }
+
+    #[test]
+    fn defensive_bails_when_required_field_missing() {
+        // Config validation normally catches these; build_sink guards anyway.
+        assert!(build_sink(&cfg(SinkKind::Jsonl, None, None)).is_err());
+        assert!(build_sink(&cfg(SinkKind::Sqlite, None, None)).is_err());
+        assert!(build_sink(&cfg(SinkKind::Http, None, None)).is_err());
+    }
+}

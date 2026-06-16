@@ -337,4 +337,45 @@ enabled = ["recon", "hunt", "validate", "report"]
         let err = Config::load(f.path()).unwrap_err().to_string();
         assert!(err.contains("unknown stage"), "got: {err}");
     }
+
+    #[test]
+    fn rejects_zero_concurrency() {
+        let bad = VALID.replace("concurrency = 8", "concurrency = 0");
+        let f = write_tmp(&bad);
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("concurrency"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_stage_list() {
+        let bad = VALID.replace(
+            "enabled = [\"recon\", \"hunt\", \"validate\", \"report\"]",
+            "enabled = []",
+        );
+        let f = write_tmp(&bad);
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("at least one stage"), "got: {err}");
+    }
+
+    #[test]
+    fn jsonl_sink_requires_path() {
+        let bad = VALID.replace(
+            "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
+            "sink = \"jsonl\"",
+        );
+        let f = write_tmp(&bad);
+        let err = Config::load(f.path()).unwrap_err().to_string();
+        assert!(err.contains("report.path is required"), "got: {err}");
+    }
+
+    #[test]
+    fn applies_documented_defaults() {
+        // concurrency is set in VALID; the rest fall back to their defaults.
+        let f = write_tmp(VALID);
+        let cfg = Config::load(f.path()).unwrap();
+        assert_eq!(cfg.run.agent_timeout_secs, 1800);
+        assert!(cfg.run.fork_hunters);
+        assert!(!cfg.run.require_poc);
+        assert_eq!(cfg.feedback.max_seeds, 200);
+    }
 }

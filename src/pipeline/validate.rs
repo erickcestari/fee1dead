@@ -87,8 +87,42 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
 async fn validate_one(ctx: &StageCtx, req: AgentRequest) -> Result<(RawVerdict, Option<f64>)> {
     let result = ctx.runner.run(req).await?;
-    let json = extract_json_block(&result.stdout).context("validator output had no json block")?;
-    let raw: RawVerdict =
-        serde_json::from_str(json).context("validator output was not valid json")?;
+    let raw = parse_verdict(&result.stdout)?;
     Ok((raw, result.cost_usd))
+}
+
+/// Pull the validator's verdict out of its (possibly prose-wrapped) output.
+fn parse_verdict(stdout: &str) -> Result<RawVerdict> {
+    let json = extract_json_block(stdout).context("validator output had no json block")?;
+    serde_json::from_str(json).context("validator output was not valid json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_true_positive_verdict_from_fenced_block() {
+        let out = "Verdict:\n```json\n{\"verdict\":\"true_positive\",\"evidence\":\"reachable\"}\n```";
+        let v = parse_verdict(out).unwrap();
+        assert_eq!(v.verdict, Verdict::TruePositive);
+        assert_eq!(v.evidence, "reachable");
+    }
+
+    #[test]
+    fn parses_false_positive_verdict_from_bare_json() {
+        let v = parse_verdict("{\"verdict\":\"false_positive\",\"evidence\":\"guarded\"}").unwrap();
+        assert_eq!(v.verdict, Verdict::FalsePositive);
+    }
+
+    #[test]
+    fn rejects_output_without_json() {
+        assert!(parse_verdict("I could not decide.").is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_verdict_value() {
+        let err = parse_verdict("{\"verdict\":\"maybe\",\"evidence\":\"\"}").unwrap_err();
+        assert!(err.to_string().contains("not valid json"), "got: {err}");
+    }
 }

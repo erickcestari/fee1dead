@@ -22,13 +22,29 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     }
 
     let queue: Vec<Task> = ctx.artifacts.read_jsonl(names::QUEUE)?;
+    let new_tasks = plan_gapfill(&queue, gaps);
 
-    // Avoid re-queuing an area an existing task already scopes. Cheap textual
-    // containment is enough to stop obvious duplicates.
+    for task in &new_tasks {
+        ctx.artifacts.append_jsonl(names::QUEUE, task)?;
+    }
+
+    info!(
+        added = new_tasks.len(),
+        "gapfill re-queued uncovered areas"
+    );
+    Ok(())
+}
+
+/// Turn gap markers into fresh hunt tasks, skipping any area an existing queue
+/// task already scopes. Cheap bidirectional textual containment is enough to
+/// stop obvious duplicates; already-planned gaps in this batch also count as
+/// covered, so two markers for the same area produce one task. Ids continue the
+/// queue's numbering with a `G-` prefix.
+fn plan_gapfill(queue: &[Task], gaps: Vec<GapMarker>) -> Vec<Task> {
     let mut covered: HashSet<String> = queue.iter().map(|t| t.scope_hint.to_lowercase()).collect();
-
     let mut next = queue.len() + 1;
-    let mut added = 0usize;
+    let mut new_tasks = Vec::new();
+
     for gap in gaps {
         let area_key = gap.area.to_lowercase();
         if covered
@@ -37,18 +53,63 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         {
             continue;
         }
-        let task = Task {
+        new_tasks.push(Task {
             id: format!("G-{next:04}"),
             attack_class: "uncovered area".to_string(),
             scope_hint: format!("{} — {}", gap.area, gap.reason),
             origin: TaskOrigin::Gapfill,
-        };
-        ctx.artifacts.append_jsonl(names::QUEUE, &task)?;
+        });
         covered.insert(area_key);
         next += 1;
-        added += 1;
     }
 
-    info!(added, "gapfill re-queued uncovered areas");
-    Ok(())
+    new_tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: &str, hint: &str) -> Task {
+        Task {
+            id: id.into(),
+            attack_class: "c".into(),
+            scope_hint: hint.into(),
+            origin: TaskOrigin::Recon,
+        }
+    }
+
+    fn gap(area: &str, reason: &str) -> GapMarker {
+        GapMarker {
+            task_id: "T".into(),
+            area: area.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn requeues_uncovered_areas_with_continued_ids() {
+        let queue = vec![task("T-0001", "src/a.rs")];
+        let plan = plan_gapfill(&queue, vec![gap("src/b.rs", "untouched")]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].id, "G-0002");
+        assert_eq!(plan[0].attack_class, "uncovered area");
+        assert!(matches!(plan[0].origin, TaskOrigin::Gapfill));
+        assert!(plan[0].scope_hint.starts_with("src/b.rs"));
+    }
+
+    #[test]
+    fn skips_area_already_scoped_by_queue_either_direction() {
+        let queue = vec![task("T-0001", "src/auth/login.rs")];
+        // Queue hint contains the gap area, and vice versa: both are duplicates.
+        let plan = plan_gapfill(&queue, vec![gap("src/auth", "x"), gap("src/auth/login.rs:40", "y")]);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn dedupes_repeated_gaps_within_one_batch() {
+        let plan = plan_gapfill(&[], vec![gap("src/x.rs", "a"), gap("src/x.rs", "b")]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].id, "G-0001");
+    }
 }
