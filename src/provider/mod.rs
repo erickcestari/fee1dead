@@ -67,6 +67,9 @@ pub struct AgentResult {
     pub exit_code: i32,
     /// Reported cost in USD, when the provider exposes it.
     pub cost_usd: Option<f64>,
+    /// Wall-clock time the agent took to finish, measured by the provider around
+    /// the underlying process call.
+    pub duration: Duration,
     /// This run's session id, when the provider exposes one. Lets a later stage
     /// fork from this conversation (see [`ResumeSession`]).
     pub session_id: Option<String>,

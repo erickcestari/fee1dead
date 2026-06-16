@@ -68,6 +68,7 @@ impl AgentRunner for MockRunner {
                 structured: None,
                 exit_code: 0,
                 cost_usd: Some(0.0),
+                duration: std::time::Duration::ZERO,
                 session_id: r.session_id,
             }),
             None => bail!("mock runner has no canned reply for prompt"),

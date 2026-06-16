@@ -64,7 +64,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     };
 
     let result = ctx.runner.run(req).await.context("review agent failed")?;
-    ctx.cost.record("validate", "review", result.cost_usd);
+    ctx.cost
+        .record("validate", "review", result.cost_usd, result.duration);
 
     let reviews = parse_reviews(&result.stdout)?;
     let validations = reconcile(&candidates, reviews);

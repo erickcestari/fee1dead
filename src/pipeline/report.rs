@@ -83,8 +83,12 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         };
 
         let result = ctx.runner.run(req).await?;
-        ctx.cost
-            .record("report", &format!("batch-{attempt}"), result.cost_usd);
+        ctx.cost.record(
+            "report",
+            &format!("batch-{attempt}"),
+            result.cost_usd,
+            result.duration,
+        );
 
         let mut returned = match parse_records(&result.stdout) {
             Ok(r) => r,

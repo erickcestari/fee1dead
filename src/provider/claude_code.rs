@@ -144,10 +144,12 @@ impl AgentRunner for ClaudeCodeRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let started = std::time::Instant::now();
         let output = tokio::time::timeout(req.timeout, cmd.output())
             .await
             .with_context(|| format!("provider '{}' timed out", self.name))?
             .with_context(|| format!("spawning claude for provider '{}'", self.name))?;
+        let duration = started.elapsed();
 
         let raw = String::from_utf8_lossy(&output.stdout).into_owned();
         let exit_code = output.status.code().unwrap_or(-1);
@@ -194,6 +196,7 @@ impl AgentRunner for ClaudeCodeRunner {
             structured: Some(envelope),
             exit_code,
             cost_usd,
+            duration,
             session_id,
         })
     }

@@ -184,8 +184,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     for handle in handles {
         let (task, out) = handle.await.context("hunter task panicked")?;
         match out {
-            Ok((findings, gaps, cost_usd)) => {
-                ctx.cost.record("hunt", &task.id, cost_usd);
+            Ok((findings, gaps, cost_usd, duration)) => {
+                ctx.cost.record("hunt", &task.id, cost_usd, duration);
                 for (i, rf) in findings.into_iter().enumerate() {
                     let finding = Finding {
                         id: format!("{}-F{:02}", task.id, i + 1),
@@ -229,10 +229,10 @@ fn append_finding(artifacts: &Artifacts, finding: &Finding) -> Result<()> {
 async fn run_hunter(
     runner: &dyn AgentRunner,
     req: AgentRequest,
-) -> Result<(Vec<RawFinding>, Vec<RawGap>, Option<f64>)> {
+) -> Result<(Vec<RawFinding>, Vec<RawGap>, Option<f64>, std::time::Duration)> {
     let result = runner.run(req).await?;
     let json = extract_json_block(&result.stdout).context("hunter output had no json block")?;
     let out: HunterOutput =
         serde_json::from_str(json).context("hunter output was not valid json")?;
-    Ok((out.findings, out.gaps, result.cost_usd))
+    Ok((out.findings, out.gaps, result.cost_usd, result.duration))
 }

@@ -56,10 +56,12 @@ impl AgentRunner for ExecRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let started = std::time::Instant::now();
         let output = tokio::time::timeout(req.timeout, cmd.output())
             .await
             .with_context(|| format!("provider '{}' timed out", self.name))?
             .with_context(|| format!("spawning provider '{}' ({})", self.name, self.command))?;
+        let duration = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let exit_code = output.status.code().unwrap_or(-1);
@@ -86,6 +88,7 @@ impl AgentRunner for ExecRunner {
             structured,
             exit_code,
             cost_usd: None,
+            duration,
             // Exec providers have no session concept; nothing to fork from.
             session_id: None,
         })
