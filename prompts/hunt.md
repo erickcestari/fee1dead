@@ -19,9 +19,19 @@ Architectural context:
 
 - Stay on your attack class and scope. Do not drift into other classes or files.
 - A pattern that *looks* dangerous is not a finding. Trace untrusted input to
-  the sink and show the sink is reachable before reporting.
+  the sink before reporting.
+- Reachability sets `confidence` and `severity`, it does NOT delete the finding.
+  If you traced a real defect but the path is latent (only internal/test callers,
+  or guarded on one branch), still report it: low `confidence` (<=0.3) and a
+  reduced `severity`, and say so in the description. An independent reviewer
+  decides what ships — your job is to surface, not to censor.
+- Before claiming "missing check": grep the data-flow chain for an existing
+  guard (validate/verify/bounds/len/< Max). Framework/type-system guarantees
+  count. If the guard fully covers the case, drop it; if it is partial, report
+  it and cite the guard.
 {poc_rule}
-- If you found nothing, return empty arrays. Do not pad with weak findings.
+- Only discard a "finding" with no traced data path at all. Do not pad with
+  pure pattern matches; do not suppress a traced-but-latent bug.
 
 ## Workflow
 
@@ -29,8 +39,9 @@ Architectural context:
 Hunt progress:
 - [ ] Read the code in scope and trace untrusted input to the sink
 - [ ] Form a concrete hypothesis for the attack class
+- [ ] Grep callers to gauge reachability; grep the chain for existing guards
 {poc_step}
-- [ ] Keep only findings you substantiated; discard the rest
+- [ ] Set confidence + severity from reachability; keep every traced defect
 - [ ] Note areas you touched but could not fully cover (gaps)
 ```
 
@@ -44,8 +55,9 @@ Return a single fenced ```json block:
     {
       "title": "concise, specific title",
       "severity": "info|low|medium|high|critical",
+      "confidence": 0.0,
       "location": "path/to/file.ext:LINE",
-      "description": "the bug, the data flow from source to sink, and the impact",
+      "description": "the bug, the data flow from source to sink, the reachability, and the impact",
       "poc_path": "relative/path/in/scratch"
     }
   ],
@@ -55,4 +67,5 @@ Return a single fenced ```json block:
 }
 ```
 
-`poc_path` is optional.
+`poc_path` is optional. `confidence` is in [0,1]: how sure you are the bug is
+real AND reachable (latent/guarded → low).

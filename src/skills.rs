@@ -12,7 +12,7 @@ pub fn skills_for(stage: &str) -> &'static [&'static str] {
         "recon" => &["audit-context-building", "entry-point-analyzer"],
         // Hunters lean on attack-surface and insecure-default heuristics.
         "hunt" => &["sharp-edges", "insecure-defaults"],
-        // Validation is disprove-only false-positive checking.
+        // Review tags each finding (confirmed/downgraded/likely-FP) in one pass.
         "validate" => &["fp-check"],
         // Gapfill and dedupe both reason about variants of a finding.
         "gapfill" => &["variant-analysis"],

@@ -19,7 +19,7 @@ use tracing::info;
 
 use super::StageCtx;
 use crate::artifacts::names;
-use crate::domain::{Finding, GapMarker, Task, TaskOrigin, Validation, Verdict};
+use crate::domain::{Finding, GapMarker, Task, TaskOrigin, Validation};
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
@@ -31,11 +31,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     // New seeds from this run, freshest signal first.
     let mut new_seeds: Vec<Task> = Vec::new();
 
-    // Variant hunts around confirmed bugs.
-    for v in validations
-        .iter()
-        .filter(|v| v.verdict == Verdict::TruePositive)
-    {
+    // Variant hunts around bugs that survived review (confirmed or downgraded).
+    for v in validations.iter().filter(|v| v.verdict.is_reportable()) {
         if let Some(f) = by_id.get(v.finding_id.as_str()) {
             new_seeds.push(Task {
                 id: String::new(), // assigned after dedupe

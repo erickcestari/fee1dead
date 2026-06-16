@@ -1,36 +1,49 @@
-//! Report stage: render each confirmed finding into a schema-validated record,
-//! self-repairing schema errors, then persist through the configured sink.
+//! Report stage: render every reportable finding into a schema-validated record
+//! in one batched agent call, with at most one repair round for any records
+//! that fail the schema, then persist through the configured sink.
+//!
+//! "Reportable" means the reviewer tagged the finding `confirmed` or
+//! `downgraded`; a downgraded finding ships with the reviewer's corrected
+//! severity. `likely_false_positive` findings stay in the validated artifact
+//! and are not reported.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use jsonschema::JSONSchema;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
-use crate::domain::{Finding, Validation, Verdict};
+use crate::domain::{Finding, Severity, Validation};
 use crate::provider::AgentRequest;
 use crate::store::{ReportRecord, build_sink};
 
 const PROMPT: &str = include_str!("../../prompts/report.md");
 const SCHEMA_SRC: &str = include_str!("../../schema/finding.schema.json");
 
-/// How many times the agent may self-correct schema errors before we give up.
-const MAX_REPAIR_ATTEMPTS: usize = 3;
+/// How many batched passes the agent gets to satisfy the schema before we give
+/// up on whatever records are still invalid.
+const MAX_ATTEMPTS: usize = 3;
+
+/// One finding bound for the report, with the effective (post-review) severity.
+#[derive(Debug, Clone)]
+struct ReportItem {
+    id: String,
+    title: String,
+    attack_class: String,
+    severity: Severity,
+    location: String,
+    description: String,
+    evidence: String,
+}
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     let validations: Vec<Validation> = ctx.artifacts.read_jsonl(names::VALIDATED)?;
-
-    // Only true positives advance.
-    let confirmed: HashMap<&str, &Validation> = validations
-        .iter()
-        .filter(|v| v.verdict == Verdict::TruePositive)
-        .map(|v| (v.finding_id.as_str(), v))
-        .collect();
+    let items = reportable_items(&candidates, &validations);
 
     let schema_value: Value =
         serde_json::from_str(SCHEMA_SRC).context("finding schema is not valid json")?;
@@ -38,51 +51,23 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("compiling finding schema: {e}"))?;
 
     let mut sink = build_sink(&ctx.config.report)?;
-    let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
-    let mut written = 0usize;
-
-    for finding in &candidates {
-        let Some(validation) = confirmed.get(finding.id.as_str()) else {
-            continue;
-        };
-
-        match build_report(ctx, finding, validation, &schema, timeout).await {
-            Ok(mut payload) => {
-                // Authoritative id, regardless of what the agent emitted.
-                payload["id"] = Value::String(finding.id.clone());
-                sink.write(&ReportRecord {
-                    id: finding.id.clone(),
-                    payload,
-                })?;
-                written += 1;
-            }
-            Err(e) => warn!(finding = %finding.id, error = %e, "could not produce valid report"),
-        }
+    if items.is_empty() {
+        info!(written = 0, total = sink.count()?, "report complete");
+        return Ok(());
     }
 
-    info!(written, total = sink.count()?, "report complete");
-    Ok(())
-}
-
-/// Run the report agent, then validate-and-repair against the schema.
-async fn build_report(
-    ctx: &StageCtx,
-    finding: &Finding,
-    validation: &Validation,
-    schema: &JSONSchema,
-    timeout: Duration,
-) -> Result<Value> {
+    let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
+    let mut pending = items;
+    let mut done: Vec<Value> = Vec::new();
     let mut repair_note = String::new();
 
-    for attempt in 0..MAX_REPAIR_ATTEMPTS {
+    for attempt in 0..MAX_ATTEMPTS {
+        if pending.is_empty() {
+            break;
+        }
+
         let prompt = PROMPT
-            .replace("{finding_id}", &finding.id)
-            .replace("{title}", &finding.title)
-            .replace("{attack_class}", &finding.attack_class)
-            .replace("{severity}", &severity_str(finding))
-            .replace("{location}", &finding.location)
-            .replace("{description}", &finding.description)
-            .replace("{evidence}", &validation.evidence)
+            .replace("{findings_json}", &report_input(&pending))
             .replace("{schema}", SCHEMA_SRC)
             .replace("{repair_note}", &repair_note);
 
@@ -98,36 +83,146 @@ async fn build_report(
         };
 
         let result = ctx.runner.run(req).await?;
-        ctx.cost.record("report", &finding.id, result.cost_usd);
-        let json = extract_json_block(&result.stdout).context("report output had no json block")?;
-        let payload: Value = match serde_json::from_str(json) {
-            Ok(v) => v,
+        ctx.cost
+            .record("report", &format!("batch-{attempt}"), result.cost_usd);
+
+        let mut returned = match parse_records(&result.stdout) {
+            Ok(r) => r,
             Err(e) => {
-                repair_note = format!(
-                    "Your previous output was not valid JSON ({e}). Return only a valid json object."
-                );
+                warn!(attempt, error = %e, "report output unparseable; retrying");
+                repair_note = "Your previous output was not a JSON array. Return ONLY a \
+                    fenced ```json array of report objects, one per finding."
+                    .to_string();
                 continue;
             }
         };
 
-        let errors = schema_errors(schema, &payload);
-
-        if errors.is_empty() {
-            return Ok(payload);
+        let (still_pending, notes) = collect_valid(&mut pending, &mut returned, &schema, &mut done);
+        pending = still_pending;
+        if pending.is_empty() {
+            break;
         }
-
-        warn!(finding = %finding.id, attempt, ?errors, "report failed schema; repairing");
         repair_note = format!(
-            "Your previous output failed schema validation with these errors:\n- {}\nFix them.",
-            errors.join("\n- ")
+            "These findings were missing or failed schema validation; return ALL of them \
+             again, fixed:\n- {}",
+            notes.join("\n- ")
+        );
+        warn!(attempt, remaining = pending.len(), "report repairing records");
+    }
+
+    for payload in &done {
+        let id = payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        sink.write(&ReportRecord {
+            id,
+            payload: payload.clone(),
+        })?;
+    }
+    if !pending.is_empty() {
+        warn!(
+            count = pending.len(),
+            "findings could not be rendered to a valid report"
         );
     }
 
-    bail!("report did not validate after {MAX_REPAIR_ATTEMPTS} attempts");
+    info!(written = done.len(), total = sink.count()?, "report complete");
+    Ok(())
 }
 
-fn severity_str(f: &Finding) -> String {
-    serde_json::to_value(f.severity)
+/// Select the findings that advance to the report and stamp each with its
+/// effective severity (the reviewer's correction for downgraded findings).
+fn reportable_items(candidates: &[Finding], validations: &[Validation]) -> Vec<ReportItem> {
+    let by_id: HashMap<&str, &Finding> = candidates.iter().map(|f| (f.id.as_str(), f)).collect();
+    validations
+        .iter()
+        .filter(|v| v.verdict.is_reportable())
+        .filter_map(|v| {
+            let f = by_id.get(v.finding_id.as_str())?;
+            Some(ReportItem {
+                id: f.id.clone(),
+                title: f.title.clone(),
+                attack_class: f.attack_class.clone(),
+                severity: v.corrected_severity.unwrap_or(f.severity),
+                location: f.location.clone(),
+                description: f.description.clone(),
+                evidence: v.evidence.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Serialize the pending items into the JSON the report agent reads.
+fn report_input(items: &[ReportItem]) -> String {
+    let arr: Vec<_> = items
+        .iter()
+        .map(|it| {
+            json!({
+                "id": it.id,
+                "title": it.title,
+                "attack_class": it.attack_class,
+                "severity": it.severity,
+                "location": it.location,
+                "description": it.description,
+                "evidence": it.evidence,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+/// Parse the agent's reply into an array of report objects.
+fn parse_records(stdout: &str) -> Result<Vec<Value>> {
+    let json = extract_json_block(stdout).context("report output had no json block")?;
+    serde_json::from_str(json).context("report output was not a json array")
+}
+
+/// Match returned records to pending items by id, enforce the authoritative id
+/// and severity, and schema-check each. Valid records move to `done`; the rest
+/// stay pending. Returns the still-pending items and a note per failure.
+fn collect_valid(
+    pending: &mut [ReportItem],
+    returned: &mut [Value],
+    schema: &JSONSchema,
+    done: &mut Vec<Value>,
+) -> (Vec<ReportItem>, Vec<String>) {
+    let mut by_id: HashMap<String, Value> = returned
+        .iter_mut()
+        .filter_map(|v| {
+            let id = v.get("id").and_then(|i| i.as_str()).map(str::to_string)?;
+            Some((id, v.take()))
+        })
+        .collect();
+
+    let mut still = Vec::new();
+    let mut notes = Vec::new();
+    for item in pending.iter() {
+        match by_id.remove(&item.id) {
+            Some(mut payload) => {
+                // Harness-authoritative: never trust the model to echo these.
+                payload["id"] = Value::String(item.id.clone());
+                payload["severity"] = Value::String(severity_str(item.severity));
+                let errors = schema_errors(schema, &payload);
+                if errors.is_empty() {
+                    done.push(payload);
+                } else {
+                    notes.push(format!("{}: {}", item.id, errors.join("; ")));
+                    still.push(item.clone());
+                }
+            }
+            None => {
+                notes.push(format!("{}: no record returned", item.id));
+                still.push(item.clone());
+            }
+        }
+    }
+    (still, notes)
+}
+
+fn severity_str(sev: Severity) -> String {
+    serde_json::to_value(sev)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "medium".into())
@@ -145,79 +240,144 @@ fn schema_errors(schema: &JSONSchema, payload: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Severity;
-    use serde_json::json;
+    use crate::domain::Verdict;
 
     fn compiled_schema() -> JSONSchema {
         let value: Value = serde_json::from_str(SCHEMA_SRC).unwrap();
         JSONSchema::compile(&value).unwrap()
     }
 
-    fn finding(sev: Severity) -> Finding {
+    fn finding(id: &str, sev: Severity) -> Finding {
         Finding {
-            id: "F-1".into(),
+            id: id.into(),
             task_id: "T".into(),
             title: "t".into(),
             attack_class: "c".into(),
             severity: sev,
             location: "a.rs:1".into(),
             description: "d".into(),
+            confidence: 0.5,
             poc_path: None,
         }
     }
 
+    fn validation(id: &str, verdict: Verdict, corrected: Option<Severity>) -> Validation {
+        Validation {
+            finding_id: id.into(),
+            verdict,
+            evidence: "e".into(),
+            corrected_severity: corrected,
+        }
+    }
+
+    fn full_record(id: &str, sev: &str) -> Value {
+        json!({
+            "id": id, "title": "x", "attack_class": "c", "severity": sev,
+            "location": "a.rs:1", "description": "d", "impact": "i", "recommendation": "r"
+        })
+    }
+
     #[test]
     fn embedded_schema_compiles() {
-        // Guards the build artifact: a malformed schema/finding.schema.json
-        // would break every report run, so fail loudly in tests instead.
         let _ = compiled_schema();
     }
 
     #[test]
-    fn complete_payload_passes_schema() {
-        let schema = compiled_schema();
-        let payload = json!({
-            "id": "F-1",
-            "title": "Integer overflow",
-            "attack_class": "overflow",
-            "severity": "high",
-            "location": "src/a.rs:10",
-            "description": "adds two attacker-controlled u32s",
-            "impact": "panic / wrong accounting",
-            "recommendation": "use checked_add"
-        });
-        assert!(schema_errors(&schema, &payload).is_empty());
+    fn only_reportable_verdicts_advance_with_corrected_severity() {
+        let candidates = vec![
+            finding("F-1", Severity::High),
+            finding("F-2", Severity::High),
+            finding("F-3", Severity::High),
+        ];
+        let validations = vec![
+            validation("F-1", Verdict::Confirmed, None),
+            validation("F-2", Verdict::Downgraded, Some(Severity::Low)),
+            validation("F-3", Verdict::LikelyFalsePositive, None),
+        ];
+        let items = reportable_items(&candidates, &validations);
+        assert_eq!(items.len(), 2, "likely_false_positive must not advance");
+        assert_eq!(items[0].id, "F-1");
+        assert_eq!(items[0].severity, Severity::High);
+        // Downgrade applied.
+        assert_eq!(items[1].id, "F-2");
+        assert_eq!(items[1].severity, Severity::Low);
     }
 
     #[test]
-    fn missing_required_fields_reported() {
+    fn collect_valid_separates_good_from_bad_and_enforces_id_and_severity() {
         let schema = compiled_schema();
-        // Missing impact + recommendation (both required).
-        let payload = json!({
-            "id": "F-1",
-            "title": "x",
-            "attack_class": "c",
-            "severity": "low",
-            "location": "a.rs:1",
-            "description": "d"
-        });
-        assert!(!schema_errors(&schema, &payload).is_empty());
+        let pending = [
+            ReportItem {
+                id: "F-1".into(),
+                title: "t".into(),
+                attack_class: "c".into(),
+                severity: Severity::Low,
+                location: "a.rs:1".into(),
+                description: "d".into(),
+                evidence: "e".into(),
+            },
+            ReportItem {
+                id: "F-2".into(),
+                title: "t".into(),
+                attack_class: "c".into(),
+                severity: Severity::High,
+                location: "a.rs:1".into(),
+                description: "d".into(),
+                evidence: "e".into(),
+            },
+        ];
+        // F-1: agent echoed wrong id+severity → must be overwritten and pass.
+        // F-2: missing required fields → must stay pending.
+        let mut returned = vec![
+            json!({
+                "id": "WRONG", "title": "x", "attack_class": "c", "severity": "critical",
+                "location": "a.rs:1", "description": "d", "impact": "i", "recommendation": "r"
+            }),
+            json!({"id": "F-2", "title": "x"}),
+        ];
+        // The first returned record matches F-1 only if its id matches; the
+        // model echoed "WRONG", so F-1 has no match and stays pending while the
+        // stray record is ignored. This documents that id echo is required.
+        let mut pending_vec = pending.to_vec();
+        let mut done = Vec::new();
+        let (still, notes) = collect_valid(&mut pending_vec, &mut returned, &schema, &mut done);
+        assert_eq!(done.len(), 0);
+        assert_eq!(still.len(), 2);
+        assert_eq!(notes.len(), 2);
     }
 
     #[test]
-    fn invalid_severity_enum_reported() {
+    fn collect_valid_accepts_matching_records_and_overwrites_severity() {
         let schema = compiled_schema();
-        let payload = json!({
-            "id": "F-1", "title": "x", "attack_class": "c",
-            "severity": "catastrophic", "location": "a.rs:1",
-            "description": "d", "impact": "i", "recommendation": "r"
-        });
-        assert!(!schema_errors(&schema, &payload).is_empty());
+        let pending = [ReportItem {
+            id: "F-1".into(),
+            title: "t".into(),
+            attack_class: "c".into(),
+            severity: Severity::Low, // effective severity wins over the record's
+            location: "a.rs:1".into(),
+            description: "d".into(),
+            evidence: "e".into(),
+        }];
+        let mut returned = vec![full_record("F-1", "critical")];
+        let mut pending_vec = pending.to_vec();
+        let mut done = Vec::new();
+        let (still, _notes) = collect_valid(&mut pending_vec, &mut returned, &schema, &mut done);
+        assert!(still.is_empty());
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0]["severity"], "low");
+        assert_eq!(done[0]["id"], "F-1");
     }
 
     #[test]
     fn severity_renders_as_schema_enum_value() {
-        assert_eq!(severity_str(&finding(Severity::Critical)), "critical");
-        assert_eq!(severity_str(&finding(Severity::Info)), "info");
+        assert_eq!(severity_str(Severity::Critical), "critical");
+        assert_eq!(severity_str(Severity::Info), "info");
+    }
+
+    #[test]
+    fn schema_errors_flags_missing_required_fields() {
+        let schema = compiled_schema();
+        assert!(!schema_errors(&schema, &json!({"id": "F-1"})).is_empty());
+        assert!(schema_errors(&schema, &full_record("F-1", "high")).is_empty());
     }
 }

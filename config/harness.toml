@@ -80,4 +80,4 @@ max_seeds = 200
 # feedback runs last: it distils this run into feedback-seeds.jsonl, which the
 # next run's recon merges back into the queue. Keep the same out_dir to retain
 # that memory across runs.
-enabled = ["recon", "hunt", "dedupe", "validate", "report", "feedback"]
+enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "validate", "report", "feedback"]

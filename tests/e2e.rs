@@ -25,13 +25,13 @@ Build: `cargo build`. Entry point: src/parse.rs.
                 .into(),
             session_id: Some(RECON_SESSION_ID.into()),
         },
-        // Hunter: one finding, one gap.
+        // Hunter: one finding (with confidence), one gap.
         CannedReply {
             match_substr: Some("You are a Hunter".into()),
             stdout: r#"```json
 {
   "findings": [
-    {"title": "unchecked add overflows length", "severity": "high",
+    {"title": "unchecked add overflows length", "severity": "high", "confidence": 0.8,
      "location": "src/parse.rs:42",
      "description": "attacker-controlled length added without bounds check"}
   ],
@@ -41,20 +41,20 @@ Build: `cargo build`. Entry point: src/parse.rs.
                 .into(),
             session_id: None,
         },
-        // Validator: confirm it.
+        // Reviewer: batched verdict array, keyed by finding_id. Confirms it.
         CannedReply {
-            match_substr: Some("You are the Validator".into()),
+            match_substr: Some("You are the Reviewer".into()),
             stdout: r#"```json
-{"verdict": "true_positive", "evidence": "len*4 wraps for len > u32::MAX/4"}
+[{"finding_id": "T-0001-F01", "verdict": "confirmed", "evidence": "len*4 wraps for len > u32::MAX/4"}]
 ```"#
                 .into(),
             session_id: None,
         },
-        // Report: a schema-valid record.
+        // Report: batched array of schema-valid records, keyed by id.
         CannedReply {
             match_substr: Some("You are the Report agent".into()),
             stdout: r#"```json
-{
+[{
   "id": "T-0001-F01",
   "title": "unchecked add overflows length",
   "attack_class": "integer overflow",
@@ -63,7 +63,7 @@ Build: `cargo build`. Entry point: src/parse.rs.
   "description": "attacker-controlled length added without bounds check",
   "impact": "heap buffer overflow leading to RCE",
   "recommendation": "use checked_add and reject oversized lengths"
-}
+}]
 ```"#
                 .into(),
             session_id: None,

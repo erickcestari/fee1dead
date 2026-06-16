@@ -15,11 +15,11 @@ per-task scratch space, and validates/persists results.
 |------------|----------|--------------|
 | Recon      | built    | Reads the repo top-down, emits `ARCHITECTURE.md` and seeds the hunt queue. |
 | Hunt       | built    | One hunter per task (attack class + scope hint), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context, not just `ARCHITECTURE.md`. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
-| Validate   | built    | Independent agent re-reads the code and tries to **disprove** each finding (`fp-check` skill). Emits verdicts only. |
+| Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
 | Feedback   | built    | Cross-run memory: distils confirmed findings (hunt variants) and unresolved gaps into durable seed tasks in `feedback-seeds.jsonl`. The next run's recon merges them, so each run starts smarter. |
-| Report     | built    | Renders confirmed findings against `schema/finding.schema.json`, self-repairs schema errors, persists via the configured sink. |
+| Report     | built    | Renders all reportable findings (confirmed + downgraded) against `schema/finding.schema.json` in **one batched call** with a single repair round, then persists via the configured sink. |
 
 Stages communicate only through artifacts in `out_dir` (`queue.jsonl`,
 `candidates.jsonl`, `gaps.jsonl`, `validated.jsonl`, `hunted.jsonl`,

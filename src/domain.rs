@@ -44,9 +44,18 @@ pub struct Finding {
     pub location: String,
     /// What the hunter believes the bug is and why it matters.
     pub description: String,
+    /// Hunter's self-assessed confidence in [0,1]. Latent / hard-to-reach bugs
+    /// get a low score rather than being discarded, so the review stage (not the
+    /// hunter) decides what to surface. Defaults to 0.5 for older artifacts.
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
     /// Optional path to a proof-of-concept in the task scratch dir.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poc_path: Option<String>,
+}
+
+fn default_confidence() -> f64 {
+    0.5
 }
 
 /// Variants are declared in ascending order so the derived `Ord` ranks
@@ -61,23 +70,44 @@ pub enum Severity {
     Critical,
 }
 
-/// Validation verdict produced by the (independent) Validate stage.
+/// Review verdict produced by the (independent) Validate stage.
 ///
-/// The validator can only confirm or refute a hunter's finding; it cannot emit
-/// new findings of its own.
+/// The reviewer never deletes a finding; it *tags* it. A latent or
+/// defense-in-depth issue is downgraded, not dropped, so a real bug the hunter
+/// could not fully prove still reaches a human instead of vanishing. Only
+/// `LikelyFalsePositive` is held back from the report (it stays in the
+/// validated artifact for review).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Validation {
     pub finding_id: String,
     pub verdict: Verdict,
     /// Evidence supporting the verdict (trace, failed assumption, PoC result).
     pub evidence: String,
+    /// Set only when `verdict == Downgraded`: the severity the reviewer judges
+    /// correct, which the report stage applies in place of the hunter's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_severity: Option<Severity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    TruePositive,
-    FalsePositive,
+    /// Data flow holds, attacker control proven; file as-is.
+    Confirmed,
+    /// Real issue but overstated; file with `corrected_severity`.
+    Downgraded,
+    /// Unreachable, mis-cited, or operational-not-security; keep for review,
+    /// do not report.
+    LikelyFalsePositive,
+}
+
+impl Verdict {
+    /// Whether a finding with this verdict advances to the report. Downgraded
+    /// findings still ship (with corrected severity); only likely-false-
+    /// positives are held back.
+    pub fn is_reportable(self) -> bool {
+        matches!(self, Verdict::Confirmed | Verdict::Downgraded)
+    }
 }
 
 /// An area a hunter touched but did not cover thoroughly.
@@ -118,8 +148,28 @@ mod tests {
 
     #[test]
     fn verdict_uses_snake_case_on_the_wire() {
-        assert_eq!(serde_json::to_string(&Verdict::TruePositive).unwrap(), "\"true_positive\"");
-        assert_eq!(serde_json::to_string(&Verdict::FalsePositive).unwrap(), "\"false_positive\"");
+        assert_eq!(serde_json::to_string(&Verdict::Confirmed).unwrap(), "\"confirmed\"");
+        assert_eq!(serde_json::to_string(&Verdict::Downgraded).unwrap(), "\"downgraded\"");
+        assert_eq!(
+            serde_json::to_string(&Verdict::LikelyFalsePositive).unwrap(),
+            "\"likely_false_positive\""
+        );
+    }
+
+    #[test]
+    fn only_confirmed_and_downgraded_are_reportable() {
+        assert!(Verdict::Confirmed.is_reportable());
+        assert!(Verdict::Downgraded.is_reportable());
+        assert!(!Verdict::LikelyFalsePositive.is_reportable());
+    }
+
+    #[test]
+    fn finding_confidence_defaults_when_absent() {
+        let f: Finding = serde_json::from_str(
+            "{\"id\":\"F-1\",\"task_id\":\"T\",\"title\":\"t\",\"attack_class\":\"c\",\"severity\":\"low\",\"location\":\"a.rs:1\",\"description\":\"d\"}",
+        )
+        .unwrap();
+        assert_eq!(f.confidence, 0.5);
     }
 
     #[test]
@@ -142,6 +192,7 @@ mod tests {
             severity: Severity::Low,
             location: "a.rs:1".into(),
             description: "d".into(),
+            confidence: 0.9,
             poc_path: None,
         };
         let json = serde_json::to_string(&f).unwrap();

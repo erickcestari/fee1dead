@@ -33,8 +33,15 @@ struct RawFinding {
     severity: Severity,
     location: String,
     description: String,
+    /// Hunter's confidence in [0,1]; defaults mid-scale if the hunter omits it.
+    #[serde(default = "half")]
+    confidence: f64,
     #[serde(default)]
     poc_path: Option<String>,
+}
+
+fn half() -> f64 {
+    0.5
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +195,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                         severity: rf.severity,
                         location: rf.location,
                         description: rf.description,
+                        confidence: rf.confidence,
                         poc_path: rf.poc_path,
                     };
                     append_finding(&ctx.artifacts, &finding)?;

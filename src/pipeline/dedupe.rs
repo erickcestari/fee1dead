@@ -83,6 +83,7 @@ mod tests {
             severity: sev,
             location: location.into(),
             description: "d".into(),
+            confidence: 0.5,
             poc_path: None,
         }
     }
