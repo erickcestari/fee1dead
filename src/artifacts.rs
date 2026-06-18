@@ -28,9 +28,11 @@ pub mod names {
     /// The recon agent's session id, so hunters can fork from its context.
     /// Holds a single line of text, not JSONL.
     pub const RECON_SESSION: &str = "recon-session.txt";
-    /// Per-agent telemetry: one JSONL row per agent run (stage, label, cost,
-    /// duration). Lets a run be profiled after the fact to find bottlenecks.
-    pub const COSTS: &str = "costs.jsonl";
+    /// Directory of per-agent event-stream transcripts (one JSONL file per agent
+    /// run). Each transcript's final `result` event carries that agent's cost,
+    /// token usage, and prompt-cache hits, so a run is profiled from here. Cleared
+    /// wholesale at the start of a recon-led run.
+    pub const LOGS: &str = "logs";
 
     /// Artifacts produced fresh by a single run (everything except SEEDS).
     /// Cleared at the start of a run that includes recon.
@@ -42,7 +44,6 @@ pub mod names {
         VALIDATED,
         HUNTED,
         RECON_SESSION,
-        COSTS,
     ];
 }
 
@@ -62,6 +63,11 @@ impl Artifacts {
 
     pub fn path(&self, name: &str) -> PathBuf {
         self.out_dir.join(name)
+    }
+
+    /// Path of a per-agent stream-log file, under the [`names::LOGS`] dir.
+    pub fn log_path(&self, file: &str) -> PathBuf {
+        self.path(names::LOGS).join(file)
     }
 
     /// Overwrite a JSONL file with `items`.
@@ -139,6 +145,16 @@ impl Artifacts {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    /// Recursively delete a directory artifact if present (no error when absent).
+    pub fn remove_dir(&self, name: &str) -> Result<()> {
+        let path = self.path(name);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing dir {}", path.display())),
         }
     }
 }

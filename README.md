@@ -14,7 +14,7 @@ per-task scratch space, and validates/persists results.
 | Stage      | Status   | What it does |
 |------------|----------|--------------|
 | Recon      | built    | Reads the repo top-down, emits `ARCHITECTURE.md` and seeds the hunt queue. |
-| Hunt       | built    | One hunter per task (attack class + scope hint), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context, not just `ARCHITECTURE.md`. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
+| Hunt       | built    | One hunter per task (attack class + scope hint + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context, not just `ARCHITECTURE.md`. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
 | Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
@@ -28,9 +28,24 @@ run clears those per-run artifacts at startup; `feedback-seeds.jsonl` is the one
 durable artifact and survives, carrying learning between runs. **Reuse the same
 `out_dir` (mount) across runs to keep the feedback memory.**
 
-Every agent run also appends a row to `out_dir/costs.jsonl`
-(`{stage, label, cost_usd, duration_secs}`), so a run can be profiled after the
-fact to find which stage or task dominates cost and wall-clock time.
+The full agent transcript of each run is teed live to `out_dir/logs/` (one
+`<stage>-<label>.jsonl` per agent, the Claude CLI's `stream-json` events), so a
+run can be replayed or debugged after the fact — a transcript survives even if
+its agent times out. Its final `result` event also carries that agent's cost and
+token usage (`total_cost_usd`, `duration_ms`, `num_turns`, and a `usage` block
+with token counts and prompt-cache hits), so the harness keeps no separate cost
+file — profile a run straight from the logs, e.g.:
+
+```sh
+jq -s 'map(select(.type=="result") | .total_cost_usd) | add' out_dir/logs/*.jsonl
+```
+
+Each agent is also told to write its complete final answer to
+`agent-final-output.txt` in its working dir; the harness reads that file back as
+the result (falling back to the stream's final event if the agent didn't write
+it) and mirrors it next to the transcript as `out_dir/logs/<stage>-<label>.output.txt`,
+so each agent's answer is visible in the out dir without reaching into its scratch
+dir. The `logs/` directory is cleared at the start of a recon-led run.
 
 ## Architecture
 
@@ -85,6 +100,23 @@ ref  = "main"   # branch, tag, or commit SHA; optional
 
 Then `just run-clone` (no local target mount needed). With `[target]` unset, the
 harness expects `target_dir` to already contain the code (the mounted case).
+
+### Reference spec / known-good implementation
+
+Set `[reference]` to clone a spec or reference implementation and expose it to
+the recon, hunt, and validate agents as ground truth — its path is added to each
+agent's readable dirs and named in their prompts. When a reference is set, recon
+also emits dedicated `spec-to-code-compliance` hunt tasks (a spec clause paired
+with its implementing code), and those hunters apply the `spec-to-code-compliance`
+skill. Useful for spec conformance (e.g. the BOLT specs for a Lightning
+implementation). The git host must also be in `[firewall].allow`.
+
+```toml
+[reference]
+repo = "https://github.com/lightning/bolts.git"
+ref  = "master"           # optional
+dir  = "/work/reference"  # where to clone it; defaults to /work/reference
+```
 
 Or directly:
 

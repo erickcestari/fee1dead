@@ -1,17 +1,26 @@
 //! Claude Code CLI adapter — the only built-in provider implementation.
 //!
-//! Invokes `claude -p <prompt> --output-format json ...` and unwraps the JSON
-//! result envelope into an [`AgentResult`]. The agent runs with whatever extra
-//! args the config supplies (typically `--dangerously-skip-permissions`, since
-//! the container is the security boundary, not the tool allow-list).
+//! Invokes `claude -p <prompt> --output-format stream-json --verbose ...` and
+//! consumes the event stream line by line, teeing it to a per-agent log file as
+//! it runs (so a timed-out agent still leaves a transcript, and cost/usage stay
+//! in that log's final `result` event). The agent is told to write its complete
+//! final answer to a file (see [`super::FINAL_OUTPUT_FILE`]); the harness reads
+//! that back as the result, decoupling the consumed output from the noisy
+//! stream. The agent runs with whatever extra args the config supplies
+//! (typically `--dangerously-skip-permissions`, since the container is the
+//! security boundary, not the tool allow-list — which also lets it `Write`).
 
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tracing::warn;
 
-use super::{AgentRequest, AgentResult, AgentRunner};
+use super::{AgentRequest, AgentResult, AgentRunner, final_output_path};
 
 /// Environment that makes session forking actually cheap.
 ///
@@ -61,6 +70,24 @@ impl ClaudeCodeRunner {
     }
 }
 
+/// Append the "write your final answer to a file" instruction to the user
+/// prompt.
+///
+/// It goes in the per-agent user prompt — never the shared system prefix — on
+/// purpose: the path is per-agent (the working dir), so injecting it into the
+/// cached system prompt would bust the cross-fork cache the whole design relies
+/// on. A new user turn is uncached regardless, so this costs nothing extra.
+fn with_final_output_instruction(prompt: &str, working_dir: &Path) -> String {
+    let path = final_output_path(working_dir);
+    format!(
+        "{prompt}\n\n---\nWhen you are finished, use the Write tool to save your \
+         COMPLETE final answer — the exact content you would otherwise print, \
+         verbatim and in full — to this file:\n  {}\nThat file, not your chat \
+         output, is what gets consumed downstream, so it must stand on its own.",
+        path.display()
+    )
+}
+
 /// Build the `claude` argv (after the program name) and the directory to run
 /// in for one request.
 ///
@@ -75,9 +102,12 @@ fn build_invocation(
 ) -> (Vec<String>, std::path::PathBuf) {
     let mut args = vec![
         "-p".to_string(),
-        req.prompt.clone(),
+        with_final_output_instruction(&req.prompt, &req.working_dir),
+        // Stream the event log so a long-running (or timed-out) agent can be
+        // teed to disk live; `--verbose` is required for stream-json under -p.
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
         "--add-dir".to_string(),
         req.working_dir.to_string_lossy().into_owned(),
         // Stabilize the cacheable system-prompt prefix. Forks run in different
@@ -90,6 +120,13 @@ fn build_invocation(
         // --append-system-prompt below).
         "--exclude-dynamic-system-prompt-sections".to_string(),
     ];
+
+    // Extra readable dirs (e.g. the cloned reference repo) so the agent can read
+    // them without a permission prompt.
+    for dir in &req.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(dir.to_string_lossy().into_owned());
+    }
 
     // Forking a prior session must run in that session's project dir, since
     // claude scopes `--resume` lookup to the current directory. The agent's own
@@ -117,6 +154,10 @@ fn build_invocation(
         args.push("--allowedTools".to_string());
         args.push(req.allowed_tools.join(","));
     }
+    if !req.disallowed_tools.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.push(req.disallowed_tools.join(","));
+    }
     if let Some(max_turns) = req.max_turns {
         args.push("--max-turns".to_string());
         args.push(max_turns.to_string());
@@ -138,68 +179,184 @@ impl AgentRunner for ClaudeCodeRunner {
         let mut cmd = Command::new("claude");
         cmd.args(&args);
         cmd.envs(CACHE_ENV.iter().copied());
-
         cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // If we abandon the child on timeout, don't leak the process.
+            .kill_on_drop(true);
 
-        let started = std::time::Instant::now();
-        let output = tokio::time::timeout(req.timeout, cmd.output())
-            .await
-            .with_context(|| format!("provider '{}' timed out", self.name))?
+        let mut child = cmd
+            .spawn()
             .with_context(|| format!("spawning claude for provider '{}'", self.name))?;
-        let duration = started.elapsed();
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
 
-        let raw = String::from_utf8_lossy(&output.stdout).into_owned();
-        let exit_code = output.status.code().unwrap_or(-1);
+        // Drain stderr concurrently: a full stderr pipe would otherwise deadlock
+        // the child while we read stdout.
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+            buf
+        });
+
+        // Open the live event-stream tee, if requested. A logging failure must
+        // not abort the run, so it degrades to "no tee" with a warning.
+        let mut log = match &req.stream_log_path {
+            Some(p) => match open_log(p).await {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    warn!(error = %e, path = %p.display(), "failed to open agent stream log");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // Consume the stream line by line, teeing each event and keeping the
+        // final `result` event (the only one carrying cost/usage/session id).
+        let mut lines = BufReader::new(stdout).lines();
+        let mut result_event: Option<serde_json::Value> = None;
+        let pump = async {
+            while let Some(line) = lines.next_line().await? {
+                if let Some(f) = log.as_mut() {
+                    // Flush per line so a kill-on-timeout still leaves a usable
+                    // partial transcript.
+                    f.write_all(line.as_bytes()).await?;
+                    f.write_all(b"\n").await?;
+                    f.flush().await?;
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+                    && v.get("type").and_then(|t| t.as_str()) == Some("result")
+                {
+                    result_event = Some(v);
+                }
+            }
+            anyhow::Ok(())
+        };
+
+        match tokio::time::timeout(req.timeout, pump).await {
+            Err(_) => {
+                let _ = child.start_kill();
+                bail!(
+                    "provider '{}' timed out (partial stream log kept)",
+                    self.name
+                );
+            }
+            Ok(Err(e)) => {
+                return Err(e)
+                    .with_context(|| format!("reading claude stream for '{}'", self.name));
+            }
+            Ok(Ok(())) => {}
+        }
+
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("waiting on claude for '{}'", self.name))?;
+        let exit_code = status.code().unwrap_or(-1);
+        let stderr_out = stderr_task.await.unwrap_or_default();
 
         if exit_code != 0 {
-            // claude reports errors on stdout under --output-format json, so
-            // surface both streams.
-            let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "claude exited with code {exit_code}: stderr=[{}] stdout=[{}]",
-                stderr.trim(),
-                raw.trim()
+                "claude exited with code {exit_code}: stderr=[{}]",
+                stderr_out.trim()
             );
         }
 
-        let envelope: serde_json::Value = serde_json::from_str(raw.trim())
-            .with_context(|| format!("claude did not emit valid JSON: {}", raw.trim()))?;
+        let result_event = result_event
+            .with_context(|| format!("claude stream for '{}' had no result event", self.name))?;
+        if result_event.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+            // claude reports usage/session/rate limits as a successful-subtype
+            // result with is_error=true and a human message in `.result`. Tag
+            // those so the orchestrator can stop hammering a limited account.
+            let msg = result_event
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if is_usage_limit_message(msg) {
+                return Err(super::ProviderError::UsageLimited(msg.to_string()).into());
+            }
+            bail!("claude reported an error: {msg}");
+        }
 
-        if envelope.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
-            bail!(
-                "claude reported an error: {}",
-                envelope
+        // The agent was told to write its complete final answer to a file; that
+        // is the result we consume. Fall back to the result event's text if it
+        // forgot (or lacked the Write tool), so a stray run still makes progress.
+        let final_path = final_output_path(&req.working_dir);
+        let stdout = match fs::read_to_string(&final_path).await {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => {
+                warn!(
+                    path = %final_path.display(),
+                    "agent did not write its final-output file; using the result event text"
+                );
+                result_event
                     .get("result")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-            );
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+
+        // Mirror the consumed final answer next to its transcript in the out
+        // dir, so it's visible there without reaching into the agent's scratch
+        // dir. Best-effort: persisting it must never fail the run.
+        if let Some(log_path) = &req.stream_log_path {
+            let sidecar = output_sidecar(log_path);
+            if let Err(e) = fs::write(&sidecar, &stdout).await {
+                warn!(error = %e, path = %sidecar.display(), "failed to persist agent final output");
+            }
         }
 
-        // The textual result lives in `.result`; fall back to the whole payload.
-        let stdout = envelope
-            .get("result")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| raw.clone());
-
-        let cost_usd = envelope.get("total_cost_usd").and_then(|v| v.as_f64());
-        let session_id = envelope
+        // Cost, timing, and token usage (prompt-cache hits included) all live in
+        // the result event, which has already been teed to the stream log; we
+        // only need the session id off it here, for later forks.
+        let session_id = result_event
             .get("session_id")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
 
         Ok(AgentResult {
             stdout,
-            structured: Some(envelope),
             exit_code,
-            cost_usd,
-            duration,
             session_id,
         })
     }
+}
+
+/// Heuristic: does an error `.result` message describe a usage/session/rate
+/// limit? Matched against the human strings claude emits, e.g. "You've hit your
+/// session limit · resets 2:50am". Kept deliberately broad-but-anchored on the
+/// word "limit" so a new phrasing still trips it without matching unrelated
+/// errors.
+fn is_usage_limit_message(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("limit")
+        && (m.contains("session")
+            || m.contains("usage")
+            || m.contains("rate")
+            || m.contains("hit your")
+            || m.contains("resets"))
+}
+
+/// Path of the final-answer sidecar that sits beside a stream log: the
+/// transcript `<base>.jsonl` is paired with the consumed answer
+/// `<base>.output.txt` in the same dir.
+fn output_sidecar(stream_log_path: &Path) -> std::path::PathBuf {
+    stream_log_path.with_extension("output.txt")
+}
+
+/// Create (truncating) the stream-log file, making parent dirs as needed.
+async fn open_log(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating log dir {}", parent.display()))?;
+    }
+    fs::File::create(path)
+        .await
+        .with_context(|| format!("creating stream log {}", path.display()))
 }
 
 #[cfg(test)]
@@ -214,17 +371,21 @@ mod tests {
             prompt: "find bugs".into(),
             system: None,
             working_dir: PathBuf::from("/work/scratch/t1"),
+            extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
-            skills: Vec::new(),
+            disallowed_tools: Vec::new(),
             timeout: Duration::from_secs(1),
             max_turns: None,
             resume: None,
+            stream_log_path: None,
         }
     }
 
     /// Find the value following `flag` in an argv, if present.
     fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str())
+        args.iter()
+            .position(|a| a == flag)
+            .map(|i| args[i + 1].as_str())
     }
 
     #[test]
@@ -233,14 +394,41 @@ mod tests {
         // must carry the prefix-stabilization flag or forks miss recon's cache.
         let (args, cwd) = build_invocation(&req(), Some("claude-opus-4-8"), &[]);
         assert!(args.contains(&"--exclude-dynamic-system-prompt-sections".to_string()));
-        assert_eq!(arg_after(&args, "-p"), Some("find bugs"));
-        assert_eq!(arg_after(&args, "--output-format"), Some("json"));
+        // The prompt carries the original text plus the final-output instruction
+        // (with the working dir's path), and the stream-json format is requested.
+        let prompt = arg_after(&args, "-p").unwrap();
+        assert!(prompt.starts_with("find bugs"));
+        assert!(prompt.contains("agent-final-output.txt"));
+        assert!(prompt.contains("/work/scratch/t1"));
+        assert_eq!(arg_after(&args, "--output-format"), Some("stream-json"));
+        assert!(args.contains(&"--verbose".to_string()));
         assert_eq!(arg_after(&args, "--add-dir"), Some("/work/scratch/t1"));
         assert_eq!(arg_after(&args, "--model"), Some("claude-opus-4-8"));
         // No resume: run in the working dir, no --resume/--fork-session.
         assert_eq!(cwd, PathBuf::from("/work/scratch/t1"));
         assert!(!args.contains(&"--resume".to_string()));
         assert!(!args.contains(&"--fork-session".to_string()));
+    }
+
+    #[test]
+    fn extra_dirs_each_get_an_add_dir_flag() {
+        let mut r = req();
+        r.extra_dirs = vec![
+            PathBuf::from("/work/reference"),
+            PathBuf::from("/work/spec"),
+        ];
+        let (args, _) = build_invocation(&r, None, &[]);
+        // Working dir plus each extra dir are all passed as --add-dir.
+        let add_dirs: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-dir")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        assert_eq!(
+            add_dirs,
+            vec!["/work/scratch/t1", "/work/reference", "/work/spec"]
+        );
     }
 
     #[test]
@@ -277,20 +465,76 @@ mod tests {
         let mut r = req();
         r.system = Some("be terse".into());
         r.allowed_tools = vec!["Read".into(), "Grep".into()];
+        r.disallowed_tools = vec!["Task".into()];
         r.max_turns = Some(7);
         let extra = vec!["--dangerously-skip-permissions".to_string()];
         let (args, _) = build_invocation(&r, None, &extra);
         assert_eq!(arg_after(&args, "--append-system-prompt"), Some("be terse"));
         assert_eq!(arg_after(&args, "--allowedTools"), Some("Read,Grep"));
+        assert_eq!(arg_after(&args, "--disallowedTools"), Some("Task"));
         assert_eq!(arg_after(&args, "--max-turns"), Some("7"));
         assert_eq!(args.last().unwrap(), "--dangerously-skip-permissions");
     }
 
     #[test]
-    fn empty_allowed_tools_omits_flag() {
+    fn empty_tool_lists_omit_flags() {
         let (args, _) = build_invocation(&req(), None, &[]);
         assert!(!args.contains(&"--allowedTools".to_string()));
+        assert!(!args.contains(&"--disallowedTools".to_string()));
         assert!(!args.contains(&"--max-turns".to_string()));
         assert!(!args.contains(&"--append-system-prompt".to_string()));
+    }
+
+    #[test]
+    fn final_output_instruction_keeps_prompt_and_points_at_working_dir() {
+        let out = with_final_output_instruction("do the thing", Path::new("/work/scratch/t1"));
+        // Original prompt is preserved verbatim at the front.
+        assert!(out.starts_with("do the thing"));
+        // And the agent is pointed at the file the harness will read back.
+        assert!(out.contains("/work/scratch/t1/agent-final-output.txt"));
+        assert!(out.contains("Write tool"));
+    }
+
+    #[test]
+    fn detects_usage_limit_messages_only() {
+        // The real strings claude emits for a depleted account.
+        assert!(is_usage_limit_message(
+            "You've hit your session limit · resets 2:50am (UTC)"
+        ));
+        assert!(is_usage_limit_message("Usage limit reached"));
+        assert!(is_usage_limit_message("rate limit exceeded, please retry"));
+        // Ordinary failures must NOT be classified as a usage limit, or the
+        // stage would abort on a one-off error.
+        assert!(!is_usage_limit_message("hunter output was not valid json"));
+        assert!(!is_usage_limit_message("file not found"));
+        assert!(!is_usage_limit_message(""));
+    }
+
+    #[test]
+    fn usage_limit_error_is_recognized_through_anyhow() {
+        let err: anyhow::Error =
+            super::super::ProviderError::UsageLimited("hit your session limit".into()).into();
+        assert!(crate::provider::is_usage_limited(&err));
+        // A plain error is not a usage limit.
+        assert!(!crate::provider::is_usage_limited(&anyhow::anyhow!("boom")));
+    }
+
+    #[test]
+    fn output_sidecar_sits_beside_the_transcript() {
+        let log = Path::new("/work/out/logs/hunt-G-0093.jsonl");
+        assert_eq!(
+            output_sidecar(log),
+            Path::new("/work/out/logs/hunt-G-0093.output.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn open_log_creates_missing_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("hunt-T-0001.jsonl");
+        let mut f = open_log(&path).await.unwrap();
+        f.write_all(b"{}\n").await.unwrap();
+        f.flush().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
     }
 }

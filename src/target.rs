@@ -1,10 +1,13 @@
-//! Target repository acquisition.
+//! Repository acquisition for the target and the optional reference.
 //!
 //! If `[target].repo` is configured, the harness clones it into
 //! `run.target_dir` (at an optional `ref`) before any stage runs. Otherwise the
 //! target is expected to already be present there (e.g. a mounted volume).
 //!
-//! The clone runs after the egress firewall is up, so the git host must be in
+//! If `[reference].repo` is configured, that spec / known-good implementation is
+//! cloned into `[reference].dir` and exposed to the agents as ground truth.
+//!
+//! Clones run after the egress firewall is up, so each git host must be in
 //! `[firewall].allow`.
 
 use std::path::Path;
@@ -31,34 +34,55 @@ pub fn ensure_target(cfg: &Config) -> Result<()> {
         return Ok(());
     };
 
+    clone_or_update(repo, dir, cfg.target.git_ref.as_deref(), "target")
+}
+
+/// Clone the optional reference repo (spec / known-good implementation) into
+/// `reference.dir`. No-op when no reference repo is configured.
+pub fn ensure_reference(cfg: &Config) -> Result<()> {
+    let Some(repo) = cfg.reference.repo.as_deref() else {
+        return Ok(());
+    };
+    clone_or_update(
+        repo,
+        &cfg.reference.dir,
+        cfg.reference.git_ref.as_deref(),
+        "reference",
+    )
+}
+
+/// Clone `repo` into `dir` (or fetch if already cloned) and check out `git_ref`.
+/// `label` names the repo's role for logs. The clone runs after the egress
+/// firewall is up, so the git host must be in `[firewall].allow`.
+fn clone_or_update(repo: &str, dir: &Path, git_ref: Option<&str>, label: &str) -> Result<()> {
     let dir_str = dir
         .to_str()
-        .with_context(|| format!("target_dir {} is not valid UTF-8", dir.display()))?;
+        .with_context(|| format!("{label}_dir {} is not valid UTF-8", dir.display()))?;
 
     if dir.join(".git").is_dir() {
-        info!(%dir_str, "target repo present; fetching updates");
+        info!(%dir_str, "{label} repo present; fetching updates");
         git(&["-C", dir_str, "fetch", "--tags", "--prune", "origin"])?;
     } else {
         if dir.exists() && !is_empty_dir(dir)? {
             bail!(
-                "target_dir {} is non-empty and not a git repo; refusing to clone over it",
+                "{label}_dir {} is non-empty and not a git repo; refusing to clone over it",
                 dir.display()
             );
         }
         std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating target_dir {}", dir.display()))?;
-        info!(repo, "cloning target repo");
+            .with_context(|| format!("creating {label}_dir {}", dir.display()))?;
+        info!(repo, "cloning {label} repo");
         git(&["clone", repo, dir_str])?;
     }
 
-    if let Some(git_ref) = cfg.target.git_ref.as_deref() {
-        info!(git_ref, "checking out ref");
+    if let Some(git_ref) = git_ref {
+        info!(git_ref, "checking out {label} ref");
         git(&["-C", dir_str, "checkout", "--force", git_ref])?;
     }
 
-    // Record exactly what we hunted.
+    // Record exactly what we used.
     if let Ok(head) = git_capture(&["-C", dir_str, "rev-parse", "HEAD"]) {
-        info!(head = head.trim(), "target checked out");
+        info!(label, head = head.trim(), "checked out");
     }
     Ok(())
 }

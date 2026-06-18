@@ -75,20 +75,19 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             prompt,
             system: None,
             working_dir: ctx.config.run.out_dir.clone(),
+            extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
-            skills: Vec::new(),
+            disallowed_tools: Vec::new(),
             timeout,
             max_turns: None,
             resume: None,
+            stream_log_path: Some(
+                ctx.artifacts
+                    .log_path(&format!("report-batch-{attempt}.jsonl")),
+            ),
         };
 
         let result = ctx.runner.run(req).await?;
-        ctx.cost.record(
-            "report",
-            &format!("batch-{attempt}"),
-            result.cost_usd,
-            result.duration,
-        );
 
         let mut returned = match parse_records(&result.stdout) {
             Ok(r) => r,
@@ -111,7 +110,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
              again, fixed:\n- {}",
             notes.join("\n- ")
         );
-        warn!(attempt, remaining = pending.len(), "report repairing records");
+        warn!(
+            attempt,
+            remaining = pending.len(),
+            "report repairing records"
+        );
     }
 
     for payload in &done {
@@ -132,7 +135,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         );
     }
 
-    info!(written = done.len(), total = sink.count()?, "report complete");
+    info!(
+        written = done.len(),
+        total = sink.count()?,
+        "report complete"
+    );
     Ok(())
 }
 

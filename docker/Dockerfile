@@ -67,11 +67,38 @@ RUN groupadd -o -g ${HOST_GID} agent && \
     mkdir -p /home/agent/go /home/agent/.cache/go-build && \
     chown -R agent:agent /home/agent
 
-# The Trail of Bits skills (cloned into the repo). Installed as a plugin
-# marketplace so `claude` can load skills like fp-check by name.
+# The Trail of Bits skills (vendored in the repo as a plugin marketplace:
+# skills/plugins/<plugin>/skills/<skill>/SKILL.md). A bare symlink to
+# ~/.claude/plugins does NOT register anything, so `claude` never exposes the
+# skills and agents fall back to grepping the filesystem for SKILL.md. Instead,
+# register each skill as a personal skill (~/.claude/skills/<skill>), the
+# location `claude` auto-discovers, so they're invokable by name (fp-check,
+# spec-to-code-compliance, …). One plugin may ship several skills.
+#
+# Register ONLY the skills the pipeline actually routes to: recon names
+# audit-context-building/entry-point-analyzer, validate names fp-check, and the
+# recon hunt allow-list (prompts/recon.md) names the rest. Every registered skill
+# adds its name+description to each agent's system preamble, so keeping this list
+# tight cuts per-spawn tokens and stops recon suggesting skills that don't apply.
+# The full vendored suite stays in /opt/skills for reference; widen the list here
+# when you widen the recon allow-list.
 COPY skills /opt/skills
-RUN mkdir -p /home/agent/.claude && \
-    ln -s /opt/skills /home/agent/.claude/plugins && \
+RUN mkdir -p /home/agent/.claude/skills && \
+    for skill in \
+        audit-context-building \
+        entry-point-analyzer \
+        fp-check \
+        sharp-edges \
+        insecure-defaults \
+        constant-time-analysis \
+        spec-to-code-compliance \
+        differential-review \
+        variant-analysis \
+        property-based-testing; do \
+        d="$(find /opt/skills/plugins -maxdepth 3 -type d -name "$skill" -print -quit)"; \
+        [ -n "$d" ] || { echo "skill not found in vendored suite: $skill" >&2; exit 1; }; \
+        ln -sfn "$d" "/home/agent/.claude/skills/$skill"; \
+    done && \
     chown -R agent:agent /home/agent/.claude
 
 # Orchestrator binary, prompts/schema (embedded in the binary but kept for ref),

@@ -17,6 +17,10 @@ pub struct Config {
     /// expecting it to be mounted there.
     #[serde(default)]
     pub target: TargetConfig,
+    /// Optional reference repository (a spec or known-good implementation)
+    /// cloned at startup and exposed to the agents as ground truth.
+    #[serde(default)]
+    pub reference: ReferenceConfig,
     pub provider: ProviderSelection,
     /// Named provider definitions, keyed by the name referenced in `provider.default`.
     pub providers: BTreeMap<String, ProviderConfig>,
@@ -64,6 +68,83 @@ pub struct TargetConfig {
     pub git_ref: Option<String>,
 }
 
+/// Optional reference repository: a specification or known-good implementation
+/// cloned at startup (into `dir`) and added to every hunting agent's readable
+/// dirs, so findings can be checked against ground truth (e.g. the BOLT specs
+/// for a Lightning implementation, for spec-to-code compliance). Disabled when
+/// `repo` is unset. Like the target clone, the git host must be in
+/// `[firewall].allow`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReferenceConfig {
+    /// Git URL to clone. Unset disables the reference.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Branch, tag, or commit SHA to check out. Defaults to the repo's default branch.
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+    /// Where to clone it (a container path the agents can read).
+    #[serde(default = "default_reference_dir")]
+    pub dir: PathBuf,
+}
+
+fn default_reference_dir() -> PathBuf {
+    PathBuf::from("/work/reference")
+}
+
+impl Default for ReferenceConfig {
+    fn default() -> Self {
+        Self {
+            repo: None,
+            git_ref: None,
+            dir: default_reference_dir(),
+        }
+    }
+}
+
+impl ReferenceConfig {
+    /// The clone directory iff a reference repo is configured.
+    pub fn active_dir(&self) -> Option<&Path> {
+        self.repo.as_ref().map(|_| self.dir.as_path())
+    }
+
+    /// A sentence appended to hunt/validate prompts: where the reference is and
+    /// how to use it. Empty when no reference is configured.
+    pub fn prompt_note(&self) -> String {
+        match self.active_dir() {
+            Some(dir) => format!(
+                "\n\nA reference spec / known-good implementation is checked out at `{}`. \
+                 Treat it as ground truth. For a `spec-to-code-compliance` task, use the \
+                 spec-to-code-compliance skill: locate the governing clause in the reference \
+                 and prove whether the code honors or violates it.",
+                dir.display()
+            ),
+            None => String::new(),
+        }
+    }
+
+    /// A directive appended to the recon prompt so it generates
+    /// `spec-to-code-compliance` hunt tasks against the reference. Empty when no
+    /// reference is configured, so recon never invents spec tasks without a spec.
+    pub fn recon_directive(&self) -> String {
+        match self.active_dir() {
+            Some(dir) => format!(
+                "\n\n## Reference spec / known-good implementation\n\n\
+                 A reference is checked out at `{}`. Beyond the tasks above, emit \
+                 `spec-to-code-compliance` hunt tasks: pick concrete MUST/SHALL/REQUIRED \
+                 clauses (or known-good behaviors) from the reference, find the code that \
+                 implements each, and write the `hypothesis` as the specific way the code \
+                 may deviate. For each, set `attack_class` to \"spec-to-code-compliance\", \
+                 set `suggested_skills` to [\"spec-to-code-compliance\"], put BOTH the \
+                 reference location and the implementing code in `targets`, and prefer \
+                 clauses whose violation has security impact. Cover the security-critical \
+                 clauses; skip trivial ones.",
+                dir.display()
+            ),
+            None => String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunConfig {
     pub target_dir: PathBuf,
@@ -89,10 +170,31 @@ pub struct RunConfig {
     /// produce runnable PoCs at higher cost.
     #[serde(default = "default_require_poc")]
     pub require_poc: bool,
+    /// Cap on a hunter's agent turns. Cost scales with turns (each turn re-reads
+    /// the whole cached context), and a long tail of runaway hunters dominates
+    /// spend, so this bounds the worst case. Set very high to effectively
+    /// disable. Only the claude-code provider enforces it.
+    #[serde(default = "default_hunter_max_turns")]
+    pub hunter_max_turns: u32,
+    /// Delay between launching consecutive hunters, in milliseconds. Forked
+    /// hunters each replay recon's (often large) session as their first request;
+    /// releasing the whole concurrency batch at once fires that burst
+    /// simultaneously and the API rejects it with server-side rate limiting.
+    /// Staggering spreads the first requests out. 0 disables the delay.
+    #[serde(default = "default_hunter_stagger_ms")]
+    pub hunter_stagger_ms: u64,
 }
 
 fn default_concurrency() -> usize {
     50
+}
+
+fn default_hunter_max_turns() -> u32 {
+    60
+}
+
+fn default_hunter_stagger_ms() -> u64 {
+    750
 }
 
 fn default_fork_hunters() -> bool {
@@ -189,6 +291,9 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.run.concurrency == 0 {
             bail!("run.concurrency must be >= 1");
+        }
+        if self.run.hunter_max_turns == 0 {
+            bail!("run.hunter_max_turns must be >= 1");
         }
         if !self.providers.contains_key(&self.provider.default) {
             bail!(
@@ -304,6 +409,60 @@ enabled = ["recon", "hunt", "validate", "report"]
     }
 
     #[test]
+    fn reference_absent_means_disabled() {
+        let cfg = Config::load(write_tmp(VALID).path()).unwrap();
+        assert!(cfg.reference.repo.is_none());
+        assert!(cfg.reference.active_dir().is_none());
+        assert!(cfg.reference.prompt_note().is_empty());
+        // Without a reference, recon must not be told to emit spec tasks.
+        assert!(cfg.reference.recon_directive().is_empty());
+    }
+
+    #[test]
+    fn reference_drives_spec_compliance_directive() {
+        let with_ref =
+            format!("{VALID}\n[reference]\nrepo = \"https://x/y.git\"\ndir = \"/work/spec\"\n");
+        let cfg = Config::load(write_tmp(&with_ref).path()).unwrap();
+        let directive = cfg.reference.recon_directive();
+        assert!(directive.contains("spec-to-code-compliance"));
+        assert!(directive.contains("/work/spec"));
+        // Hunt/validate get the skill-usage note pointing at the same dir.
+        assert!(cfg.reference.prompt_note().contains("/work/spec"));
+        assert!(
+            cfg.reference
+                .prompt_note()
+                .contains("spec-to-code-compliance")
+        );
+    }
+
+    #[test]
+    fn reference_parsed_with_default_dir_and_note() {
+        let with_ref = format!(
+            "{VALID}\n[reference]\nrepo = \"https://github.com/lightning/bolts.git\"\nref = \"master\"\n"
+        );
+        let cfg = Config::load(write_tmp(&with_ref).path()).unwrap();
+        assert_eq!(
+            cfg.reference.repo.as_deref(),
+            Some("https://github.com/lightning/bolts.git")
+        );
+        assert_eq!(cfg.reference.git_ref.as_deref(), Some("master"));
+        // dir defaults when omitted; active_dir/prompt_note reflect it.
+        assert_eq!(
+            cfg.reference.active_dir().unwrap(),
+            Path::new("/work/reference")
+        );
+        assert!(cfg.reference.prompt_note().contains("/work/reference"));
+    }
+
+    #[test]
+    fn reference_dir_is_overridable() {
+        let with_ref =
+            format!("{VALID}\n[reference]\nrepo = \"https://x/y.git\"\ndir = \"/work/spec\"\n");
+        let cfg = Config::load(write_tmp(&with_ref).path()).unwrap();
+        assert_eq!(cfg.reference.active_dir().unwrap(), Path::new("/work/spec"));
+    }
+
+    #[test]
     fn rejects_unknown_default_provider() {
         let bad = VALID.replace("default = \"claude-code\"", "default = \"ghost\"");
         let f = write_tmp(&bad);
@@ -376,6 +535,8 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert_eq!(cfg.run.agent_timeout_secs, 1800);
         assert!(cfg.run.fork_hunters);
         assert!(!cfg.run.require_poc);
+        assert_eq!(cfg.run.hunter_max_turns, 60);
+        assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
     }
 }

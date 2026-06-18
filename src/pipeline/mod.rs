@@ -4,7 +4,6 @@
 //! order. Each stage is a self-contained function over [`StageCtx`]; they
 //! communicate only through artifacts, so the orchestrator just sequences them.
 
-mod cost;
 mod dedupe;
 mod feedback;
 mod gapfill;
@@ -12,8 +11,6 @@ mod hunt;
 mod recon;
 mod report;
 mod validate;
-
-pub use cost::CostMeter;
 
 use std::sync::Arc;
 
@@ -31,8 +28,6 @@ pub struct StageCtx {
     pub artifacts: Artifacts,
     pub scratch: ScratchRoot,
     pub runner: Arc<dyn AgentRunner>,
-    /// Tallies the cost of every agent spawn, across all stages.
-    pub cost: Arc<CostMeter>,
 }
 
 pub struct Pipeline {
@@ -48,16 +43,12 @@ impl Pipeline {
             &config.provider.default,
             config.default_provider(),
         ));
-        let cost = Arc::new(CostMeter::with_log(
-            artifacts.path(crate::artifacts::names::COSTS),
-        ));
         Ok(Self {
             ctx: StageCtx {
                 config,
                 artifacts,
                 scratch,
                 runner,
-                cost,
             },
         })
     }
@@ -67,24 +58,22 @@ impl Pipeline {
     pub fn with_runner(config: Config, runner: Arc<dyn AgentRunner>) -> Result<Self> {
         let artifacts = Artifacts::new(&config.run.out_dir)?;
         let scratch = ScratchRoot::new(&config.run.scratch_root)?;
-        let cost = Arc::new(CostMeter::with_log(
-            artifacts.path(crate::artifacts::names::COSTS),
-        ));
         Ok(Self {
             ctx: StageCtx {
                 config,
                 artifacts,
                 scratch,
                 runner,
-                cost,
             },
         })
     }
 
     /// Run the stages listed in `stages.enabled`, in order.
     pub async fn run(&self) -> Result<()> {
-        // Acquire the target (clone if configured) before any stage reads it.
+        // Acquire the target and optional reference repo (clone if configured)
+        // before any stage reads them.
         crate::target::ensure_target(&self.ctx.config)?;
+        crate::target::ensure_reference(&self.ctx.config)?;
 
         let stages = self.ctx.config.stages.enabled.clone();
 
@@ -95,6 +84,11 @@ impl Pipeline {
             for name in crate::artifacts::names::PER_RUN {
                 self.ctx.artifacts.remove(name)?;
             }
+            // Stream transcripts live in a directory, not a single file, so they
+            // are cleared separately from the PER_RUN file list.
+            self.ctx
+                .artifacts
+                .remove_dir(crate::artifacts::names::LOGS)?;
         }
 
         info!(
@@ -105,10 +99,8 @@ impl Pipeline {
         for stage in &stages {
             info!(stage = %stage, "stage start");
             run_stage(stage, &self.ctx).await?;
-            self.ctx.cost.log_stage(stage);
             info!(stage = %stage, "stage done");
         }
-        self.ctx.cost.log_total();
         Ok(())
     }
 }

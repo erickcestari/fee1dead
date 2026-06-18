@@ -17,6 +17,20 @@ pub struct Task {
     pub attack_class: String,
     /// Where to look: a file, module, function, or subsystem description.
     pub scope_hint: String,
+    /// A falsifiable, one-line hypothesis the hunter should test (e.g. "length
+    /// is added without bounds check before the alloc"). Steers the hunter at a
+    /// specific suspected defect instead of a whole class. Empty when unset.
+    #[serde(default)]
+    pub hypothesis: String,
+    /// Concrete starting points — `file:func` or `file:line` entries the hunter
+    /// should read first, so it spends tokens hunting rather than orienting.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Trail of Bits skills the hunter should apply to this task (e.g.
+    /// "constant-time-analysis", "spec-to-code-compliance"). Named in the hunter
+    /// prompt so it invokes the matching skill; empty means "use judgment".
+    #[serde(default)]
+    pub suggested_skills: Vec<String>,
     /// Where the task came from, for debugging the queue's provenance.
     #[serde(default)]
     pub origin: TaskOrigin,
@@ -29,6 +43,23 @@ pub enum TaskOrigin {
     Recon,
     Gapfill,
     Feedback,
+}
+
+impl TaskOrigin {
+    /// Hunt scheduling priority; lower is scheduled first.
+    ///
+    /// Tasks a hunter caused are narrower and higher-value than recon's broad
+    /// sweep: a gap marker is an area a hunter touched but could not finish, and
+    /// a feedback seed is a lead distilled from a past run's findings. Both took
+    /// hunting to surface, so they run ahead of the initial recon tasks when
+    /// concurrency forces an order.
+    pub fn hunt_priority(self) -> u8 {
+        match self {
+            TaskOrigin::Gapfill => 0,
+            TaskOrigin::Feedback => 1,
+            TaskOrigin::Recon => 2,
+        }
+    }
 }
 
 /// A candidate vulnerability emitted by a hunter, before validation.
@@ -134,22 +165,44 @@ mod tests {
         assert!(Severity::Low < Severity::Medium);
         assert!(Severity::Medium < Severity::High);
         assert!(Severity::High < Severity::Critical);
-        let mut v = [Severity::High, Severity::Info, Severity::Critical, Severity::Low];
+        let mut v = [
+            Severity::High,
+            Severity::Info,
+            Severity::Critical,
+            Severity::Low,
+        ];
         v.sort();
-        assert_eq!(v, [Severity::Info, Severity::Low, Severity::High, Severity::Critical]);
+        assert_eq!(
+            v,
+            [
+                Severity::Info,
+                Severity::Low,
+                Severity::High,
+                Severity::Critical
+            ]
+        );
     }
 
     #[test]
     fn severity_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&Severity::Critical).unwrap(), "\"critical\"");
+        assert_eq!(
+            serde_json::to_string(&Severity::Critical).unwrap(),
+            "\"critical\""
+        );
         let s: Severity = serde_json::from_str("\"info\"").unwrap();
         assert_eq!(s, Severity::Info);
     }
 
     #[test]
     fn verdict_uses_snake_case_on_the_wire() {
-        assert_eq!(serde_json::to_string(&Verdict::Confirmed).unwrap(), "\"confirmed\"");
-        assert_eq!(serde_json::to_string(&Verdict::Downgraded).unwrap(), "\"downgraded\"");
+        assert_eq!(
+            serde_json::to_string(&Verdict::Confirmed).unwrap(),
+            "\"confirmed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::Downgraded).unwrap(),
+            "\"downgraded\""
+        );
         assert_eq!(
             serde_json::to_string(&Verdict::LikelyFalsePositive).unwrap(),
             "\"likely_false_positive\""
@@ -173,12 +226,25 @@ mod tests {
     }
 
     #[test]
+    fn hunter_surfaced_origins_outrank_recon_for_scheduling() {
+        // Deeper tasks (a hunter had to surface them) run before the broad sweep.
+        assert!(TaskOrigin::Gapfill.hunt_priority() < TaskOrigin::Recon.hunt_priority());
+        assert!(TaskOrigin::Feedback.hunt_priority() < TaskOrigin::Recon.hunt_priority());
+
+        let mut origins = [TaskOrigin::Recon, TaskOrigin::Feedback, TaskOrigin::Gapfill];
+        origins.sort_by_key(|o| o.hunt_priority());
+        assert_eq!(
+            origins,
+            [TaskOrigin::Gapfill, TaskOrigin::Feedback, TaskOrigin::Recon]
+        );
+    }
+
+    #[test]
     fn task_origin_defaults_to_recon_when_absent() {
         // Older queue files predate the `origin` field; they must still load.
-        let t: Task = serde_json::from_str(
-            "{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}",
-        )
-        .unwrap();
+        let t: Task =
+            serde_json::from_str("{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}")
+                .unwrap();
         assert!(matches!(t.origin, TaskOrigin::Recon));
     }
 

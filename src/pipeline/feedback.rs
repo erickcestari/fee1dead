@@ -41,6 +41,10 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                     "variants of confirmed bug \"{}\" near {}",
                     f.title, f.location
                 ),
+                // Point next run's hunter straight at the confirmed bug site.
+                hypothesis: format!("a variant of \"{}\" exists nearby", f.title),
+                targets: vec![f.location.clone()],
+                suggested_skills: vec!["variant-analysis".to_string()],
                 origin: TaskOrigin::Feedback,
             });
         }
@@ -52,6 +56,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             id: String::new(),
             attack_class: "uncovered area".to_string(),
             scope_hint: format!("{} — {}", g.area, g.reason),
+            hypothesis: String::new(),
+            targets: Vec::new(),
+            suggested_skills: Vec::new(),
             origin: TaskOrigin::Feedback,
         });
     }
@@ -98,6 +105,9 @@ mod tests {
             id: String::new(),
             attack_class: class.into(),
             scope_hint: hint.into(),
+            hypothesis: String::new(),
+            targets: Vec::new(),
+            suggested_skills: Vec::new(),
             origin: TaskOrigin::Feedback,
         }
     }

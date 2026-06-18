@@ -12,7 +12,6 @@ use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Task, TaskOrigin};
 use crate::provider::AgentRequest;
-use crate::skills;
 
 const PROMPT: &str = include_str!("../../prompts/recon.md");
 
@@ -21,29 +20,41 @@ const PROMPT: &str = include_str!("../../prompts/recon.md");
 struct SeedTask {
     attack_class: String,
     scope_hint: String,
+    #[serde(default)]
+    hypothesis: String,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    suggested_skills: Vec<String>,
 }
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let target = &ctx.config.run.target_dir;
-    let prompt = PROMPT.replace("{target_dir}", &target.to_string_lossy());
+    let prompt = PROMPT.replace("{target_dir}", &target.to_string_lossy())
+        + &ctx.config.reference.recon_directive();
 
     let req = AgentRequest {
         prompt,
         system: None,
         working_dir: target.clone(),
+        extra_dirs: ctx
+            .config
+            .reference
+            .active_dir()
+            .map(|d| vec![d.to_path_buf()])
+            .unwrap_or_default(),
         allowed_tools: Vec::new(),
-        skills: skills::skills_for("recon")
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        // Recon runs as a single agent: subagent fan-out multiplies cost (each
+        // child re-explores the repo) for little extra coverage. Same restraint
+        // the hunters use.
+        disallowed_tools: vec!["Task".to_string()],
         timeout: Duration::from_secs(ctx.config.run.agent_timeout_secs),
         max_turns: None,
         resume: None,
+        stream_log_path: Some(ctx.artifacts.log_path("recon-recon.jsonl")),
     };
 
     let result = ctx.runner.run(req).await.context("recon agent failed")?;
-    ctx.cost
-        .record("recon", "recon", result.cost_usd, result.duration);
 
     // The whole response is the architecture document.
     ctx.artifacts
@@ -86,6 +97,9 @@ fn assign_ids(seeds: Vec<SeedTask>) -> Vec<Task> {
             id: format!("T-{:04}", i + 1),
             attack_class: s.attack_class,
             scope_hint: s.scope_hint,
+            hypothesis: s.hypothesis,
+            targets: s.targets,
+            suggested_skills: s.suggested_skills,
             origin: TaskOrigin::Recon,
         })
         .collect()
@@ -126,6 +140,9 @@ mod tests {
         SeedTask {
             attack_class: class.into(),
             scope_hint: hint.into(),
+            hypothesis: String::new(),
+            targets: Vec::new(),
+            suggested_skills: Vec::new(),
         }
     }
 
@@ -153,5 +170,23 @@ mod tests {
         let tasks = assign_ids(seeds);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].attack_class, "x");
+        // Absent hypothesis/targets default to empty, not a parse error.
+        assert!(tasks[0].hypothesis.is_empty());
+        assert!(tasks[0].targets.is_empty());
+    }
+
+    #[test]
+    fn carries_hypothesis_targets_and_skills_into_tasks() {
+        let out = r#"```json
+[{"attack_class":"overflow","scope_hint":"src/a.rs","hypothesis":"len added without bounds check","targets":["src/a.rs:decode","src/a.rs:42"],"suggested_skills":["sharp-edges","spec-to-code-compliance"]}]
+```"#;
+        let json = extract_json_block(out).unwrap();
+        let tasks = assign_ids(serde_json::from_str(json).unwrap());
+        assert_eq!(tasks[0].hypothesis, "len added without bounds check");
+        assert_eq!(tasks[0].targets, vec!["src/a.rs:decode", "src/a.rs:42"]);
+        assert_eq!(
+            tasks[0].suggested_skills,
+            vec!["sharp-edges", "spec-to-code-compliance"]
+        );
     }
 }

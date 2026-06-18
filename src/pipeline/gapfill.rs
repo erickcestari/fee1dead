@@ -28,10 +28,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         ctx.artifacts.append_jsonl(names::QUEUE, task)?;
     }
 
-    info!(
-        added = new_tasks.len(),
-        "gapfill re-queued uncovered areas"
-    );
+    info!(added = new_tasks.len(), "gapfill re-queued uncovered areas");
     Ok(())
 }
 
@@ -57,6 +54,9 @@ fn plan_gapfill(queue: &[Task], gaps: Vec<GapMarker>) -> Vec<Task> {
             id: format!("G-{next:04}"),
             attack_class: "uncovered area".to_string(),
             scope_hint: format!("{} — {}", gap.area, gap.reason),
+            hypothesis: String::new(),
+            targets: Vec::new(),
+            suggested_skills: Vec::new(),
             origin: TaskOrigin::Gapfill,
         });
         covered.insert(area_key);
@@ -75,6 +75,9 @@ mod tests {
             id: id.into(),
             attack_class: "c".into(),
             scope_hint: hint.into(),
+            hypothesis: String::new(),
+            targets: Vec::new(),
+            suggested_skills: Vec::new(),
             origin: TaskOrigin::Recon,
         }
     }
@@ -102,7 +105,10 @@ mod tests {
     fn skips_area_already_scoped_by_queue_either_direction() {
         let queue = vec![task("T-0001", "src/auth/login.rs")];
         // Queue hint contains the gap area, and vice versa: both are duplicates.
-        let plan = plan_gapfill(&queue, vec![gap("src/auth", "x"), gap("src/auth/login.rs:40", "y")]);
+        let plan = plan_gapfill(
+            &queue,
+            vec![gap("src/auth", "x"), gap("src/auth/login.rs:40", "y")],
+        );
         assert!(plan.is_empty());
     }
 

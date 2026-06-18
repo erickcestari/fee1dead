@@ -19,7 +19,6 @@ use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Finding, Severity, Validation, Verdict};
 use crate::provider::AgentRequest;
-use crate::skills;
 
 const PROMPT: &str = include_str!("../../prompts/validate.md");
 
@@ -46,26 +45,29 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let target = ctx.config.run.target_dir.to_string_lossy().into_owned();
     let prompt = PROMPT
         .replace("{target_dir}", &target)
-        .replace("{findings_json}", &review_input(&candidates));
+        .replace("{findings_json}", &review_input(&candidates))
+        + &ctx.config.reference.prompt_note();
 
     // Reviewing re-reads the source, so it runs in the target dir.
     let req = AgentRequest {
         prompt,
         system: None,
         working_dir: ctx.config.run.target_dir.clone(),
+        extra_dirs: ctx
+            .config
+            .reference
+            .active_dir()
+            .map(|d| vec![d.to_path_buf()])
+            .unwrap_or_default(),
         allowed_tools: Vec::new(),
-        skills: skills::skills_for("validate")
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        disallowed_tools: Vec::new(),
         timeout: Duration::from_secs(ctx.config.run.agent_timeout_secs),
         max_turns: None,
         resume: None,
+        stream_log_path: Some(ctx.artifacts.log_path("validate-review.jsonl")),
     };
 
     let result = ctx.runner.run(req).await.context("review agent failed")?;
-    ctx.cost
-        .record("validate", "review", result.cost_usd, result.duration);
 
     let reviews = parse_reviews(&result.stdout)?;
     let validations = reconcile(&candidates, reviews);
@@ -114,8 +116,10 @@ fn parse_reviews(stdout: &str) -> Result<Vec<RawReview>> {
 /// (tag-don't-drop) as `confirmed` so it still reaches a human, flagged as
 /// unreviewed. `corrected_severity` is honored only for `downgraded`.
 fn reconcile(candidates: &[Finding], reviews: Vec<RawReview>) -> Vec<Validation> {
-    let mut by_id: HashMap<String, RawReview> =
-        reviews.into_iter().map(|r| (r.finding_id.clone(), r)).collect();
+    let mut by_id: HashMap<String, RawReview> = reviews
+        .into_iter()
+        .map(|r| (r.finding_id.clone(), r))
+        .collect();
 
     candidates
         .iter()
@@ -159,7 +163,8 @@ mod tests {
 
     #[test]
     fn parses_review_array() {
-        let out = "```json\n[{\"finding_id\":\"F-1\",\"verdict\":\"confirmed\",\"evidence\":\"e\"}]\n```";
+        let out =
+            "```json\n[{\"finding_id\":\"F-1\",\"verdict\":\"confirmed\",\"evidence\":\"e\"}]\n```";
         let reviews = parse_reviews(out).unwrap();
         assert_eq!(reviews.len(), 1);
         assert_eq!(reviews[0].verdict, Verdict::Confirmed);

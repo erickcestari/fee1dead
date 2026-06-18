@@ -56,23 +56,21 @@ impl AgentRunner for ExecRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let started = std::time::Instant::now();
         let output = tokio::time::timeout(req.timeout, cmd.output())
             .await
             .with_context(|| format!("provider '{}' timed out", self.name))?
             .with_context(|| format!("spawning provider '{}' ({})", self.name, self.command))?;
-        let duration = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let exit_code = output.status.code().unwrap_or(-1);
 
-        let structured = match self.output {
-            ExecOutput::Text => None,
-            ExecOutput::Json => Some(
-                serde_json::from_str(stdout.trim())
-                    .with_context(|| format!("provider '{}' did not emit valid JSON", self.name))?,
-            ),
-        };
+        // Fail fast on a misconfigured command: if it's declared to emit JSON,
+        // confirm it actually did. The parsed value itself isn't kept — stages
+        // pull structured data out of `stdout` themselves.
+        if let ExecOutput::Json = self.output {
+            serde_json::from_str::<serde_json::Value>(stdout.trim())
+                .with_context(|| format!("provider '{}' did not emit valid JSON", self.name))?;
+        }
 
         if exit_code != 0 {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -85,10 +83,7 @@ impl AgentRunner for ExecRunner {
 
         Ok(AgentResult {
             stdout,
-            structured,
             exit_code,
-            cost_usd: None,
-            duration,
             // Exec providers have no session concept; nothing to fork from.
             session_id: None,
         })

@@ -20,7 +20,7 @@ fn replies() -> Vec<CannedReply> {
 Build: `cargo build`. Entry point: src/parse.rs.
 
 ```json
-[{"attack_class": "integer overflow", "scope_hint": "src/parse.rs decode loop"}]
+[{"attack_class": "integer overflow", "scope_hint": "src/parse.rs decode loop", "hypothesis": "length added without bounds check", "targets": ["src/parse.rs:42"], "suggested_skills": ["sharp-edges"]}]
 ```"#
                 .into(),
             session_id: Some(RECON_SESSION_ID.into()),
@@ -135,18 +135,6 @@ async fn full_skeleton_pipeline_with_mock() {
     assert!(out.join("candidates.jsonl").exists(), "candidates missing");
     assert!(out.join("gaps.jsonl").exists(), "gaps missing");
     assert!(out.join("validated.jsonl").exists(), "validations missing");
-
-    // Per-agent telemetry persisted: one row per agent run (recon, hunt,
-    // review, report), each carrying stage, label, cost, and duration.
-    let costs = std::fs::read_to_string(out.join("costs.jsonl")).unwrap();
-    let rows: Vec<serde_json::Value> = costs
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(rows.len(), 4, "expected one cost row per agent run");
-    assert!(rows.iter().all(|r| r.get("duration_secs").is_some()));
-    assert!(rows.iter().any(|r| r["stage"] == "hunt"));
 
     // One finding made it all the way into the store.
     let conn = rusqlite::Connection::open(&db).unwrap();

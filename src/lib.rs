@@ -14,6 +14,5 @@ pub mod domain;
 pub mod pipeline;
 pub mod provider;
 pub mod scratch;
-pub mod skills;
 pub mod store;
 pub mod target;
