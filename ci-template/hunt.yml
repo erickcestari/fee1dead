@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       config:
-        description: "Harness config to run (path inside the fee1dead checkout)"
+        description: "Harness config to run (path in THIS runs repo)"
         required: false
         default: "config/target.toml"
 
@@ -54,19 +54,45 @@ jobs:
           token: ${{ secrets.FEE1DEAD_PAT }}
           path: fee1dead
 
+      # Cache the built image keyed on the fee1dead commit SHA, so a build only
+      # happens when the source actually changed.
+      - name: Resolve fee1dead commit
+        id: sha
+        run: echo "sha=$(git -C fee1dead rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache harness image
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fee1dead-image.tar
+          key: fee1dead-image-${{ steps.sha.outputs.sha }}
+
+      - name: Load cached image
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/fee1dead-image.tar
+
       - name: Build image
+        if: steps.image-cache.outputs.cache-hit != 'true'
         working-directory: fee1dead
         run: |
-          docker build -t fee1dead \
+          docker build -t fee1dead:local \
             --build-arg HOST_UID="$(id -u)" \
             --build-arg HOST_GID="$(id -g)" \
             -f docker/Dockerfile .
+          docker save fee1dead:local -o /tmp/fee1dead-image.tar
 
       - name: Run pipeline (clone mode)
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # Fail clearly if the config doesn't exist (otherwise docker bind-mount
+          # silently creates a directory and the mount fails cryptically).
+          # CONFIG is a path in THIS (runs) repo, not the fee1dead checkout.
+          if [ ! -f "$CONFIG" ]; then
+            echo "config not found: $CONFIG (relative to the runs repo root)"
+            exit 1
+          fi
           # Each run gets its own immutable output dir so prior runs are never
           # overwritten. runs/ is the archive of all past runs.
           RUN_DIR="runs/$(date -u +%Y%m%d-%H%M%S)-${{ github.run_id }}"
@@ -84,8 +110,8 @@ jobs:
             -e CLAUDE_CODE_OAUTH_TOKEN \
             -e ANTHROPIC_API_KEY \
             -v "$PWD/$RUN_DIR":/work/out \
-            -v "$PWD/fee1dead/$CONFIG":/opt/fee1dead/config/harness.toml:ro \
-            fee1dead
+            -v "$PWD/$CONFIG":/opt/fee1dead/config/harness.toml:ro \
+            fee1dead:local
 
       - name: Commit this run's output
         if: always()
