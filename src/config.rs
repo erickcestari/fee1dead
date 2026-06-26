@@ -161,6 +161,15 @@ pub struct RunConfig {
     /// claude-code provider supports this; others ignore it. Forks run in
     /// recon's directory, so recon's history is a shared, cached prefix across
     /// hunters (cache-read rates) when they start within the cache window.
+    ///
+    /// The amortized win shrinks now that recon orients shallow (`recon_max_turns`,
+    /// structure-first prompt): the shared prefix is mostly the threat model plus
+    /// orient output, not deep file reads a hunter would otherwise repeat. Forking
+    /// still spares every hunter from re-orienting, but with good per-task `targets`
+    /// a cold hunter reads only what it needs — so which regime is cheaper per
+    /// confirmed finding is now an empirical call. Compare both on a target before
+    /// trusting either default; each agent's stream-log `result` event records its
+    /// cost/usage, so a run profiles from the logs dir.
     #[serde(default = "default_fork_hunters")]
     pub fork_hunters: bool,
     /// Whether hunters write, compile, and run proof-of-concept code to confirm
@@ -176,6 +185,14 @@ pub struct RunConfig {
     /// disable. Only the claude-code provider enforces it.
     #[serde(default = "default_hunter_max_turns")]
     pub hunter_max_turns: u32,
+    /// Cap on recon's agent turns. Recon's job is to orient (structure-first)
+    /// and emit the threat model, not to read the whole repo: every turn re-reads
+    /// recon's growing context, and a bloated recon session is then replayed into
+    /// every forked hunter, so an unbounded recon dominates a run's cost. Keeping
+    /// recon compact also keeps its context under the long-context pricing tier.
+    /// Only the claude-code provider enforces it.
+    #[serde(default = "default_recon_max_turns")]
+    pub recon_max_turns: u32,
     /// Delay between launching consecutive hunters, in milliseconds. Forked
     /// hunters each replay recon's (often large) session as their first request;
     /// releasing the whole concurrency batch at once fires that burst
@@ -183,6 +200,29 @@ pub struct RunConfig {
     /// Staggering spreads the first requests out. 0 disables the delay.
     #[serde(default = "default_hunter_stagger_ms")]
     pub hunter_stagger_ms: u64,
+    /// Whether agents may use the vendored Trail of Bits skills at all. On by
+    /// default. When false, every stage prompt is told to ignore the skills and
+    /// rely on its own analysis, and recon emits no `suggested_skills` — useful
+    /// to isolate the skills' effect on token cost and bug yield, or to run
+    /// against a target the skills don't fit.
+    #[serde(default = "default_use_skills")]
+    pub use_skills: bool,
+}
+
+impl RunConfig {
+    /// A directive appended to every stage prompt when skills are disabled,
+    /// countermanding the in-prompt instructions to use specific skills. Empty
+    /// when skills are enabled.
+    pub fn skills_directive(&self) -> String {
+        if self.use_skills {
+            String::new()
+        } else {
+            "\n\nSkills are disabled for this run. Do not invoke any skill; ignore \
+             any earlier instruction to use one and rely on your own analysis. If \
+             you emit hunt tasks, leave every `suggested_skills` empty."
+                .to_string()
+        }
+    }
 }
 
 fn default_concurrency() -> usize {
@@ -191,6 +231,10 @@ fn default_concurrency() -> usize {
 
 fn default_hunter_max_turns() -> u32 {
     60
+}
+
+fn default_recon_max_turns() -> u32 {
+    30
 }
 
 fn default_hunter_stagger_ms() -> u64 {
@@ -203,6 +247,10 @@ fn default_fork_hunters() -> bool {
 
 fn default_require_poc() -> bool {
     false
+}
+
+fn default_use_skills() -> bool {
+    true
 }
 
 fn default_timeout_secs() -> u64 {
@@ -294,6 +342,9 @@ impl Config {
         }
         if self.run.hunter_max_turns == 0 {
             bail!("run.hunter_max_turns must be >= 1");
+        }
+        if self.run.recon_max_turns == 0 {
+            bail!("run.recon_max_turns must be >= 1");
         }
         if !self.providers.contains_key(&self.provider.default) {
             bail!(
@@ -536,6 +587,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert!(cfg.run.fork_hunters);
         assert!(!cfg.run.require_poc);
         assert_eq!(cfg.run.hunter_max_turns, 60);
+        assert_eq!(cfg.run.recon_max_turns, 30);
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
     }

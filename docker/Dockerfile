@@ -39,8 +39,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uv (fast Python package manager); several Trail of Bits skills invoke `uv run`.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-# Claude Code CLI (the default provider). Pin via build arg if you need to.
-RUN npm install -g @anthropic-ai/claude-code
+# Claude Code CLI (the default provider). Pinned for reproducible builds;
+# override with --build-arg CLAUDE_CODE_VERSION=... if needed.
+ARG CLAUDE_CODE_VERSION=2.1.116
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Go toolchain, so hunters can compile and run PoCs against Go targets (e.g. lnd).
 ARG GO_VERSION=1.23.4
@@ -95,7 +97,7 @@ RUN mkdir -p /home/agent/.claude/skills && \
         differential-review \
         variant-analysis \
         property-based-testing; do \
-        d="$(find /opt/skills/plugins -maxdepth 3 -type d -name "$skill" -print -quit)"; \
+        d="$(find /opt/skills/plugins -type d -path "*/skills/$skill" -print -quit)"; \
         [ -n "$d" ] || { echo "skill not found in vendored suite: $skill" >&2; exit 1; }; \
         ln -sfn "$d" "/home/agent/.claude/skills/$skill"; \
     done && \

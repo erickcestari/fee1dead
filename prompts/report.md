@@ -22,8 +22,8 @@ JSON Schema each object must satisfy (authoritative):
 
 ## Rules
 
-- Output ONLY a single fenced ```json block containing a JSON ARRAY of report
-  objects. No prose.
+- Your entire final answer MUST be a single bare JSON ARRAY of report objects —
+  no markdown fences, no prose, nothing around it.
 - One object per input finding; echo its `id`, `location`, and `severity` exactly.
 - Include every required field; use only valid enum values.
 - `impact` — the concrete consequence to an attacker.

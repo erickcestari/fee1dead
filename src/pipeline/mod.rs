@@ -22,6 +22,53 @@ use crate::config::Config;
 use crate::provider::{AgentRunner, build_runner};
 use crate::scratch::ScratchRoot;
 
+/// Tools every stage agent is denied, for two reasons:
+///
+/// - `Task` and the orchestration tools (`Task*`, `Workflow`): the harness owns
+///   parallelism. A stage spawning its own sub-agents only multiplies cost
+///   without adding coverage.
+/// - The rest are irrelevant to reading code and finding bugs — scheduling,
+///   notebooks, notifications, worktrees, deferred-tool search, and web access
+///   (egress is firewalled to a deny-default allow-list anyway). Every tool's
+///   schema sits in the cached system-prompt prefix that is re-read on every
+///   agent turn, so dropping the unused ones shrinks the per-turn cost across
+///   the whole run.
+///
+/// A deny-list (not an allow-list) because `--disallowedTools` is what removes a
+/// tool from the model's context; if the CLI adds a new irrelevant tool later,
+/// add it here. `Read`, `Bash`, `Write`, `Edit`, and `Skill` are what the stages
+/// actually use, so they are deliberately absent.
+const DISABLED_TOOLS: &[&str] = &[
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "Workflow",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "Monitor",
+    "RemoteTrigger",
+    "PushNotification",
+    "SendMessage",
+    "DesignSync",
+    "NotebookEdit",
+    "EnterWorktree",
+    "ExitWorktree",
+    "ToolSearch",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// The shared deny-list as owned strings for an [`AgentRequest`].
+pub(crate) fn disabled_tools() -> Vec<String> {
+    DISABLED_TOOLS.iter().map(|s| s.to_string()).collect()
+}
+
 /// Shared context handed to every stage.
 pub struct StageCtx {
     pub config: Config,

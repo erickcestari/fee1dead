@@ -13,6 +13,12 @@ agent_timeout_secs = 1800
 # cached context), and a few runaway hunters dominate spend; this bounds the
 # worst case. Set very high to effectively disable. Only claude-code enforces it.
 hunter_max_turns = 60
+# Cap on recon's agent turns. Recon orients (structure-first) and emits the
+# threat model; it should not read the whole repo. Every turn re-reads recon's
+# growing context, which is then replayed into every forked hunter, so an
+# unbounded recon dominates a run's cost. Keeping recon compact also holds its
+# context under the long-context pricing tier. Only claude-code enforces it.
+recon_max_turns = 30
 # Delay between launching consecutive hunters, in milliseconds. Each forked
 # hunter replays recon's (large) session as its first request; releasing the
 # whole concurrency batch at once fires that burst simultaneously and the API
@@ -24,12 +30,23 @@ hunter_stagger_ms = 750
 # hunter prompt. Only the claude-code provider supports this. Forks share
 # recon's history as a cached prefix (cache-read rates) when hunters start
 # within the cache window. Set false to opt out.
+#
+# Now that recon orients shallow (recon_max_turns), the shared prefix is mostly
+# the threat model + orient output rather than deep file reads, so forking's edge
+# over cold hunters (which read only their per-task targets) is an empirical call.
+# A/B both on your target: each agent's stream log records its cost/usage, so
+# compare total cost vs confirmed findings from the logs dir.
 fork_hunters = true
 # Whether hunters write, compile, and run proof-of-concept code to confirm
 # findings. This is the most token-hungry part of hunting, so it is off by
 # default: hunters substantiate by close reading instead (cheaper, but weaker
 # confirmation). Set true to have hunters produce runnable PoCs at higher cost.
 require_poc = false
+# Whether agents may use the vendored Trail of Bits skills. On by default. Set
+# false to tell every stage to ignore the skills and rely on its own analysis
+# (recon then emits no suggested_skills) — useful to isolate the skills' effect
+# on token cost and bug yield, or for a target the skills don't fit.
+use_skills = true
 
 # Optional: clone the target into run.target_dir at startup instead of mounting
 # it. The git host MUST be in [firewall].allow (the clone runs after the

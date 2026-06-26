@@ -42,7 +42,7 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `Validation`, `GapMarker`, `Severity`). Change here ripples to artifacts.
 - `src/artifacts.rs` — JSON/JSONL stage IO. **Stages communicate ONLY through
   artifacts** in `out_dir` (`queue.jsonl`, `candidates.jsonl`, `gaps.jsonl`,
-  `validated.jsonl`, `hunted.jsonl`, `ARCHITECTURE.md`), never by calling each
+  `validated.jsonl`, `hunted.jsonl`, `recon.json`), never by calling each
   other. Keep it that way: it is what makes stages decoupled and runs resumable.
 - `prompts/`, `schema/finding.schema.json` — embedded into the binary via
   `include_str!`; editing them changes the build.

@@ -14,7 +14,10 @@ use serde::de::DeserializeOwned;
 
 /// Canonical artifact file names within `out_dir`.
 pub mod names {
-    pub const ARCHITECTURE: &str = "ARCHITECTURE.md";
+    /// Recon's structured threat model, persisted verbatim as the agent emitted
+    /// it. Forked hunters inherit recon's session and never read this; cold
+    /// hunters (non-forking providers) read it back as their threat-model context.
+    pub const RECON_REPORT: &str = "recon.json";
     pub const QUEUE: &str = "queue.jsonl";
     pub const CANDIDATES: &str = "candidates.jsonl";
     pub const GAPS: &str = "gaps.jsonl";
@@ -37,7 +40,7 @@ pub mod names {
     /// Artifacts produced fresh by a single run (everything except SEEDS).
     /// Cleared at the start of a run that includes recon.
     pub const PER_RUN: &[&str] = &[
-        ARCHITECTURE,
+        RECON_REPORT,
         QUEUE,
         CANDIDATES,
         GAPS,

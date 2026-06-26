@@ -1,0 +1,104 @@
+# Scheduled vulnerability-hunting run.
+#
+# This workflow lives in a SEPARATE private repo (the "results" repo). It:
+#   1. checks out this results repo (where runs/ are committed),
+#   2. checks out the fee1dead source from its own repo (needs a PAT if private),
+#   3. builds the harness image and runs the pipeline in clone mode (the harness
+#      clones the TARGET repo itself),
+#   4. commits each run's output back to this results repo under runs/.
+#
+# Required secrets (Settings -> Secrets and variables -> Actions):
+#   FEE1DEAD_PAT             - PAT (or fine-grained token) with read access to
+#                             the fee1dead repo, used to check out its source.
+#   CLAUDE_CODE_OAUTH_TOKEN  - Claude Pro/Max OAuth token (or ...)
+#   ANTHROPIC_API_KEY        - ...API-key billing. Set whichever you use.
+#
+# Required variables (or hardcode below):
+#   FEE1DEAD_REPO            - owner/name of the fee1dead source repo.
+#   FEE1DEAD_REF             - branch/tag/SHA to build (defaults to main).
+
+name: hunt
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Harness config to run (path inside the fee1dead checkout)"
+        required: false
+        default: "config/target.toml"
+
+permissions:
+  contents: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    env:
+      CONFIG: ${{ github.event.inputs.config || 'config/target.toml' }}
+    steps:
+      # The results repo: where runs/ get committed. Default checkout token
+      # (GITHUB_TOKEN) is enough to push back here.
+      - name: Checkout results repo
+        uses: actions/checkout@v4
+
+      # The fee1dead source: built into the harness image. Uses the PAT so it
+      # works even when fee1dead is private.
+      - name: Checkout fee1dead source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.FEE1DEAD_REPO }}
+          ref: ${{ vars.FEE1DEAD_REF || 'main' }}
+          token: ${{ secrets.FEE1DEAD_PAT }}
+          path: fee1dead
+
+      - name: Build image
+        working-directory: fee1dead
+        run: |
+          docker build -t fee1dead \
+            --build-arg HOST_UID="$(id -u)" \
+            --build-arg HOST_GID="$(id -g)" \
+            -f docker/Dockerfile .
+
+      - name: Run pipeline (clone mode)
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Each run gets its own immutable output dir so prior runs are never
+          # overwritten. runs/ is the archive of all past runs.
+          RUN_DIR="runs/$(date -u +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          echo "RUN_DIR=$RUN_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$RUN_DIR"
+          # Carry the cross-run feedback memory forward from the most recent
+          # previous run (the one durable artifact the harness reuses).
+          LAST_SEEDS="$(ls -1 runs/*/feedback-seeds.jsonl 2>/dev/null | tail -n1 || true)"
+          if [ -n "$LAST_SEEDS" ]; then
+            cp "$LAST_SEEDS" "$RUN_DIR/feedback-seeds.jsonl"
+            echo "seeded feedback memory from $LAST_SEEDS"
+          fi
+          docker run --rm \
+            --cap-add=NET_ADMIN \
+            -e CLAUDE_CODE_OAUTH_TOKEN \
+            -e ANTHROPIC_API_KEY \
+            -v "$PWD/$RUN_DIR":/work/out \
+            -v "$PWD/fee1dead/$CONFIG":/opt/fee1dead/config/harness.toml:ro \
+            fee1dead
+
+      - name: Commit this run's output
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" runs
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -Af "$RUN_DIR"
+          if git diff --cached --quiet; then
+            echo "no output to commit"
+            exit 0
+          fi
+          git commit -m "hunt: run ${{ github.run_id }} (${CONFIG})"
+          # Rebase onto any concurrent pushes before pushing.
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

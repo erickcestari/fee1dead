@@ -22,18 +22,9 @@ use tracing::warn;
 
 use super::{AgentRequest, AgentResult, AgentRunner, final_output_path};
 
-/// Environment that makes session forking actually cheap.
+/// Environment applied to every `claude` invocation, regardless of stage. These
+/// stabilize the cacheable system-prompt prefix and keep runs reproducible:
 ///
-/// The harness forks every hunter (and the validate/report agents) from the
-/// recon session so they inherit its codebase exploration as a cached prefix.
-/// That only pays off if the prefix stays cacheable and the cache lives long
-/// enough — which requires turning these knobs on explicitly:
-///
-/// - `ENABLE_PROMPT_CACHING_1H`: extend the prompt-cache TTL from 5m to 1h.
-///   Hunters run with `concurrency` of 10+ and per-agent timeouts of 30–40
-///   minutes, so under the default 5m TTL recon's prefix expires before most
-///   hunters (and the later stages) start — re-billing recon's whole context
-///   at full input rates instead of cache-read rates.
 /// - `CLAUDE_CODE_DISABLE_CLAUDE_MDS`: target repos are untrusted clones; a
 ///   `CLAUDE.md` in the clone would otherwise be auto-loaded into the agent's
 ///   context (a prompt-injection channel) and would also vary the prefix per
@@ -44,15 +35,39 @@ use super::{AgentRequest, AgentResult, AgentRunner, final_output_path};
 /// - `CLAUDE_CODE_DISABLE_AUTO_MEMORY`: keep each run reproducible and
 ///   uncontaminated by prior scans of other targets (the harness has its own
 ///   cross-run memory in `feedback-seeds.jsonl`).
-/// - `CLAUDE_CODE_EFFORT_LEVEL`: hunters trace multi-hop code paths; xhigh
-///   gives deeper adaptive thinking before they report, which finds more.
-const CACHE_ENV: &[(&str, &str)] = &[
-    ("ENABLE_PROMPT_CACHING_1H", "1"),
+///
+/// Reasoning effort (`CLAUDE_CODE_EFFORT_LEVEL`) is *not* here: it is set per
+/// stage via [`AgentRequest::effort`], since the stages' needs differ (deep
+/// multi-hop tracing in hunt vs. a mechanical schema transform in report).
+const BASE_ENV: &[(&str, &str)] = &[
     ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
     ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
     ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
-    ("CLAUDE_CODE_EFFORT_LEVEL", "xhigh"),
 ];
+
+/// Extend the prompt-cache TTL from 5m to 1h. Set only for a session that is
+/// *forked from* and whose prefix must outlive the 5m window — i.e. recon, which
+/// every hunter (and the validate/report agents) forks. Recon runs at
+/// `concurrency` 10+ with per-agent timeouts of 30–40 minutes, so under the
+/// default 5m TTL its prefix expires before most forked agents start, re-billing
+/// recon's whole context at full input rates instead of cache-read rates.
+///
+/// Not worth it for a leaf agent (hunt/validate/report): nothing forks from it,
+/// and its own context is re-read only by its own sub-5m-apart turns, so 1h just
+/// pays the higher cache-write premium (2x vs 1.25x base input) for no reuse.
+/// Gated per request via [`AgentRequest::cache_1h`].
+const CACHE_1H_ENV: (&str, &str) = ("ENABLE_PROMPT_CACHING_1H", "1");
+
+/// Environment for one invocation: the always-on base, the per-stage reasoning
+/// effort, plus 1h caching when the request opts in.
+fn agent_env(req: &AgentRequest) -> Vec<(&'static str, &'static str)> {
+    let mut env = BASE_ENV.to_vec();
+    if req.cache_1h {
+        env.push(CACHE_1H_ENV);
+    }
+    env.push(("CLAUDE_CODE_EFFORT_LEVEL", req.effort.as_str()));
+    env
+}
 
 pub struct ClaudeCodeRunner {
     name: String,
@@ -178,7 +193,7 @@ impl AgentRunner for ClaudeCodeRunner {
 
         let mut cmd = Command::new("claude");
         cmd.args(&args);
-        cmd.envs(CACHE_ENV.iter().copied());
+        cmd.envs(agent_env(&req));
         cmd.current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -342,9 +357,9 @@ fn is_usage_limit_message(msg: &str) -> bool {
 
 /// Path of the final-answer sidecar that sits beside a stream log: the
 /// transcript `<base>.jsonl` is paired with the consumed answer
-/// `<base>.output.txt` in the same dir.
+/// `<base>.output.json` in the same dir.
 fn output_sidecar(stream_log_path: &Path) -> std::path::PathBuf {
-    stream_log_path.with_extension("output.txt")
+    stream_log_path.with_extension("output.json")
 }
 
 /// Create (truncating) the stream-log file, making parent dirs as needed.
@@ -362,7 +377,7 @@ async fn open_log(path: &Path) -> Result<fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ResumeSession;
+    use crate::provider::{Effort, ResumeSession};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -377,6 +392,8 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_turns: None,
             resume: None,
+            cache_1h: false,
+            effort: Effort::Xhigh,
             stream_log_path: None,
         }
     }
@@ -398,7 +415,7 @@ mod tests {
         // (with the working dir's path), and the stream-json format is requested.
         let prompt = arg_after(&args, "-p").unwrap();
         assert!(prompt.starts_with("find bugs"));
-        assert!(prompt.contains("agent-final-output.txt"));
+        assert!(prompt.contains("agent-final-output.json"));
         assert!(prompt.contains("/work/scratch/t1"));
         assert_eq!(arg_after(&args, "--output-format"), Some("stream-json"));
         assert!(args.contains(&"--verbose".to_string()));
@@ -432,14 +449,27 @@ mod tests {
     }
 
     #[test]
-    fn cache_env_enables_1h_caching_and_xhigh_effort() {
-        // CACHE_ENV is what makes session forking actually cheap; guard its keys.
-        let env: std::collections::HashMap<_, _> = CACHE_ENV.iter().copied().collect();
-        assert_eq!(env.get("ENABLE_PROMPT_CACHING_1H"), Some(&"1"));
-        assert_eq!(env.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS"), Some(&"1"));
-        assert_eq!(env.get("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"), Some(&"1"));
-        assert_eq!(env.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"), Some(&"1"));
-        assert_eq!(env.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&"xhigh"));
+    fn agent_env_stabilizes_prefix_and_gates_cache_and_effort_per_request() {
+        // The base env stabilizes the cacheable prefix and is applied to every
+        // agent regardless of stage.
+        let mut r = req();
+        r.cache_1h = false;
+        r.effort = Effort::Low;
+        let base: std::collections::HashMap<_, _> = agent_env(&r).into_iter().collect();
+        assert_eq!(base.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS"), Some(&"1"));
+        assert_eq!(base.get("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"), Some(&"1"));
+        assert_eq!(base.get("CLAUDE_CODE_DISABLE_AUTO_MEMORY"), Some(&"1"));
+        // Effort is per-request, not a global constant.
+        assert_eq!(base.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&"low"));
+        // 1h caching is opt-in: only the forked-from session (recon) pays its
+        // write premium; leaf agents leave it off and keep the 5m default.
+        assert_eq!(base.get("ENABLE_PROMPT_CACHING_1H"), None);
+
+        r.cache_1h = true;
+        r.effort = Effort::Xhigh;
+        let opted_in: std::collections::HashMap<_, _> = agent_env(&r).into_iter().collect();
+        assert_eq!(opted_in.get("ENABLE_PROMPT_CACHING_1H"), Some(&"1"));
+        assert_eq!(opted_in.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&"xhigh"));
     }
 
     #[test]
@@ -491,7 +521,7 @@ mod tests {
         // Original prompt is preserved verbatim at the front.
         assert!(out.starts_with("do the thing"));
         // And the agent is pointed at the file the harness will read back.
-        assert!(out.contains("/work/scratch/t1/agent-final-output.txt"));
+        assert!(out.contains("/work/scratch/t1/agent-final-output.json"));
         assert!(out.contains("Write tool"));
     }
 
@@ -524,7 +554,7 @@ mod tests {
         let log = Path::new("/work/out/logs/hunt-G-0093.jsonl");
         assert_eq!(
             output_sidecar(log),
-            Path::new("/work/out/logs/hunt-G-0093.output.txt")
+            Path::new("/work/out/logs/hunt-G-0093.output.json")
         );
     }
 

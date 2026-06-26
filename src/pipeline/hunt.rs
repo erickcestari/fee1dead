@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use super::StageCtx;
 use crate::artifacts::{Artifacts, extract_json_block, names};
 use crate::domain::{Finding, GapMarker, Severity, Task};
-use crate::provider::{AgentRequest, AgentRunner, ResumeSession, is_usage_limited};
+use crate::provider::{AgentRequest, AgentRunner, Effort, ResumeSession, is_usage_limited};
 
 const PROMPT: &str = include_str!("../../prompts/hunt.md");
 
@@ -56,9 +56,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         warn!("hunt queue is empty; did recon run?");
         return Ok(());
     }
-    let architecture = ctx
+    // Cold hunters (non-forking providers) get recon's threat model injected as
+    // context; forked hunters already carry it in their inherited session.
+    let recon_report = ctx
         .artifacts
-        .read_text(names::ARCHITECTURE)
+        .read_text(names::RECON_REPORT)
         .unwrap_or_default();
 
     // Hunt incrementally: skip tasks already processed in a previous pass so
@@ -81,10 +83,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         return Ok(());
     }
     // Schedule deeper tasks first. Concurrency only runs `concurrency` hunters at
-    // once, so spawn order is priority order: hunter-surfaced tasks (gapfill,
-    // feedback) before recon's broad sweep. Stable, so queue order holds within
-    // an origin.
-    tasks.sort_by_key(|t| t.origin.hunt_priority());
+    // once (and a usage limit can truncate the tail), so spawn order is value
+    // order: hunter-surfaced tasks (gapfill, feedback) before recon's broad
+    // sweep, then recon's own priority within each origin. Stable, so queue order
+    // breaks ties.
+    tasks.sort_by_key(|t| (t.origin.hunt_priority(), t.priority.hunt_rank()));
 
     // Fork each hunter from recon's session so it inherits the codebase context
     // recon built up, not just the architecture doc. Absent a recorded session
@@ -102,16 +105,21 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         info!("hunters will fork from recon's session");
     }
 
-    // A forked hunter already carries recon's full exploration (the architecture
-    // doc included) in its conversation history, shared as a cached prefix
-    // across hunters. Re-injecting the doc would re-bill those tokens per hunter
-    // at full price, so forked hunters get a pointer instead of the text.
+    // A forked hunter already carries recon's session (threat model and
+    // invariants included) as a cached prefix, so re-injecting the report text
+    // would re-bill those tokens per hunter — it gets a pointer instead. But
+    // recon now orients deliberately shallow (structure-first, few full-file
+    // reads), so that pass is NOT a substitute for reading the code: steer the
+    // forked hunter at its task's own targets. A cold hunter gets the report.
     let arch_context = if recon_session.is_some() {
         "You explored this repository as the recon agent earlier in this \
-         session; rely on that analysis rather than re-reading from scratch."
+         session, so its threat model and invariants are already in your \
+         context. That pass was deliberately shallow — it read few files in \
+         full — so do not treat it as a substitute for reading the code: open \
+         this task's targets and the surrounding code yourself before reporting."
             .to_string()
     } else {
-        architecture
+        recon_report
     };
 
     // PoC confirmation is the most token-hungry part of hunting (compile/run
@@ -178,10 +186,10 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         let stream_log_path = ctx.artifacts.log_path(&format!("hunt-{}.jsonl", task.id));
         let prompt = PROMPT
             .replace("{attack_class}", &task.attack_class)
-            .replace("{scope_hint}", &task.scope_hint)
+            .replace("{scope}", &scope_line(&task))
             .replace("{hypothesis}", &hypothesis_line(&task))
             .replace("{targets}", &targets_block(&task))
-            .replace("{skills}", &skills_line(&task))
+            .replace("{skills}", &skills_line(&task, ctx.config.run.use_skills))
             .replace("{target_dir}", &target.to_string_lossy())
             .replace("{poc_intro}", poc_intro)
             .replace("{poc_rule}", poc_rule)
@@ -189,7 +197,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             // After poc_intro, since it may embed {scratch_dir}.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &arch_context)
-            + &reference_note;
+            + &reference_note
+            + &ctx.config.run.skills_directive();
         let extra_dirs = reference_dirs.clone();
         // A forked hunter runs in recon's project dir (the target), so PoCs go
         // to the scratch dir by absolute path; a cold hunter runs in scratch.
@@ -206,13 +215,21 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 working_dir: scratch_dir,
                 extra_dirs,
                 allowed_tools: Vec::new(),
-                // Hunters must not spawn sub-agents: the orchestrator already
-                // runs them in parallel, so a nested Task agent only multiplies
-                // cost without adding coverage.
-                disallowed_tools: vec!["Task".to_string()],
+                // Shared deny-list: no sub-agent fan-out (the orchestrator
+                // already runs hunters in parallel) plus the tools no stage uses.
+                disallowed_tools: super::disabled_tools(),
                 timeout,
                 max_turns: Some(max_turns),
                 resume,
+                // A leaf agent: nothing forks from a hunter, and its own context
+                // is re-read only by its own sub-5m-apart turns, so 1h caching
+                // would pay a higher write premium for no reuse. It reads recon's
+                // prefix at cache rates regardless (recon owns that 1h cache).
+                cache_1h: false,
+                // Hunting is open-ended multi-hop tracing source→sink; the
+                // deepest thinking earns its keep here, and a hunter's effort is
+                // not fork-amplified. This is the stage xhigh is for.
+                effort: Effort::Xhigh,
                 stream_log_path: Some(stream_log_path),
             };
             info!(task = %task.id, attack_class = %task.attack_class, "hunter started");
@@ -303,6 +320,16 @@ fn append_finding(artifacts: &Artifacts, finding: &Finding) -> Result<()> {
     artifacts.append_jsonl(names::CANDIDATES, finding)
 }
 
+/// The scope shown to the hunter: recon's path-prefix list when present, else
+/// the free-form scope hint (gapfill/feedback tasks set only the hint).
+fn scope_line(task: &Task) -> String {
+    if task.scope_paths.is_empty() {
+        task.scope_hint.clone()
+    } else {
+        task.scope_paths.join(", ")
+    }
+}
+
 /// The hypothesis line shown to the hunter, with a fallback when recon left it
 /// unset so the prompt never renders an empty field.
 fn hypothesis_line(task: &Task) -> String {
@@ -327,8 +354,11 @@ fn targets_block(task: &Task) -> String {
 }
 
 /// The Trail of Bits skills the hunter should apply, recon's per-task picks.
-fn skills_line(task: &Task) -> String {
-    if task.suggested_skills.is_empty() {
+/// With skills disabled for the run, the per-task picks are ignored.
+fn skills_line(task: &Task, use_skills: bool) -> String {
+    if !use_skills {
+        "(disabled for this run — use judgment)".to_string()
+    } else if task.suggested_skills.is_empty() {
         "(none suggested — use judgment)".to_string()
     } else {
         task.suggested_skills.join(", ")
@@ -356,9 +386,12 @@ mod tests {
             id: "T-0001".into(),
             attack_class: "overflow".into(),
             scope_hint: "src/a.rs".into(),
+            scope_paths: Vec::new(),
             hypothesis: hypothesis.into(),
             targets: targets.iter().map(|s| s.to_string()).collect(),
             suggested_skills: skills.iter().map(|s| s.to_string()).collect(),
+            tags: Vec::new(),
+            priority: crate::domain::Priority::default(),
             origin: TaskOrigin::Recon,
         }
     }
@@ -372,7 +405,20 @@ mod tests {
         );
         assert_eq!(hypothesis_line(&t), "len added unchecked");
         assert_eq!(targets_block(&t), "- src/a.rs:decode\n- src/a.rs:42");
-        assert_eq!(skills_line(&t), "sharp-edges, spec-to-code-compliance");
+        assert_eq!(
+            skills_line(&t, true),
+            "sharp-edges, spec-to-code-compliance"
+        );
+    }
+
+    #[test]
+    fn scope_prefers_paths_then_falls_back_to_hint() {
+        let mut t = task("h", &[], &[]);
+        // With no scope_paths, the free-form hint is shown.
+        assert_eq!(scope_line(&t), "src/a.rs");
+        // recon's path prefixes take precedence and render joined.
+        t.scope_paths = vec!["lnwallet/".into(), "htlcswitch/".into()];
+        assert_eq!(scope_line(&t), "lnwallet/, htlcswitch/");
     }
 
     #[test]
@@ -380,6 +426,37 @@ mod tests {
         let t = task("   ", &[], &[]);
         assert!(hypothesis_line(&t).contains("form your own"));
         assert!(targets_block(&t).contains("locate the relevant code"));
-        assert!(skills_line(&t).contains("use judgment"));
+        assert!(skills_line(&t, true).contains("use judgment"));
+    }
+
+    #[test]
+    fn disabling_skills_ignores_per_task_picks() {
+        let t = task("x", &["src/a.rs"], &["sharp-edges"]);
+        let line = skills_line(&t, false);
+        assert!(line.contains("disabled"));
+        assert!(!line.contains("sharp-edges"));
+    }
+
+    #[test]
+    fn spawn_order_is_origin_then_priority() {
+        // Mirrors the sort key in run(): hunter-surfaced origins first, then
+        // recon's own priority within an origin, queue order breaking ties.
+        let mk = |id: &str, origin: TaskOrigin, priority: crate::domain::Priority| {
+            let mut t = task("h", &[], &[]);
+            t.id = id.into();
+            t.origin = origin;
+            t.priority = priority;
+            t
+        };
+        use crate::domain::Priority::{High, Low, Medium};
+        let mut tasks = vec![
+            mk("recon-low", TaskOrigin::Recon, Low),
+            mk("recon-high", TaskOrigin::Recon, High),
+            mk("gapfill", TaskOrigin::Gapfill, Medium),
+            mk("recon-med", TaskOrigin::Recon, Medium),
+        ];
+        tasks.sort_by_key(|t| (t.origin.hunt_priority(), t.priority.hunt_rank()));
+        let order: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(order, ["gapfill", "recon-high", "recon-med", "recon-low"]);
     }
 }

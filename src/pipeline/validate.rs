@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Finding, Severity, Validation, Verdict};
-use crate::provider::AgentRequest;
+use crate::provider::{AgentRequest, Effort};
 
 const PROMPT: &str = include_str!("../../prompts/validate.md");
 
@@ -46,7 +46,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let prompt = PROMPT
         .replace("{target_dir}", &target)
         .replace("{findings_json}", &review_input(&candidates))
-        + &ctx.config.reference.prompt_note();
+        + &ctx.config.reference.prompt_note()
+        + &ctx.config.run.skills_directive();
 
     // Reviewing re-reads the source, so it runs in the target dir.
     let req = AgentRequest {
@@ -60,10 +61,15 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             .map(|d| vec![d.to_path_buf()])
             .unwrap_or_default(),
         allowed_tools: Vec::new(),
-        disallowed_tools: Vec::new(),
+        disallowed_tools: super::disabled_tools(),
         timeout: Duration::from_secs(ctx.config.run.agent_timeout_secs),
         max_turns: None,
         resume: None,
+        // Leaf agent: nothing forks from it, so the default 5m cache suffices.
+        cache_1h: false,
+        // Re-tracing a specific claim to confirm or refute it: careful, but
+        // bounded, not open-ended discovery. High is plenty; xhigh is marginal.
+        effort: Effort::High,
         stream_log_path: Some(ctx.artifacts.log_path("validate-review.jsonl")),
     };
 

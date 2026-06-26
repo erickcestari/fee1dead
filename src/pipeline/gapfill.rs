@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::StageCtx;
 use crate::artifacts::names;
-use crate::domain::{GapMarker, Task, TaskOrigin};
+use crate::domain::{GapMarker, Priority, Task, TaskOrigin};
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let gaps: Vec<GapMarker> = ctx.artifacts.read_jsonl(names::GAPS)?;
@@ -54,9 +54,12 @@ fn plan_gapfill(queue: &[Task], gaps: Vec<GapMarker>) -> Vec<Task> {
             id: format!("G-{next:04}"),
             attack_class: "uncovered area".to_string(),
             scope_hint: format!("{} — {}", gap.area, gap.reason),
+            scope_paths: Vec::new(),
             hypothesis: String::new(),
             targets: Vec::new(),
             suggested_skills: Vec::new(),
+            tags: Vec::new(),
+            priority: Priority::default(),
             origin: TaskOrigin::Gapfill,
         });
         covered.insert(area_key);
@@ -75,9 +78,12 @@ mod tests {
             id: id.into(),
             attack_class: "c".into(),
             scope_hint: hint.into(),
+            scope_paths: Vec::new(),
             hypothesis: String::new(),
             targets: Vec::new(),
             suggested_skills: Vec::new(),
+            tags: Vec::new(),
+            priority: Priority::default(),
             origin: TaskOrigin::Recon,
         }
     }

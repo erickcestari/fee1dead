@@ -16,7 +16,15 @@ pub struct Task {
     /// The attack class the hunter should focus on (e.g. "integer overflow").
     pub attack_class: String,
     /// Where to look: a file, module, function, or subsystem description.
+    /// Recon-origin tasks derive this from `scope_paths` (joined); gapfill and
+    /// feedback tasks set it directly. Used for queue dedupe across stages.
     pub scope_hint: String,
+    /// Repo-relative path prefixes recon confined this task to (the structured
+    /// successor to `scope_hint`). Recon populates it; gapfill/feedback tasks
+    /// leave it empty and rely on `scope_hint`. Shown to the hunter as its
+    /// confinement boundary. Empty for older artifacts.
+    #[serde(default)]
+    pub scope_paths: Vec<String>,
     /// A falsifiable, one-line hypothesis the hunter should test (e.g. "length
     /// is added without bounds check before the alloc"). Steers the hunter at a
     /// specific suspected defect instead of a whole class. Empty when unset.
@@ -31,9 +39,41 @@ pub struct Task {
     /// prompt so it invokes the matching skill; empty means "use judgment".
     #[serde(default)]
     pub suggested_skills: Vec<String>,
+    /// Risk tags recon assigns (e.g. "crypto", "funds", "p2p", "auth"). Carried
+    /// in the queue so a run can be sliced by risk area; empty when unset.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// How urgently to hunt this task. Hunters spawn in queue order under a
+    /// concurrency cap, and a usage limit can truncate the tail, so the most
+    /// security-critical tasks must spawn first. Defaults to Medium for older
+    /// artifacts and tasks recon leaves unranked.
+    #[serde(default)]
+    pub priority: Priority,
     /// Where the task came from, for debugging the queue's provenance.
     #[serde(default)]
     pub origin: TaskOrigin,
+}
+
+/// How urgently a task should be hunted, set by recon. Lower [`Priority::hunt_rank`]
+/// schedules first; this is the within-origin tiebreaker for spawn order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+impl Priority {
+    /// Scheduling rank; lower is scheduled first.
+    pub fn hunt_rank(self) -> u8 {
+        match self {
+            Priority::High => 0,
+            Priority::Medium => 1,
+            Priority::Low => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -246,6 +286,26 @@ mod tests {
             serde_json::from_str("{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}")
                 .unwrap();
         assert!(matches!(t.origin, TaskOrigin::Recon));
+    }
+
+    #[test]
+    fn task_priority_and_tags_default_when_absent() {
+        // Queue files predating these fields must still load with safe defaults.
+        let t: Task =
+            serde_json::from_str("{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}")
+                .unwrap();
+        assert_eq!(t.priority, Priority::Medium);
+        assert!(t.tags.is_empty());
+    }
+
+    #[test]
+    fn priority_ranks_high_before_low_and_serializes_lowercase() {
+        // Spawn order depends on this ranking: high-value tasks first.
+        assert!(Priority::High.hunt_rank() < Priority::Medium.hunt_rank());
+        assert!(Priority::Medium.hunt_rank() < Priority::Low.hunt_rank());
+        assert_eq!(serde_json::to_string(&Priority::High).unwrap(), "\"high\"");
+        let p: Priority = serde_json::from_str("\"low\"").unwrap();
+        assert_eq!(p, Priority::Low);
     }
 
     #[test]

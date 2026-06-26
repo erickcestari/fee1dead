@@ -13,8 +13,8 @@ per-task scratch space, and validates/persists results.
 
 | Stage      | Status   | What it does |
 |------------|----------|--------------|
-| Recon      | built    | Reads the repo top-down, emits `ARCHITECTURE.md` and seeds the hunt queue. |
-| Hunt       | built    | One hunter per task (attack class + scope hint + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context, not just `ARCHITECTURE.md`. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
+| Recon      | built    | Reads the repo top-down, emits a structured threat model (`recon.json`) and seeds the hunt queue from its `hunt_tasks`. |
+| Hunt       | built    | One hunter per task (attack class + scope + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context; cold hunters load `recon.json` instead. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
 | Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
@@ -23,7 +23,7 @@ per-task scratch space, and validates/persists results.
 
 Stages communicate only through artifacts in `out_dir` (`queue.jsonl`,
 `candidates.jsonl`, `gaps.jsonl`, `validated.jsonl`, `hunted.jsonl`,
-`ARCHITECTURE.md`), so they are decoupled and runs are resumable. A recon-led
+`recon.json`), so they are decoupled and runs are resumable. A recon-led
 run clears those per-run artifacts at startup; `feedback-seeds.jsonl` is the one
 durable artifact and survives, carrying learning between runs. **Reuse the same
 `out_dir` (mount) across runs to keep the feedback memory.**

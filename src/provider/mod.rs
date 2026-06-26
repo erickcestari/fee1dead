@@ -39,10 +39,11 @@ pub fn is_usage_limited(err: &anyhow::Error) -> bool {
 /// Filename the agent is instructed to write its complete final answer to,
 /// inside its working dir. The harness reads this back as the agent's result,
 /// so the consumed output is decoupled from the streamed event log (and survives
-/// even if the chat output is noisy). Defined once here because it is a contract
-/// shared between the prompt instruction and the read-back; see
+/// even if the chat output is noisy). A `.json` file because every stage's final
+/// answer is a bare JSON document (no markdown fence). Defined once here because
+/// it is a contract shared between the prompt instruction and the read-back; see
 /// [`final_output_path`].
-pub const FINAL_OUTPUT_FILE: &str = "agent-final-output.txt";
+pub const FINAL_OUTPUT_FILE: &str = "agent-final-output.json";
 
 /// Absolute path of the agent's final-output file for a given working dir.
 pub fn final_output_path(working_dir: &Path) -> PathBuf {
@@ -53,6 +54,32 @@ pub use claude_code::ClaudeCodeRunner;
 pub use generic_exec::ExecRunner;
 #[cfg(any(test, feature = "mock-runner"))]
 pub use mock::{CannedReply, MockRunner};
+
+/// Reasoning effort for an agent run, mapped to `CLAUDE_CODE_EFFORT_LEVEL`.
+///
+/// Higher levels think longer before acting: more thorough, more tokens (and
+/// more turns, each re-reading the cached context). Match it to the stage's
+/// actual need — open-ended multi-hop tracing wants [`Effort::Xhigh`]; a
+/// mechanical, schema-bound transform wants [`Effort::Low`]. Providers without
+/// an effort knob ignore it.
+#[derive(Debug, Clone, Copy)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::Xhigh => "xhigh",
+        }
+    }
+}
 
 /// A request to run one agent task.
 #[derive(Debug, Clone)]
@@ -82,6 +109,13 @@ pub struct AgentRequest {
     /// When set, fork a prior agent session so this run inherits its
     /// conversation context. Providers without a session concept ignore it.
     pub resume: Option<ResumeSession>,
+    /// Extend the prompt cache from the default 5m TTL to 1h. Worth its higher
+    /// write premium only for a session that is forked from and whose prefix
+    /// must outlive the 5m window (recon); a leaf agent that nothing forks from
+    /// should leave it false. Providers without prompt caching ignore it.
+    pub cache_1h: bool,
+    /// Reasoning effort for this run. Set per stage to its actual need.
+    pub effort: Effort,
     /// When set, tee the provider's full event stream to this file as it runs,
     /// one JSON event per line. Lets a run's agent transcripts be inspected
     /// after the fact, and preserves partial output if the agent times out.

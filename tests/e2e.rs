@@ -11,17 +11,26 @@ use fee1dead::provider::{CannedReply, MockRunner};
 /// Canned agent responses keyed by a substring unique to each stage's prompt.
 fn replies() -> Vec<CannedReply> {
     vec![
-        // Recon: architecture doc + a one-task queue. Reports a session id so
-        // the fork-from-recon path is exercised.
+        // Recon: a structured threat model (its whole final answer) carrying a
+        // one-task queue. Reports a session id so the fork-from-recon path is
+        // exercised.
         CannedReply {
-            match_substr: Some("You are the Recon agent".into()),
-            stdout: r#"# Architecture
-
-Build: `cargo build`. Entry point: src/parse.rs.
-
-```json
-[{"attack_class": "integer overflow", "scope_hint": "src/parse.rs decode loop", "hypothesis": "length added without bounds check", "targets": ["src/parse.rs:42"], "suggested_skills": ["sharp-edges"]}]
-```"#
+            match_substr: Some("reconnaissance phase of a multi-phase audit".into()),
+            stdout: r#"{
+  "repo_size": "small",
+  "loc_estimate": 1200,
+  "language": "rust",
+  "product_summary": "A byte parser.",
+  "trust_boundaries": [{"name": "input", "description": "untrusted bytes"}],
+  "assets": ["memory safety"],
+  "entry_points": [{"type": "file", "handler": "parse::decode", "file": "src/parse.rs", "untrusted_inputs": "length prefix", "reaches": "allocator", "validation_present": "no"}],
+  "invariants": [{"id": "INV-1", "statement": "length is bounds-checked before alloc", "relevant_modules": ["src/parse.rs"], "adversary": "file author", "how_to_falsify": "find an alloc before the check", "tags": ["deserialization"]}],
+  "priority_targets": [{"file": "src/parse.rs", "function": "decode", "tied_to": ["INV-1"], "risk": "deserialization", "reason": "length math before bounds check"}],
+  "protocol_specs": [],
+  "hunt_tasks": [{"attack_class": "integer overflow", "scope_paths": ["src/parse.rs"], "targets": ["src/parse.rs:42"], "hypothesis": "INV-1: length added without bounds check", "suggested_skills": ["sharp-edges"], "priority": "high"}],
+  "recent_changes": [],
+  "notes": "mock recon report"
+}"#
                 .into(),
             session_id: Some(RECON_SESSION_ID.into()),
         },
@@ -130,7 +139,7 @@ async fn full_skeleton_pipeline_with_mock() {
     pipeline.run().await.unwrap();
 
     // Artifacts produced by each stage.
-    assert!(out.join("ARCHITECTURE.md").exists(), "recon doc missing");
+    assert!(out.join("recon.json").exists(), "recon report missing");
     assert!(out.join("queue.jsonl").exists(), "queue missing");
     assert!(out.join("candidates.jsonl").exists(), "candidates missing");
     assert!(out.join("gaps.jsonl").exists(), "gaps missing");

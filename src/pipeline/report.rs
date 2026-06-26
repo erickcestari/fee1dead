@@ -18,7 +18,7 @@ use tracing::{info, warn};
 use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Finding, Severity, Validation};
-use crate::provider::AgentRequest;
+use crate::provider::{AgentRequest, Effort};
 use crate::store::{ReportRecord, build_sink};
 
 const PROMPT: &str = include_str!("../../prompts/report.md");
@@ -77,10 +77,15 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             working_dir: ctx.config.run.out_dir.clone(),
             extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
+            disallowed_tools: super::disabled_tools(),
             timeout,
             max_turns: None,
             resume: None,
+            // Leaf agent: nothing forks from it, so the default 5m cache suffices.
+            cache_1h: false,
+            // Mechanical transform: reviewed findings → schema-valid JSON, no
+            // prose, no tracing. Deep thinking can't improve it, only cost more.
+            effort: Effort::Low,
             stream_log_path: Some(
                 ctx.artifacts
                     .log_path(&format!("report-batch-{attempt}.jsonl")),
@@ -94,7 +99,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             Err(e) => {
                 warn!(attempt, error = %e, "report output unparseable; retrying");
                 repair_note = "Your previous output was not a JSON array. Return ONLY a \
-                    fenced ```json array of report objects, one per finding."
+                    bare JSON array of report objects (no markdown fences), one per finding."
                     .to_string();
                 continue;
             }
