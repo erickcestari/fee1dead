@@ -41,7 +41,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 
 # Claude Code CLI (the default provider). Pinned for reproducible builds;
 # override with --build-arg CLAUDE_CODE_VERSION=... if needed.
-ARG CLAUDE_CODE_VERSION=2.1.116
+ARG CLAUDE_CODE_VERSION=2.1.193
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # Go toolchain, so hunters can compile and run PoCs against Go targets (e.g. lnd).
