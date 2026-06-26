@@ -35,6 +35,18 @@ enum Command {
         #[arg(short, long, default_value = "config/harness.toml")]
         config: PathBuf,
     },
+    /// Compile a finished or partial run's hunter output into one reviewable
+    /// findings.json, without running any agent. Use after a run that spent its
+    /// token budget before the review stages.
+    Aggregate {
+        #[arg(short, long, default_value = "config/harness.toml")]
+        config: PathBuf,
+        /// Read artifacts from this directory instead of the config's
+        /// `run.out_dir`. Use when the config points at a container path (e.g.
+        /// `/work/out`) but the artifacts are on the host (e.g. `./out`).
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +80,11 @@ async fn main() -> Result<()> {
                 println!("{host}");
             }
             Ok(())
+        }
+        Command::Aggregate { config, out_dir } => {
+            let cfg = Config::load(&config)?;
+            let dir = out_dir.unwrap_or_else(|| cfg.run.out_dir.clone());
+            fee1dead::pipeline::aggregate_dir(&dir)
         }
     }
 }

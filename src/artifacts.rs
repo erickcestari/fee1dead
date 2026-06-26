@@ -22,6 +22,12 @@ pub mod names {
     pub const CANDIDATES: &str = "candidates.jsonl";
     pub const GAPS: &str = "gaps.jsonl";
     pub const VALIDATED: &str = "validated.jsonl";
+    /// Single human-reviewable JSON document the Aggregate stage compiles from
+    /// the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`), enriched with
+    /// each finding's recon task context. Unlike the others this is one JSON
+    /// object, not JSONL. Written by pure logic with no agent call, so it lands
+    /// even when the token budget is spent before the review stages.
+    pub const REPORT_JSON: &str = "findings.json";
     /// Ledger of task ids the Hunt stage has already processed, so hunting is
     /// incremental and re-queued (gapfill) tasks get a fresh pass.
     pub const HUNTED: &str = "hunted.jsonl";
@@ -45,6 +51,7 @@ pub mod names {
         CANDIDATES,
         GAPS,
         VALIDATED,
+        REPORT_JSON,
         HUNTED,
         RECON_SESSION,
     ];

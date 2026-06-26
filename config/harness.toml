@@ -113,8 +113,8 @@ max_seeds = 200
 [stages]
 # Stages run in the listed order; a stage name may repeat. To exploit gapfill,
 # run hunt again after it, e.g.:
-#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "validate", "report", "feedback"]
+#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "aggregate", "validate", "report", "feedback"]
 # feedback runs last: it distils this run into feedback-seeds.jsonl, which the
 # next run's recon merges back into the queue. Keep the same out_dir to retain
 # that memory across runs.
-enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "validate", "report", "feedback"]
+enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "aggregate", "validate", "report", "feedback"]

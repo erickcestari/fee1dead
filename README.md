@@ -18,12 +18,13 @@ per-task scratch space, and validates/persists results.
 | Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
+| Aggregate  | built    | Joins the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`) and each finding's recon task lead into one reviewable `findings.json`, ordered by severity then confidence. **No agent call**, so it always completes — even when a run spends its whole token budget hunting and never reaches validate/report. Run it standalone on a partial run with `fee1dead aggregate`. |
 | Feedback   | built    | Cross-run memory: distils confirmed findings (hunt variants) and unresolved gaps into durable seed tasks in `feedback-seeds.jsonl`. The next run's recon merges them, so each run starts smarter. |
 | Report     | built    | Renders all reportable findings (confirmed + downgraded) against `schema/finding.schema.json` in **one batched call** with a single repair round, then persists via the configured sink. |
 
 Stages communicate only through artifacts in `out_dir` (`queue.jsonl`,
-`candidates.jsonl`, `gaps.jsonl`, `validated.jsonl`, `hunted.jsonl`,
-`recon.json`), so they are decoupled and runs are resumable. A recon-led
+`candidates.jsonl`, `gaps.jsonl`, `validated.jsonl`, `findings.json`,
+`hunted.jsonl`, `recon.json`), so they are decoupled and runs are resumable. A recon-led
 run clears those per-run artifacts at startup; `feedback-seeds.jsonl` is the one
 durable artifact and survives, carrying learning between runs. **Reuse the same
 `out_dir` (mount) across runs to keep the feedback memory.**

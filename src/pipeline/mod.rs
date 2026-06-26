@@ -4,6 +4,7 @@
 //! order. Each stage is a self-contained function over [`StageCtx`]; they
 //! communicate only through artifacts, so the orchestrator just sequences them.
 
+mod aggregate;
 mod dedupe;
 mod feedback;
 mod gapfill;
@@ -152,6 +153,17 @@ impl Pipeline {
     }
 }
 
+/// Compile a (possibly partial) run's hunter output into `findings.json` without
+/// running the pipeline. Reads the artifacts in `out_dir` only — no runner, no
+/// target acquisition, no artifact reset — so it is safe to call after a run that
+/// spent its token budget before the review stages. `out_dir` is taken directly
+/// (not from config) so the host path can override a container path like
+/// `/work/out`.
+pub fn aggregate_dir(out_dir: impl Into<std::path::PathBuf>) -> Result<()> {
+    let artifacts = Artifacts::new(out_dir)?;
+    aggregate::write_report(&artifacts)
+}
+
 async fn run_stage(stage: &str, ctx: &StageCtx) -> Result<()> {
     match stage {
         "recon" => recon::run(ctx).await,
@@ -160,6 +172,7 @@ async fn run_stage(stage: &str, ctx: &StageCtx) -> Result<()> {
         "gapfill" => gapfill::run(ctx).await,
         "dedupe" => dedupe::run(ctx).await,
         "feedback" => feedback::run(ctx).await,
+        "aggregate" => aggregate::run(ctx).await,
         "report" => report::run(ctx).await,
         other => bail!("unknown stage '{other}'"),
     }

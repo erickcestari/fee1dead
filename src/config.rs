@@ -397,7 +397,7 @@ impl Config {
 }
 
 pub const KNOWN_STAGES: &[&str] = &[
-    "recon", "hunt", "validate", "gapfill", "dedupe", "feedback", "report",
+    "recon", "hunt", "validate", "gapfill", "dedupe", "feedback", "aggregate", "report",
 ];
 
 #[cfg(test)]
