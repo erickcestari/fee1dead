@@ -234,7 +234,7 @@ fn default_hunter_max_turns() -> u32 {
 }
 
 fn default_recon_max_turns() -> u32 {
-    30
+    60
 }
 
 fn default_hunter_stagger_ms() -> u64 {
