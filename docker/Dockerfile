@@ -44,6 +44,14 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 ARG CLAUDE_CODE_VERSION=2.1.193
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
+# rtk (https://github.com/rtk-ai/rtk): a CLI proxy that filters/compresses common
+# dev-command output (git, cargo, test runners, ...) to cut agent token usage.
+# The binary is installed system-wide here; `rtk init -g` wires it into the
+# agent's Claude Code config below (after the agent user exists).
+ARG RTK_VERSION=v0.43.0
+RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \
+      | env RTK_INSTALL_DIR=/usr/local/bin RTK_VERSION=${RTK_VERSION} sh
+
 # Go toolchain, so hunters can compile and run PoCs against Go targets (e.g. lnd).
 ARG GO_VERSION=1.23.4
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -101,6 +109,12 @@ RUN mkdir -p /home/agent/.claude/skills && \
         [ -n "$d" ] || { echo "skill not found in vendored suite: $skill" >&2; exit 1; }; \
         ln -sfn "$d" "/home/agent/.claude/skills/$skill"; \
     done && \
+    chown -R agent:agent /home/agent/.claude
+
+# Register rtk with Claude Code for the agent: installs the PreToolUse auto-rewrite
+# hook + RTK.md into /home/agent/.claude so Bash commands are transparently proxied
+# through rtk. Run as `agent` (with HOME set) so the config lands in the right home.
+RUN gosu agent env HOME=/home/agent rtk init -g --auto-patch && \
     chown -R agent:agent /home/agent/.claude
 
 # Orchestrator binary, prompts/schema (embedded in the binary but kept for ref),
