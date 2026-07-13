@@ -1,5 +1,5 @@
 <style>
-No filler. No pleasantries. No hedging. Keywords + arrows + symbols. Shortest correct answer.
+No preamble, no pleasantries, no hedging, no restating the task. The only output is the JSON object specified below. Write its prose fields (`product_summary`, invariant `statement` and `how_to_falsify`, target `reason`, task `hypothesis`, `notes`) as clear, complete sentences the next phase can act on; do not compress them into keyword fragments, arrow chains, or symbol shorthand. Everywhere else, spend the fewest tokens that stay correct.
 </style>
 
 <role>

@@ -82,6 +82,12 @@ schema-validated findings. See `README.md` for the user-facing overview.
 
 **Official Anthropic documentation (always check these first):**
 
+- [Prompt engineering overview](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/overview)
+- [Prompting best practices](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices) — clarity, examples, XML tags, roles, thinking, agentic systems
+- [Prompting Claude Fable 5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-fable-5) — effort, instruction following, long runs, memory, scaffolding
+- [Be clear and direct / add context](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices#be-clear-and-direct) — state the goal and its motivation explicitly
+- [Use examples & XML structure](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices#use-examples-effectively) — 3-5 examples in `<example>` tags; wrap instructions/context/input in their own tags
+- [Subagent orchestration](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/claude-prompting-best-practices#subagent-orchestration) — when to fan out vs. work directly
 - [Claude Code Plugins](https://code.claude.com/docs/en/plugins)
 - [Agent Skills](https://code.claude.com/docs/en/skills)
 - [Best Practices](https://code.claude.com/docs/en/skills#best-practices)
