@@ -98,12 +98,21 @@ allow = [
 ]
 
 [report]
-sink = "sqlite"            # sqlite | jsonl | http
+sink = "sqlite"            # sqlite | jsonl | http | github
 path = "/work/out/findings.db"
 # For the http sink instead:
 # sink      = "http"
 # url       = "https://ingest.example.com/findings"
 # token_env = "INGEST_TOKEN"   # bearer token read from this env var
+# To open one GitHub issue per finding instead:
+# sink      = "github"
+# repo      = "owner/name"     # issues are filed here
+# token_env = "GITHUB_PAT"     # PAT env var (issues:write); defaults to GITHUB_PAT
+# The github sink needs api.github.com in [firewall].allow.
+# Before filing, new findings are deduped against issues already filed: a
+# token-overlap score decides the clear cases, and only ambiguous pairs go to a
+# lightweight judge model (defaults to claude-haiku-4-5; override below).
+# dedupe_model = "claude-haiku-4-5"
 
 # Cross-run feedback memory (see [stages] "feedback").
 [feedback]
@@ -113,8 +122,12 @@ max_seeds = 200
 [stages]
 # Stages run in the listed order; a stage name may repeat. To exploit gapfill,
 # run hunt again after it, e.g.:
-#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "aggregate", "validate", "report", "feedback"]
+#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "aggregate", "validate", "report", "feedback"]
+# skip-reported drops candidates already reported in the sink (e.g. filed as
+# GitHub issues) BEFORE validate, so no validation tokens are spent re-reviewing
+# findings a past run already surfaced. It is a no-op unless report.sink tracks
+# external state (the github sink), so it is safe to leave in the list.
 # feedback runs last: it distils this run into feedback-seeds.jsonl, which the
 # next run's recon merges back into the queue. Keep the same out_dir to retain
 # that memory across runs.
-enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "aggregate", "validate", "report", "feedback"]
+enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "aggregate", "validate", "report", "feedback"]

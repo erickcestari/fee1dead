@@ -11,6 +11,7 @@ mod gapfill;
 mod hunt;
 mod recon;
 mod report;
+mod skip_reported;
 mod validate;
 
 use std::sync::Arc;
@@ -171,6 +172,7 @@ async fn run_stage(stage: &str, ctx: &StageCtx) -> Result<()> {
         "validate" => validate::run(ctx).await,
         "gapfill" => gapfill::run(ctx).await,
         "dedupe" => dedupe::run(ctx).await,
+        "skip-reported" => skip_reported::run(ctx).await,
         "feedback" => feedback::run(ctx).await,
         "aggregate" => aggregate::run(ctx).await,
         "report" => report::run(ctx).await,

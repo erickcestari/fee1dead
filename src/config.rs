@@ -306,9 +306,34 @@ pub struct ReportConfig {
     /// Ingest endpoint for the http sink (one POST per finding).
     #[serde(default)]
     pub url: Option<String>,
-    /// Env var holding a bearer token for the http sink, if auth is required.
+    /// Env var holding an auth token: a bearer token for the http sink, or a
+    /// GitHub PAT for the github sink. Defaults to `GITHUB_PAT` for the github
+    /// sink when unset (see [`ReportConfig::github_token_env`]).
     #[serde(default)]
     pub token_env: Option<String>,
+    /// `owner/repo` slug the github sink files issues into.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Model the github sink's semantic-dedup judge uses on borderline pairs
+    /// (findings whose algorithmic similarity to an already-filed issue is
+    /// inconclusive). A lightweight model keeps that extra cost small; defaults
+    /// to `claude-haiku-4-5`. Only the claude-code provider honors it.
+    #[serde(default)]
+    pub dedupe_model: Option<String>,
+}
+
+impl ReportConfig {
+    /// The env var the github sink reads its PAT from: the operator's
+    /// `token_env` if set, else `GITHUB_PAT`.
+    pub fn github_token_env(&self) -> &str {
+        self.token_env.as_deref().unwrap_or("GITHUB_PAT")
+    }
+
+    /// The model the dedup judge runs on: the operator's `dedupe_model` if set,
+    /// else a lightweight default.
+    pub fn dedupe_model(&self) -> &str {
+        self.dedupe_model.as_deref().unwrap_or("claude-haiku-4-5")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -317,6 +342,7 @@ pub enum SinkKind {
     Sqlite,
     Jsonl,
     Http,
+    Github,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -385,6 +411,16 @@ impl Config {
                     bail!("report.url is required for the http sink");
                 }
             }
+            SinkKind::Github => match &self.report.repo {
+                None => bail!("report.repo (\"owner/repo\") is required for the github sink"),
+                Some(repo) => {
+                    if repo.split('/').filter(|s| !s.is_empty()).count() != 2 {
+                        bail!(
+                            "report.repo must be in \"owner/repo\" form for the github sink, got {repo:?}"
+                        );
+                    }
+                }
+            },
         }
         Ok(())
     }
@@ -397,7 +433,15 @@ impl Config {
 }
 
 pub const KNOWN_STAGES: &[&str] = &[
-    "recon", "hunt", "validate", "gapfill", "dedupe", "feedback", "aggregate", "report",
+    "recon",
+    "hunt",
+    "validate",
+    "gapfill",
+    "dedupe",
+    "skip-reported",
+    "feedback",
+    "aggregate",
+    "report",
 ];
 
 #[cfg(test)]
@@ -541,6 +585,38 @@ enabled = ["recon", "hunt", "validate", "report"]
     }
 
     #[test]
+    fn github_sink_requires_repo() {
+        let bad = VALID.replace(
+            "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
+            "sink = \"github\"",
+        );
+        let err = Config::load(write_tmp(&bad).path()).unwrap_err().to_string();
+        assert!(err.contains("report.repo"), "got: {err}");
+    }
+
+    #[test]
+    fn github_sink_rejects_malformed_repo() {
+        let bad = VALID.replace(
+            "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
+            "sink = \"github\"\nrepo = \"not-a-slug\"",
+        );
+        let err = Config::load(write_tmp(&bad).path()).unwrap_err().to_string();
+        assert!(err.contains("owner/repo"), "got: {err}");
+    }
+
+    #[test]
+    fn github_sink_accepts_owner_repo_and_defaults_token_env() {
+        let ok = VALID.replace(
+            "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
+            "sink = \"github\"\nrepo = \"lightningnetwork/lnd\"",
+        );
+        let cfg = Config::load(write_tmp(&ok).path()).unwrap();
+        assert_eq!(cfg.report.repo.as_deref(), Some("lightningnetwork/lnd"));
+        // token_env unset → the sink reads $GITHUB_PAT.
+        assert_eq!(cfg.report.github_token_env(), "GITHUB_PAT");
+    }
+
+    #[test]
     fn rejects_unknown_stage() {
         let bad = VALID.replace("\"report\"]", "\"report\", \"teleport\"]");
         let f = write_tmp(&bad);
@@ -587,7 +663,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert!(cfg.run.fork_hunters);
         assert!(!cfg.run.require_poc);
         assert_eq!(cfg.run.hunter_max_turns, 60);
-        assert_eq!(cfg.run.recon_max_turns, 30);
+        assert_eq!(cfg.run.recon_max_turns, 60);
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
     }

@@ -230,6 +230,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 // deepest thinking earns its keep here, and a hunter's effort is
                 // not fork-amplified. This is the stage xhigh is for.
                 effort: Effort::Xhigh,
+                model: None,
                 stream_log_path: Some(stream_log_path),
             };
             info!(task = %task.id, attack_class = %task.attack_class, "hunter started");

@@ -86,6 +86,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             // Mechanical transform: reviewed findings → schema-valid JSON, no
             // prose, no tracing. Deep thinking can't improve it, only cost more.
             effort: Effort::Low,
+            model: None,
             stream_log_path: Some(
                 ctx.artifacts
                     .log_path(&format!("report-batch-{attempt}.jsonl")),
@@ -122,6 +123,10 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         );
     }
 
+    // Findings already reported in the destination (e.g. filed as GitHub issues)
+    // were pruned from the candidate set by the `skip-reported` stage before
+    // validate, so nothing here should be a re-file; the github sink's per-id
+    // marker check is the final idempotency guard.
     for payload in &done {
         let id = payload
             .get("id")

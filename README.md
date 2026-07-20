@@ -18,6 +18,7 @@ per-task scratch space, and validates/persists results.
 | Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
+| Skip-reported | built | Prunes candidates already reported in the sink (e.g. filed as GitHub issues) **before validate**, so no validation tokens are spent re-reviewing them. A token-overlap (Jaccard) score decides the confident cases; only the ambiguous middle band is escalated to a lightweight judge model (`report.dedupe_model`, default `claude-haiku-4-5`), which fails open so a real finding is never silently dropped. No-op unless the sink tracks external state (github). |
 | Aggregate  | built    | Joins the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`) and each finding's recon task lead into one reviewable `findings.json`, ordered by severity then confidence. **No agent call**, so it always completes — even when a run spends its whole token budget hunting and never reaches validate/report. Run it standalone on a partial run with `fee1dead aggregate`. |
 | Feedback   | built    | Cross-run memory: distils confirmed findings (hunt variants) and unresolved gaps into durable seed tasks in `feedback-seeds.jsonl`. The next run's recon merges them, so each run starts smarter. |
 | Report     | built    | Renders all reportable findings (confirmed + downgraded) against `schema/finding.schema.json` in **one batched call** with a single repair round, then persists via the configured sink. |
@@ -56,7 +57,14 @@ Single Rust binary, modularized:
   config block (`type = "exec"`) with no Rust code; `claude-code` is the only
   built-in adapter. `MockRunner` (feature `mock-runner`) drives offline runs.
 - `src/pipeline/` — orchestrator + one file per stage.
-- `src/store/` — `ReportSink` trait + SQLite/JSONL/HTTP sinks.
+- `src/store/` — `ReportSink` trait + SQLite/JSONL/HTTP/GitHub-issue sinks. The
+  `github` sink files one issue per reportable finding into `report.repo`
+  (`owner/name`), authenticating with a PAT read from `report.token_env`
+  (default `GITHUB_PAT`); it is idempotent across re-runs via a hidden per-finding
+  marker in each issue body. Add `api.github.com` to `[firewall].allow`. The
+  `github` sink also exposes `ReportSink::existing_reports` (its already-filed
+  issues), which the `skip-reported` stage consumes to prune duplicates before
+  validate (see below).
 - `src/config.rs` — per-run TOML config, validated at load.
 - `prompts/`, `schema/` — embedded into the binary at build time.
 - `skills/` — the Trail of Bits plugin suite, mapped to stages in `src/skills.rs`.

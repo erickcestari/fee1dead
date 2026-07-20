@@ -189,7 +189,10 @@ impl AgentRunner for ClaudeCodeRunner {
     }
 
     async fn run(&self, req: AgentRequest) -> Result<AgentResult> {
-        let (args, cwd) = build_invocation(&req, self.model.as_deref(), &self.extra_args);
+        // A per-request override (e.g. a cheap dedup judge) wins over the
+        // provider's configured model; otherwise fall back to the configured one.
+        let model = req.model.as_deref().or(self.model.as_deref());
+        let (args, cwd) = build_invocation(&req, model, &self.extra_args);
 
         let mut cmd = Command::new("claude");
         cmd.args(&args);
@@ -394,6 +397,7 @@ mod tests {
             resume: None,
             cache_1h: false,
             effort: Effort::Xhigh,
+            model: None,
             stream_log_path: None,
         }
     }

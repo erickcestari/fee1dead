@@ -4,6 +4,7 @@
 //! is used now; an HTTP ingest sink can be added later behind the same trait
 //! without touching the stage.
 
+mod github;
 mod http;
 mod jsonl;
 mod sqlite;
@@ -11,6 +12,7 @@ mod sqlite;
 use anyhow::{Result, bail};
 use serde_json::Value;
 
+pub use github::GithubSink;
 pub use http::HttpSink;
 pub use jsonl::JsonlSink;
 pub use sqlite::SqliteSink;
@@ -25,12 +27,32 @@ pub struct ReportRecord {
     pub payload: Value,
 }
 
+/// A finding already present in the destination, surfaced so the report stage
+/// can dedup new findings against it (e.g. issues already filed in GitHub).
+#[derive(Debug, Clone)]
+pub struct ExistingReport {
+    /// Finding id the report was filed under, when recoverable (the github sink
+    /// reads it from the issue's hidden marker). Empty when unknown.
+    pub id: String,
+    pub title: String,
+    /// Free text used for similarity scoring (the issue body / description).
+    pub text: String,
+}
+
 pub trait ReportSink {
     /// Persist one finding. Implementations should upsert on `record.id`.
     fn write(&mut self, record: &ReportRecord) -> Result<()>;
 
     /// Number of distinct findings currently stored (for verification/logging).
     fn count(&self) -> Result<usize>;
+
+    /// Findings already present in the destination, for semantic dedup before
+    /// writing. Defaults to none: id-upsert sinks (sqlite/jsonl/http) can't emit
+    /// a duplicate for a re-run of the same id, so only external-state sinks
+    /// (github) implement this.
+    fn existing_reports(&self) -> Result<Vec<ExistingReport>> {
+        Ok(Vec::new())
+    }
 }
 
 /// Construct the sink selected by config. Field presence is validated at config
@@ -59,6 +81,18 @@ pub fn build_sink(cfg: &ReportConfig) -> Result<Box<dyn ReportSink>> {
                 .and_then(|var| std::env::var(var).ok());
             Box::new(HttpSink::new(url.clone(), token))
         }
+        SinkKind::Github => {
+            let Some(repo) = &cfg.repo else {
+                bail!("github sink requires report.repo (\"owner/repo\")")
+            };
+            let var = cfg.github_token_env();
+            let token = std::env::var(var).map_err(|_| {
+                anyhow::anyhow!(
+                    "github sink requires a PAT in ${var}; set it or point report.token_env at the env var holding one"
+                )
+            })?;
+            Box::new(GithubSink::new(repo.clone(), token))
+        }
     })
 }
 
@@ -72,6 +106,8 @@ mod tests {
             path: path.map(Into::into),
             url: url.map(Into::into),
             token_env: None,
+            repo: None,
+            dedupe_model: None,
         }
     }
 
@@ -95,5 +131,16 @@ mod tests {
         assert!(build_sink(&cfg(SinkKind::Jsonl, None, None)).is_err());
         assert!(build_sink(&cfg(SinkKind::Sqlite, None, None)).is_err());
         assert!(build_sink(&cfg(SinkKind::Http, None, None)).is_err());
+        // github with no repo configured.
+        assert!(build_sink(&cfg(SinkKind::Github, None, None)).is_err());
+    }
+
+    #[test]
+    fn github_sink_bails_when_pat_env_missing() {
+        // repo is set, but the PAT env var is absent → build must fail loudly.
+        let mut c = cfg(SinkKind::Github, None, None);
+        c.repo = Some("owner/repo".into());
+        c.token_env = Some("FEE1DEAD_TEST_ABSENT_PAT".into());
+        assert!(build_sink(&c).is_err());
     }
 }

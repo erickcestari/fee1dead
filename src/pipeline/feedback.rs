@@ -6,10 +6,15 @@
 //!   - unresolved gaps      -> a task to cover the area a hunter skipped.
 //!
 //! Seeds are written to `feedback-seeds.jsonl` (preserved across runs); the
-//! next run's Recon merges them into the hunt queue. The list is deduped and
-//! capped at `feedback.max_seeds`, newest first, so the memory stays bounded
-//! and self-cleaning: a bug that gets fixed stops being confirmed and its seed
-//! ages out.
+//! next run's Recon merges them into the hunt queue (keeping the seed's id). The
+//! list is deduped and capped at `feedback.max_seeds`, newest first, so the
+//! memory stays bounded and self-cleaning: a bug that gets fixed stops being
+//! confirmed and its seed ages out.
+//!
+//! A carried seed that this run actually hunted (its id is in `hunted.jsonl`) is
+//! dropped from the persisted list: it did its job, so re-persisting it would
+//! only make the next run re-hunt an already-done task. Fresh signal for the
+//! same area re-enters as a new seed.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -72,22 +77,43 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     }
 
     let existing: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
-    let merged = merge_and_cap(new_seeds, existing, ctx.config.feedback.max_seeds);
+    // Task ids hunted this run: a carried seed among them is done and must not
+    // be carried forward again.
+    let done: HashSet<String> = ctx
+        .artifacts
+        .read_jsonl::<String>(names::HUNTED)?
+        .into_iter()
+        .collect();
+    let merged = merge_and_cap(new_seeds, existing, &done, ctx.config.feedback.max_seeds);
 
     info!(seeds = merged.len(), "feedback updated cross-run memory");
     ctx.artifacts.write_jsonl(names::SEEDS, &merged)?;
     Ok(())
 }
 
-/// Combine new (freshest) seeds with existing ones, dedupe by (attack class,
-/// scope hint), cap to `max`, and assign stable ids.
-fn merge_and_cap(new_seeds: Vec<Task>, existing: Vec<Task>, max: usize) -> Vec<Task> {
+/// Combine new (freshest) seeds with existing ones, drop carried seeds already
+/// hunted (`done`), dedupe by (attack class, scope hint), cap to `max`, and
+/// assign stable ids.
+///
+/// `done` holds task ids hunted this run; a carried seed whose id is listed is
+/// dropped so the next run does not re-hunt it. New seeds have no id yet, so the
+/// done check never touches them.
+fn merge_and_cap(
+    new_seeds: Vec<Task>,
+    existing: Vec<Task>,
+    done: &HashSet<String>,
+    max: usize,
+) -> Vec<Task> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out: Vec<Task> = Vec::new();
 
     for seed in new_seeds.into_iter().chain(existing) {
         if out.len() >= max {
             break;
+        }
+        // A carried seed that was hunted this run is done; drop it.
+        if !seed.id.is_empty() && done.contains(&seed.id) {
+            continue;
         }
         let key = (
             seed.attack_class.to_lowercase(),
@@ -109,8 +135,12 @@ mod tests {
     use super::*;
 
     fn seed(class: &str, hint: &str) -> Task {
+        seed_with_id("", class, hint)
+    }
+
+    fn seed_with_id(id: &str, class: &str, hint: &str) -> Task {
         Task {
-            id: String::new(),
+            id: id.into(),
             attack_class: class.into(),
             scope_hint: hint.into(),
             scope_paths: Vec::new(),
@@ -127,7 +157,7 @@ mod tests {
     fn dedupes_and_prefers_new() {
         let new = vec![seed("overflow", "fileA"), seed("overflow", "fileA")];
         let existing = vec![seed("overflow", "fileA"), seed("traversal", "fileB")];
-        let merged = merge_and_cap(new, existing, 100);
+        let merged = merge_and_cap(new, existing, &HashSet::new(), 100);
         // One "overflow/fileA" survives, plus the distinct existing one.
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].id, "F-0001");
@@ -137,7 +167,28 @@ mod tests {
     #[test]
     fn caps_growth() {
         let new: Vec<Task> = (0..300).map(|i| seed("c", &format!("hint{i}"))).collect();
-        let merged = merge_and_cap(new, vec![], 200);
+        let merged = merge_and_cap(new, vec![], &HashSet::new(), 200);
         assert_eq!(merged.len(), 200);
+    }
+
+    #[test]
+    fn drops_carried_seed_already_hunted() {
+        // F-0001 was hunted this run: it must not be carried forward. F-0002 was
+        // not hunted and survives. New seeds (no id) are never dropped by `done`.
+        let new = vec![seed("overflow", "fileNew")];
+        let existing = vec![
+            seed_with_id("F-0001", "traversal", "fileDone"),
+            seed_with_id("F-0002", "auth", "fileTodo"),
+        ];
+        let done: HashSet<String> = ["F-0001".to_string()].into_iter().collect();
+        let merged = merge_and_cap(new, existing, &done, 100);
+        assert_eq!(merged.len(), 2);
+        // Reassigned ids are positional; match on the distinguishing scope hint.
+        assert!(merged.iter().any(|t| t.scope_hint == "fileNew"));
+        assert!(merged.iter().any(|t| t.scope_hint == "fileTodo"));
+        assert!(
+            !merged.iter().any(|t| t.scope_hint == "fileDone"),
+            "the hunted seed must be dropped"
+        );
     }
 }

@@ -115,6 +115,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // most cost-amplified in a run (re-read each turn, forked into hunters),
         // so it sits a notch below the open-ended tracing hunters do.
         effort: Effort::High,
+        model: None,
         stream_log_path: Some(ctx.artifacts.log_path("recon-recon.jsonl")),
     };
 

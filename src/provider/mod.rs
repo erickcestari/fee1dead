@@ -116,6 +116,11 @@ pub struct AgentRequest {
     pub cache_1h: bool,
     /// Reasoning effort for this run. Set per stage to its actual need.
     pub effort: Effort,
+    /// Override the provider's configured model for this one run. Lets a stage
+    /// pick a cheaper model for a cheap sub-task (e.g. a lightweight dedup judge)
+    /// without a second provider. `None` uses the provider default. Providers
+    /// without a model knob ignore it.
+    pub model: Option<String>,
     /// When set, tee the provider's full event stream to this file as it runs,
     /// one JSON event per line. Lets a run's agent transcripts be inspected
     /// after the fact, and preserves partial output if the agent times out.

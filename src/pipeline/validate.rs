@@ -70,6 +70,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // Re-tracing a specific claim to confirm or refute it: careful, but
         // bounded, not open-ended discovery. High is plenty; xhigh is marginal.
         effort: Effort::High,
+        model: None,
         stream_log_path: Some(ctx.artifacts.log_path("validate-review.jsonl")),
     };
 
