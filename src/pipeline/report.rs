@@ -19,7 +19,8 @@ use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Finding, Severity, Validation};
 use crate::provider::{AgentRequest, Effort};
-use crate::store::{ReportRecord, build_sink};
+use crate::config::SinkKind;
+use crate::store::{JsonlSink, ReportRecord, ReportSink, build_sink};
 
 const PROMPT: &str = include_str!("../../prompts/report.md");
 const SCHEMA_SRC: &str = include_str!("../../schema/finding.schema.json");
@@ -51,6 +52,14 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("compiling finding schema: {e}"))?;
 
     let mut sink = build_sink(&ctx.config.report)?;
+    // Always emit a machine-readable findings JSONL, whatever the configured
+    // sink is. When the sink is already jsonl that file *is* the record, so the
+    // tee would be a second writer to the same path (clobbering it on flush);
+    // skip it in that case and let the primary sink be the jsonl.
+    let mut jsonl_tee = match ctx.config.report.sink {
+        SinkKind::Jsonl => None,
+        _ => Some(JsonlSink::open(&ctx.config.run.out_dir.join(names::FINDINGS_JSONL))?),
+    };
     if items.is_empty() {
         info!(written = 0, total = sink.count()?, "report complete");
         return Ok(());
@@ -133,10 +142,14 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        sink.write(&ReportRecord {
+        let record = ReportRecord {
             id,
             payload: payload.clone(),
-        })?;
+        };
+        sink.write(&record)?;
+        if let Some(tee) = jsonl_tee.as_mut() {
+            tee.write(&record)?;
+        }
     }
     if !pending.is_empty() {
         warn!(

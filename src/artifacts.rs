@@ -28,6 +28,11 @@ pub mod names {
     /// object, not JSONL. Written by pure logic with no agent call, so it lands
     /// even when the token budget is spent before the review stages.
     pub const REPORT_JSON: &str = "findings.json";
+    /// Machine-readable findings JSONL, one report payload per line. Always
+    /// written by the Report stage regardless of the configured sink, so a
+    /// JSONL of findings exists even when reports land in sqlite/http/github.
+    /// When `report.sink = "jsonl"` this is the sink's own file.
+    pub const FINDINGS_JSONL: &str = "findings.jsonl";
     /// Ledger of task ids the Hunt stage has already processed, so hunting is
     /// incremental and re-queued (gapfill) tasks get a fresh pass.
     pub const HUNTED: &str = "hunted.jsonl";
@@ -52,6 +57,7 @@ pub mod names {
         GAPS,
         VALIDATED,
         REPORT_JSON,
+        FINDINGS_JSONL,
         HUNTED,
         RECON_SESSION,
     ];

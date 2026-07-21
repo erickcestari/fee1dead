@@ -155,6 +155,14 @@ async fn full_skeleton_pipeline_with_mock() {
         .query_row("SELECT severity FROM findings", [], |r| r.get(0))
         .unwrap();
     assert_eq!(sev, "high");
+
+    // A findings JSONL is always written alongside the configured sink, even
+    // though this run reports into sqlite.
+    let jsonl = std::fs::read_to_string(out.join("findings.jsonl")).unwrap();
+    let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected one finding in the JSONL tee");
+    let payload: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(payload["severity"], "high");
 }
 
 /// The feedback loop: run 1 writes seeds; run 2's recon merges them, so the
