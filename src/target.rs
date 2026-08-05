@@ -7,8 +7,10 @@
 //! If `[reference].repo` is configured, that spec / known-good implementation is
 //! cloned into `[reference].dir` and exposed to the agents as ground truth.
 //!
+//! Submodules, when present, are initialized recursively after checkout.
+//!
 //! Clones run after the egress firewall is up, so each git host must be in
-//! `[firewall].allow`.
+//! `[firewall].allow` — including the hosts of any submodule URL.
 
 use std::path::Path;
 use std::process::Command;
@@ -78,6 +80,20 @@ fn clone_or_update(repo: &str, dir: &Path, git_ref: Option<&str>, label: &str) -
     if let Some(git_ref) = git_ref {
         info!(git_ref, "checking out {label} ref");
         git(&["-C", dir_str, "checkout", "--force", git_ref])?;
+    }
+
+    // Submodules carry code the agents must be able to read; sync after the
+    // checkout so they match the ref actually in use.
+    if dir.join(".gitmodules").is_file() {
+        info!("initializing {label} submodules");
+        git(&[
+            "-C",
+            dir_str,
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ])?;
     }
 
     // Record exactly what we used.
