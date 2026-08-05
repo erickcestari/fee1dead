@@ -10,17 +10,18 @@
 //! (typically `--dangerously-skip-permissions`, since the container is the
 //! security boundary, not the tool allow-list — which also lets it `Write`).
 
-use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::warn;
 
-use super::{AgentRequest, AgentResult, AgentRunner, final_output_path};
+use super::{
+    AgentRequest, AgentResult, AgentRunner, is_usage_limit_message, open_log, read_final_output,
+    with_final_output_instruction,
+};
 
 /// Environment applied to every `claude` invocation, regardless of stage. These
 /// stabilize the cacheable system-prompt prefix and keep runs reproducible:
@@ -83,24 +84,6 @@ impl ClaudeCodeRunner {
             extra_args,
         }
     }
-}
-
-/// Append the "write your final answer to a file" instruction to the user
-/// prompt.
-///
-/// It goes in the per-agent user prompt — never the shared system prefix — on
-/// purpose: the path is per-agent (the working dir), so injecting it into the
-/// cached system prompt would bust the cross-fork cache the whole design relies
-/// on. A new user turn is uncached regardless, so this costs nothing extra.
-fn with_final_output_instruction(prompt: &str, working_dir: &Path) -> String {
-    let path = final_output_path(working_dir);
-    format!(
-        "{prompt}\n\n---\nWhen you are finished, use the Write tool to save your \
-         COMPLETE final answer — the exact content you would otherwise print, \
-         verbatim and in full — to this file:\n  {}\nThat file, not your chat \
-         output, is what gets consumed downstream, so it must stand on its own.",
-        path.display()
-    )
 }
 
 /// Build the `claude` argv (after the program name) and the directory to run
@@ -299,33 +282,12 @@ impl AgentRunner for ClaudeCodeRunner {
         }
 
         // The agent was told to write its complete final answer to a file; that
-        // is the result we consume. Fall back to the result event's text if it
-        // forgot (or lacked the Write tool), so a stray run still makes progress.
-        let final_path = final_output_path(&req.working_dir);
-        let stdout = match fs::read_to_string(&final_path).await {
-            Ok(s) if !s.trim().is_empty() => s,
-            _ => {
-                warn!(
-                    path = %final_path.display(),
-                    "agent did not write its final-output file; using the result event text"
-                );
-                result_event
-                    .get("result")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            }
-        };
-
-        // Mirror the consumed final answer next to its transcript in the out
-        // dir, so it's visible there without reaching into the agent's scratch
-        // dir. Best-effort: persisting it must never fail the run.
-        if let Some(log_path) = &req.stream_log_path {
-            let sidecar = output_sidecar(log_path);
-            if let Err(e) = fs::write(&sidecar, &stdout).await {
-                warn!(error = %e, path = %sidecar.display(), "failed to persist agent final output");
-            }
-        }
+        // is the result we consume, with the result event's text as the fallback.
+        let fallback = result_event
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let stdout = read_final_output(&req, fallback).await;
 
         // Cost, timing, and token usage (prompt-cache hits included) all live in
         // the result event, which has already been teed to the stream log; we
@@ -341,40 +303,6 @@ impl AgentRunner for ClaudeCodeRunner {
             session_id,
         })
     }
-}
-
-/// Heuristic: does an error `.result` message describe a usage/session/rate
-/// limit? Matched against the human strings claude emits, e.g. "You've hit your
-/// session limit · resets 2:50am". Kept deliberately broad-but-anchored on the
-/// word "limit" so a new phrasing still trips it without matching unrelated
-/// errors.
-fn is_usage_limit_message(msg: &str) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("limit")
-        && (m.contains("session")
-            || m.contains("usage")
-            || m.contains("rate")
-            || m.contains("hit your")
-            || m.contains("resets"))
-}
-
-/// Path of the final-answer sidecar that sits beside a stream log: the
-/// transcript `<base>.jsonl` is paired with the consumed answer
-/// `<base>.output.json` in the same dir.
-fn output_sidecar(stream_log_path: &Path) -> std::path::PathBuf {
-    stream_log_path.with_extension("output.json")
-}
-
-/// Create (truncating) the stream-log file, making parent dirs as needed.
-async fn open_log(path: &Path) -> Result<fs::File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating log dir {}", parent.display()))?;
-    }
-    fs::File::create(path)
-        .await
-        .with_context(|| format!("creating stream log {}", path.display()))
 }
 
 #[cfg(test)]
@@ -517,58 +445,5 @@ mod tests {
         assert!(!args.contains(&"--disallowedTools".to_string()));
         assert!(!args.contains(&"--max-turns".to_string()));
         assert!(!args.contains(&"--append-system-prompt".to_string()));
-    }
-
-    #[test]
-    fn final_output_instruction_keeps_prompt_and_points_at_working_dir() {
-        let out = with_final_output_instruction("do the thing", Path::new("/work/scratch/t1"));
-        // Original prompt is preserved verbatim at the front.
-        assert!(out.starts_with("do the thing"));
-        // And the agent is pointed at the file the harness will read back.
-        assert!(out.contains("/work/scratch/t1/agent-final-output.json"));
-        assert!(out.contains("Write tool"));
-    }
-
-    #[test]
-    fn detects_usage_limit_messages_only() {
-        // The real strings claude emits for a depleted account.
-        assert!(is_usage_limit_message(
-            "You've hit your session limit · resets 2:50am (UTC)"
-        ));
-        assert!(is_usage_limit_message("Usage limit reached"));
-        assert!(is_usage_limit_message("rate limit exceeded, please retry"));
-        // Ordinary failures must NOT be classified as a usage limit, or the
-        // stage would abort on a one-off error.
-        assert!(!is_usage_limit_message("hunter output was not valid json"));
-        assert!(!is_usage_limit_message("file not found"));
-        assert!(!is_usage_limit_message(""));
-    }
-
-    #[test]
-    fn usage_limit_error_is_recognized_through_anyhow() {
-        let err: anyhow::Error =
-            super::super::ProviderError::UsageLimited("hit your session limit".into()).into();
-        assert!(crate::provider::is_usage_limited(&err));
-        // A plain error is not a usage limit.
-        assert!(!crate::provider::is_usage_limited(&anyhow::anyhow!("boom")));
-    }
-
-    #[test]
-    fn output_sidecar_sits_beside_the_transcript() {
-        let log = Path::new("/work/out/logs/hunt-G-0093.jsonl");
-        assert_eq!(
-            output_sidecar(log),
-            Path::new("/work/out/logs/hunt-G-0093.output.json")
-        );
-    }
-
-    #[tokio::test]
-    async fn open_log_creates_missing_parent_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs").join("hunt-T-0001.jsonl");
-        let mut f = open_log(&path).await.unwrap();
-        f.write_all(b"{}\n").await.unwrap();
-        f.flush().await.unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
     }
 }

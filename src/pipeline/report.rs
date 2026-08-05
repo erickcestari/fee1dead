@@ -17,9 +17,9 @@ use tracing::{info, warn};
 
 use super::StageCtx;
 use crate::artifacts::{extract_json_block, names};
+use crate::config::SinkKind;
 use crate::domain::{Finding, Severity, Validation};
 use crate::provider::{AgentRequest, Effort};
-use crate::config::SinkKind;
 use crate::store::{JsonlSink, ReportRecord, ReportSink, build_sink};
 
 const PROMPT: &str = include_str!("../../prompts/report.md");
@@ -58,7 +58,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     // skip it in that case and let the primary sink be the jsonl.
     let mut jsonl_tee = match ctx.config.report.sink {
         SinkKind::Jsonl => None,
-        _ => Some(JsonlSink::open(&ctx.config.run.out_dir.join(names::FINDINGS_JSONL))?),
+        _ => Some(JsonlSink::open(
+            &ctx.config.run.out_dir.join(names::FINDINGS_JSONL),
+        )?),
     };
     if items.is_empty() {
         info!(written = 0, total = sink.count()?, "report complete");

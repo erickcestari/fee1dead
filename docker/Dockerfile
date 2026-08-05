@@ -44,6 +44,11 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/b
 ARG CLAUDE_CODE_VERSION=2.1.193
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
+# opencode CLI (the alternative provider: [providers.opencode] / type = "opencode").
+# Unused unless provider.default selects it; pinned like the CLI above.
+ARG OPENCODE_VERSION=1.18.11
+RUN npm install -g opencode-ai@${OPENCODE_VERSION}
+
 # rtk (https://github.com/rtk-ai/rtk): a CLI proxy that filters/compresses common
 # dev-command output (git, cargo, test runners, ...) to cut agent token usage.
 # The binary is installed system-wide here; `rtk init -g` wires it into the

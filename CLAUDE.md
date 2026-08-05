@@ -23,9 +23,13 @@ schema-validated findings. See `README.md` for the user-facing overview.
 ## Architecture (where things live)
 
 - `src/provider/` — `AgentRunner` trait + `AgentRequest`/`AgentResult`. The only
-  seam to any AI CLI. `claude_code.rs` is the sole built-in adapter; **add any
+  seam to any AI CLI. `claude_code.rs` and `opencode.rs` are the built-in
+  adapters (both stream events, tee them to the per-agent log, and read results
+  back through the shared final-output-file contract in `mod.rs`); **add any
   other CLI via a `type = "exec"` config block, not Rust code** (`generic_exec.rs`,
-  `{prompt}`/`{working_dir}` placeholders). `mock.rs` is feature-gated.
+  `{prompt}`/`{working_dir}` placeholders). `mock.rs` is feature-gated. Fields an
+  adapter's CLI has no equivalent for (max turns, tool allow/deny lists) are
+  ignored, never emulated.
 - `src/pipeline/` — `mod.rs` sequences stages; one file per stage. All seven
   are built. `feedback.rs` is a cross-run memory (no consumer repos): it writes
   durable seed tasks to `feedback-seeds.jsonl`, which recon merges into the next

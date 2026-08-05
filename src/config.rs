@@ -157,8 +157,8 @@ pub struct RunConfig {
     #[serde(default = "default_timeout_secs")]
     pub agent_timeout_secs: u64,
     /// Fork each hunter from the recon agent's session so it inherits recon's
-    /// codebase context instead of re-reading the architecture doc. Only the
-    /// claude-code provider supports this; others ignore it. Forks run in
+    /// codebase context instead of re-reading the architecture doc. The
+    /// claude-code and opencode providers support this; others ignore it. Forks run in
     /// recon's directory, so recon's history is a shared, cached prefix across
     /// hunters (cache-read rates) when they start within the cache window.
     ///
@@ -182,7 +182,8 @@ pub struct RunConfig {
     /// Cap on a hunter's agent turns. Cost scales with turns (each turn re-reads
     /// the whole cached context), and a long tail of runaway hunters dominates
     /// spend, so this bounds the worst case. Set very high to effectively
-    /// disable. Only the claude-code provider enforces it.
+    /// disable. Only the claude-code provider enforces it (opencode has no
+    /// turn cap).
     #[serde(default = "default_hunter_max_turns")]
     pub hunter_max_turns: u32,
     /// Cap on recon's agent turns. Recon's job is to orient (structure-first)
@@ -273,6 +274,26 @@ pub enum ProviderConfig {
         #[serde(default)]
         extra_args: Vec<String>,
     },
+    /// The opencode CLI (`opencode run`). `model` is opencode's
+    /// `provider/model` form (e.g. `anthropic/claude-opus-4-5`); `agent` picks a
+    /// configured opencode agent; `variant` is the provider-specific reasoning
+    /// effort (`high`, `max`, `minimal`, …). `auto` auto-approves permissions —
+    /// on by default, since the container is the security boundary and the agent
+    /// must be able to write its final-output file.
+    // The CLI is spelled "opencode", not kebab-cased "open-code".
+    #[serde(rename = "opencode")]
+    OpenCode {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        variant: Option<String>,
+        #[serde(default = "default_opencode_auto")]
+        auto: bool,
+        #[serde(default)]
+        extra_args: Vec<String>,
+    },
     /// Config-driven command template. `args` may contain the placeholders
     /// `{prompt}` and `{working_dir}`, substituted at run time.
     Exec {
@@ -281,6 +302,17 @@ pub enum ProviderConfig {
         #[serde(default)]
         output: ExecOutput,
     },
+}
+
+fn default_opencode_auto() -> bool {
+    true
+}
+
+/// Is this an opencode `provider/model` id? Both halves must be non-empty; the
+/// model half may itself contain slashes (e.g. `fireworks-ai/accounts/…`).
+fn is_provider_qualified_model(model: &str) -> bool {
+    matches!(model.split_once('/'), Some((provider, rest))
+        if !provider.is_empty() && !rest.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -317,7 +349,8 @@ pub struct ReportConfig {
     /// Model the github sink's semantic-dedup judge uses on borderline pairs
     /// (findings whose algorithmic similarity to an already-filed issue is
     /// inconclusive). A lightweight model keeps that extra cost small; defaults
-    /// to `claude-haiku-4-5`. Only the claude-code provider honors it.
+    /// to `claude-haiku-4-5`. Passed through to whichever provider is selected,
+    /// so with opencode it must be in `provider/model` form.
     #[serde(default)]
     pub dedupe_model: Option<String>,
 }
@@ -377,6 +410,22 @@ impl Config {
                 "provider.default = \"{}\" is not defined under [providers]",
                 self.provider.default
             );
+        }
+        // opencode resolves a model as `provider/model`. A bare id (e.g.
+        // "kimi-k3") is rejected deep inside opencode's server as an opaque
+        // "Unexpected server error", so catch it here instead.
+        for (name, provider) in &self.providers {
+            if let ProviderConfig::OpenCode {
+                model: Some(model), ..
+            } = provider
+                && !is_provider_qualified_model(model)
+            {
+                bail!(
+                    "providers.{name}.model = {model:?} is not an opencode model id; \
+                     use the \"provider/model\" form (e.g. \"anthropic/claude-opus-4-5\", \
+                     \"moonshotai/kimi-k3\"). Run `opencode models` to list them."
+                );
+            }
         }
         if self.firewall.allow.is_empty() {
             bail!("firewall.allow must list at least one host (default-deny egress)");
@@ -470,6 +519,10 @@ type = "claude-code"
 model = "claude-opus-4-8"
 extra_args = ["--dangerously-skip-permissions"]
 
+[providers.opencode]
+type = "opencode"
+model = "anthropic/claude-opus-4-5"
+
 [providers.codex]
 type = "exec"
 command = "codex"
@@ -501,6 +554,64 @@ enabled = ["recon", "hunt", "validate", "report"]
             cfg.providers["codex"],
             ProviderConfig::Exec { .. }
         ));
+    }
+
+    #[test]
+    fn opencode_provider_parses_with_auto_on_by_default() {
+        let cfg = Config::load(write_tmp(VALID).path()).unwrap();
+        let ProviderConfig::OpenCode {
+            model, auto, agent, ..
+        } = &cfg.providers["opencode"]
+        else {
+            panic!("expected an opencode provider");
+        };
+        assert_eq!(model.as_deref(), Some("anthropic/claude-opus-4-5"));
+        assert_eq!(agent.as_deref(), None);
+        // The container is the security boundary, and the agent must be able to
+        // write its final-output file, so permissions are auto-approved unless
+        // the operator opts out.
+        assert!(auto);
+    }
+
+    #[test]
+    fn rejects_opencode_model_without_a_provider_prefix() {
+        // A bare id is what opencode itself reports only as an opaque
+        // "Unexpected server error", so the config load must catch it.
+        let bad = VALID.replace("\"anthropic/claude-opus-4-5\"", "\"kimi-k3\"");
+        let err = Config::load(write_tmp(&bad).path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider/model"), "got: {err}");
+        // The check is on the definition, not on provider.default, so a
+        // misconfigured alternative provider fails before it is ever selected.
+        assert!(err.contains("providers.opencode.model"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_opencode_models_whose_id_contains_slashes() {
+        // e.g. fireworks-ai/accounts/fireworks/models/kimi-k3
+        let ok = VALID.replace(
+            "\"anthropic/claude-opus-4-5\"",
+            "\"fireworks-ai/accounts/fireworks/models/kimi-k3\"",
+        );
+        assert!(Config::load(write_tmp(&ok).path()).is_ok());
+    }
+
+    #[test]
+    fn opencode_auto_is_overridable() {
+        let cfg = Config::load(
+            write_tmp(&VALID.replace(
+                "[providers.opencode]\ntype = \"opencode\"",
+                "[providers.opencode]\ntype = \"opencode\"\nauto = false\nvariant = \"high\"",
+            ))
+            .path(),
+        )
+        .unwrap();
+        let ProviderConfig::OpenCode { auto, variant, .. } = &cfg.providers["opencode"] else {
+            panic!("expected an opencode provider");
+        };
+        assert!(!auto);
+        assert_eq!(variant.as_deref(), Some("high"));
     }
 
     #[test]
@@ -590,7 +701,9 @@ enabled = ["recon", "hunt", "validate", "report"]
             "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
             "sink = \"github\"",
         );
-        let err = Config::load(write_tmp(&bad).path()).unwrap_err().to_string();
+        let err = Config::load(write_tmp(&bad).path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("report.repo"), "got: {err}");
     }
 
@@ -600,7 +713,9 @@ enabled = ["recon", "hunt", "validate", "report"]
             "sink = \"sqlite\"\npath = \"/work/out/findings.db\"",
             "sink = \"github\"\nrepo = \"not-a-slug\"",
         );
-        let err = Config::load(write_tmp(&bad).path()).unwrap_err().to_string();
+        let err = Config::load(write_tmp(&bad).path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("owner/repo"), "got: {err}");
     }
 

@@ -130,15 +130,12 @@ fn aggregate(candidates: Vec<Finding>, gaps: Vec<GapMarker>, tasks: Vec<Task>) -
     // Most severe first; within a severity, the hunter's own confidence ranks.
     // Stable order otherwise, so equal-rank findings keep candidates.jsonl order.
     findings.sort_by(|a, b| {
-        b.finding
-            .severity
-            .cmp(&a.finding.severity)
-            .then(
-                b.finding
-                    .confidence
-                    .partial_cmp(&a.finding.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+        b.finding.severity.cmp(&a.finding.severity).then(
+            b.finding
+                .confidence
+                .partial_cmp(&a.finding.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
 
     Report {
@@ -194,7 +191,11 @@ mod tests {
             finding("high-strong", "T-1", Severity::High, 0.8),
         ];
         let report = aggregate(candidates, vec![], vec![task("T-1", "h")]);
-        let order: Vec<&str> = report.findings.iter().map(|f| f.finding.id.as_str()).collect();
+        let order: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.finding.id.as_str())
+            .collect();
         assert_eq!(order, ["high-strong", "high-weak", "low"]);
     }
 
@@ -210,10 +211,21 @@ mod tests {
         assert_eq!(report.summary.by_severity.high, 2);
         assert_eq!(report.summary.by_severity.critical, 1);
         // f1/f2 carry T-1's lead; f3's task is absent from the queue → no context.
-        let f1 = report.findings.iter().find(|f| f.finding.id == "f1").unwrap();
+        let f1 = report
+            .findings
+            .iter()
+            .find(|f| f.finding.id == "f1")
+            .unwrap();
         assert_eq!(f1.task.as_ref().unwrap().hypothesis, "len unchecked");
-        let f3 = report.findings.iter().find(|f| f.finding.id == "f3").unwrap();
-        assert!(f3.task.is_none(), "finding with no queued task has no context");
+        let f3 = report
+            .findings
+            .iter()
+            .find(|f| f.finding.id == "f3")
+            .unwrap();
+        assert!(
+            f3.task.is_none(),
+            "finding with no queued task has no context"
+        );
     }
 
     #[test]
@@ -224,6 +236,9 @@ mod tests {
             vec![],
         );
         let json = serde_json::to_string(&report).unwrap();
-        assert!(!json.contains("\"task\""), "absent context must not serialize: {json}");
+        assert!(
+            !json.contains("\"task\""),
+            "absent context must not serialize: {json}"
+        );
     }
 }

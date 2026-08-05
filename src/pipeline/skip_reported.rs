@@ -111,9 +111,12 @@ fn classify(sig: &str, existing_sigs: &[String]) -> Band {
         .iter()
         .map(|e| jaccard(&tokens, &tokenize(e)))
         .enumerate()
-        .fold((0usize, 0.0f64), |(bi, bs), (i, s)| {
-            if s > bs { (i, s) } else { (bi, bs) }
-        });
+        .fold(
+            (0usize, 0.0f64),
+            |(bi, bs), (i, s)| {
+                if s > bs { (i, s) } else { (bi, bs) }
+            },
+        );
     if best_score >= DUP_HIGH {
         Band::Duplicate
     } else if best_score < DUP_LOW {
@@ -196,10 +199,7 @@ fn tokenize(s: &str) -> std::collections::HashSet<String> {
 }
 
 /// Jaccard overlap of two token sets: |A ∩ B| / |A ∪ B|, in [0,1].
-fn jaccard(
-    a: &std::collections::HashSet<String>,
-    b: &std::collections::HashSet<String>,
-) -> f64 {
+fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 0.0;
     }
@@ -218,7 +218,11 @@ mod tests {
 
     #[test]
     fn identical_signatures_are_duplicates() {
-        let existing = vec![sig("Unbounded alloc", "src/net.rs:42", "resource exhaustion")];
+        let existing = vec![sig(
+            "Unbounded alloc",
+            "src/net.rs:42",
+            "resource exhaustion",
+        )];
         let s = sig("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
         assert_eq!(classify(&s, &existing), Band::Duplicate);
     }
@@ -235,7 +239,11 @@ mod tests {
         let existing = vec![
             sig("Totally unrelated thing", "x/y.rs:1", "misc"),
             // Shares the location and some words, but reframed: the ambiguous band.
-            sig("Missing bounds check before allocation", "src/net.rs:42", "dos"),
+            sig(
+                "Missing bounds check before allocation",
+                "src/net.rs:42",
+                "dos",
+            ),
         ];
         let s = sig(
             "Unbounded allocation from length field",

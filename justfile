@@ -38,6 +38,10 @@ check:
 
 # --- docker ------------------------------------------------------------------
 
+# Mounts for the opencode provider: credentials + sessions, and the model
+# catalogue / provider SDKs it downloads. Harmless (empty) with claude-code.
+opencode_mounts := '-v "$HOME/.local/share/opencode":/home/agent/.local/share/opencode -v "$HOME/.cache/opencode":/home/agent/.cache/opencode'
+
 # Build the harness image. Bakes in the host uid/gid so files written to the
 # mounted out/ are owned by you, not by an in-container user.
 image:
@@ -51,29 +55,31 @@ image:
 #        just run target=/path/to/repo
 run: image
     @test -d "{{target}}" || (echo "target repo not found: {{target}}  (set with 'just run target=/path')" && exit 1)
-    @mkdir -p "{{out}}"
+    @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
     docker run --rm \
       --cap-add=NET_ADMIN \
       {{auth}} \
       -v "$(realpath '{{target}}')":/work/target:ro \
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
+      {{opencode_mounts}} \
       {{image}}
 
 # Run against a repo the harness clones itself (needs [target].repo in config).
 run-clone: image
-    @mkdir -p "{{out}}"
+    @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
     docker run --rm \
       --cap-add=NET_ADMIN \
       {{auth}} \
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
+      {{opencode_mounts}} \
       {{image}}
 
 # Run with the egress firewall disabled (local debugging only).
 run-nofw: image
     @test -d "{{target}}" || (echo "target repo not found: {{target}}" && exit 1)
-    @mkdir -p "{{out}}"
+    @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
     docker run --rm \
       --cap-add=NET_ADMIN \
       {{auth}} \
@@ -81,6 +87,7 @@ run-nofw: image
       -v "$(realpath '{{target}}')":/work/target:ro \
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
+      {{opencode_mounts}} \
       {{image}}
 
 # Open an interactive shell in the image (firewall not started).
@@ -91,6 +98,7 @@ shell: image
       -v "$(realpath '{{target}}')":/work/target:ro \
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
+      {{opencode_mounts}} \
       --entrypoint /bin/bash \
       {{image}}
 

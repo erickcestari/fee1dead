@@ -14,7 +14,7 @@ per-task scratch space, and validates/persists results.
 | Stage      | Status   | What it does |
 |------------|----------|--------------|
 | Recon      | built    | Reads the repo top-down, emits a structured threat model (`recon.json`) and seeds the hunt queue from its `hunt_tasks`. |
-| Hunt       | built    | One hunter per task (attack class + scope + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (claude-code only; toggle `run.fork_hunters`) so they inherit its codebase context; cold hunters load `recon.json` instead. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
+| Hunt       | built    | One hunter per task (attack class + scope + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (toggle `run.fork_hunters`) so they inherit its codebase context; cold hunters load `recon.json` instead. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Emits candidate findings + gap markers. |
 | Validate   | built    | One independent reviewer re-reads the code and **tags every finding in a single batched call** (`fp-check` skill): `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive`. **Never drops** a finding — a real-but-unproven bug is surfaced, not discarded. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (source file + attack class); the highest-severity finding survives. |
@@ -31,7 +31,7 @@ durable artifact and survives, carrying learning between runs. **Reuse the same
 `out_dir` (mount) across runs to keep the feedback memory.**
 
 The full agent transcript of each run is teed live to `out_dir/logs/` (one
-`<stage>-<label>.jsonl` per agent, the Claude CLI's `stream-json` events), so a
+`<stage>-<label>.jsonl` per agent: the provider's raw event stream), so a
 run can be replayed or debugged after the fact — a transcript survives even if
 its agent times out. Its final `result` event also carries that agent's cost and
 token usage (`total_cost_usd`, `duration_ms`, `num_turns`, and a `usage` block
@@ -43,9 +43,9 @@ jq -s 'map(select(.type=="result") | .total_cost_usd) | add' out_dir/logs/*.json
 ```
 
 Each agent is also told to write its complete final answer to
-`agent-final-output.txt` in its working dir; the harness reads that file back as
+`agent-final-output.json` in its working dir; the harness reads that file back as
 the result (falling back to the stream's final event if the agent didn't write
-it) and mirrors it next to the transcript as `out_dir/logs/<stage>-<label>.output.txt`,
+it) and mirrors it next to the transcript as `out_dir/logs/<stage>-<label>.output.json`,
 so each agent's answer is visible in the out dir without reaching into its scratch
 dir. The `logs/` directory is cleared at the start of a recon-led run.
 
@@ -53,9 +53,10 @@ dir. The `logs/` directory is cleared at the start of a recon-led run.
 
 Single Rust binary, modularized:
 
-- `src/provider/` — `AgentRunner` trait + adapters. **Adding any CLI** is a
-  config block (`type = "exec"`) with no Rust code; `claude-code` is the only
-  built-in adapter. `MockRunner` (feature `mock-runner`) drives offline runs.
+- `src/provider/` — `AgentRunner` trait + adapters. `claude-code` and `opencode`
+  are built in (see [Choosing the AI CLI](#choosing-the-ai-cli)); **any other
+  CLI** is a config block (`type = "exec"`) with no Rust code. `MockRunner`
+  (feature `mock-runner`) drives offline runs.
 - `src/pipeline/` — orchestrator + one file per stage.
 - `src/store/` — `ReportSink` trait + SQLite/JSONL/HTTP/GitHub-issue sinks. The
   `github` sink files one issue per reportable finding into `report.repo`
@@ -79,6 +80,60 @@ fee1dead check          --config config/harness.toml   # validate config
 fee1dead firewall-hosts --config config/harness.toml   # print allow-list
 fee1dead run            --config config/harness.toml   # run the pipeline
 ```
+
+### Choosing the AI CLI
+
+Two adapters are built in. Switch by pointing `provider.default` at the block
+you want — everything else in the pipeline is unchanged.
+
+```toml
+[provider]
+default = "claude-code"   # or "opencode"
+
+[providers.claude-code]
+type       = "claude-code"
+model      = "claude-opus-4-8"
+extra_args = ["--dangerously-skip-permissions"]
+
+[providers.opencode]
+type    = "opencode"
+model   = "anthropic/claude-opus-4-5"  # opencode's provider/model form
+# agent   = "build"   # optional: a configured opencode agent (--agent)
+# variant = "high"    # optional: reasoning effort (--variant), provider-specific
+auto    = true        # auto-approve permissions (--auto); the container is the boundary
+extra_args = []
+```
+
+The `opencode` adapter runs `opencode run --format json` and consumes the same
+event stream / final-answer-file contract as the claude-code one, so transcripts
+still land in `out_dir/logs/`. It authenticates the way opencode itself does
+(e.g. `ANTHROPIC_API_KEY` in the environment, or the credentials in
+`~/.local/share/opencode/auth.json`, which the `just` recipes mount along with
+`~/.cache/opencode`).
+
+`model` must be opencode's `provider/model` form — a bare id like `kimi-k3` is
+rejected at config load, because opencode itself reports it only as an opaque
+"Unexpected server error". `opencode models` lists what your auth can reach.
+`[firewall].allow` needs, beyond your target's own hosts:
+
+- `models.dev` — the model catalogue; nothing resolves without it.
+- `registry.npmjs.org` — the provider SDK packages opencode installs on demand.
+- your model provider's API host (`api.anthropic.com`, `api.moonshot.ai`, …)
+  and `opencode.ai` if you use opencode zen.
+
+Differences worth knowing before switching:
+
+| Knob | claude-code | opencode |
+|------|-------------|----------|
+| `run.fork_hunters` | yes | yes (`--session … --fork`) |
+| `run.hunter_max_turns` / `recon_max_turns` | enforced | no equivalent; ignored |
+| Per-tool allow/deny lists | enforced | no equivalent; ignored |
+| Reasoning effort per stage | `CLAUDE_CODE_EFFORT_LEVEL` | fixed `variant` from config |
+| Trail of Bits skills | registered as personal skills | not registered; prompts name them but the agent must find them under `/opt/skills` |
+| `report.dedupe_model` | `claude-haiku-4-5` | set the `provider/model` form, e.g. `anthropic/claude-haiku-4-5` |
+
+Any other CLI is a `type = "exec"` block with no Rust code (`{prompt}` and
+`{working_dir}` are substituted per task).
 
 ## Run in Docker (default-deny egress)
 
@@ -146,11 +201,21 @@ forward both, using whichever is set):
 - `CLAUDE_CODE_OAUTH_TOKEN` — Claude Pro/Max OAuth; generate with
   `claude setup-token`. For a raw `docker run`, add `-e CLAUDE_CODE_OAUTH_TOKEN`.
 
+With the `opencode` provider, auth is opencode's own: pass the model provider's
+key (e.g. `-e ANTHROPIC_API_KEY`) or mount your credentials and its cache — the
+`just` recipes do the latter:
+
+```
+-v "$HOME/.local/share/opencode":/home/agent/.local/share/opencode \
+-v "$HOME/.cache/opencode":/home/agent/.cache/opencode
+```
+
 `--cap-add=NET_ADMIN` is required for the firewall. The container is **not**
 `--privileged`. Set `FEE1DEAD_SKIP_FIREWALL=1` (or `just run-nofw`) only for
 local debugging.
 
-The image bundles **Go** (`ARG GO_VERSION`) and **Python 3 + uv** alongside Node
+The image bundles both CLIs (`ARG CLAUDE_CODE_VERSION`, `ARG OPENCODE_VERSION`),
+**Go** (`ARG GO_VERSION`) and **Python 3 + uv** alongside Node
 so hunters can compile PoCs and run Python tooling (several Trail of Bits skills
 use `uv run`). `go build` and Python package installs fetch at run time, so the
 relevant hosts (`proxy.golang.org`, `sum.golang.org`, `storage.googleapis.com`,

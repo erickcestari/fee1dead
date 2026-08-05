@@ -67,11 +67,7 @@ impl GithubSink {
             .call()
             .with_context(|| format!("searching {} for existing issue {id}", self.repo))?;
         let body: Value = resp.into_json().context("parsing github search response")?;
-        Ok(body
-            .get("total_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            > 0)
+        Ok(body.get("total_count").and_then(Value::as_u64).unwrap_or(0) > 0)
     }
 }
 
@@ -99,10 +95,16 @@ impl ReportSink for GithubSink {
                 let detail = resp
                     .into_string()
                     .unwrap_or_else(|_| "<unreadable body>".into());
-                bail!("github returned {code} filing issue for finding {}: {detail}", record.id)
+                bail!(
+                    "github returned {code} filing issue for finding {}: {detail}",
+                    record.id
+                )
             }
             Err(e) => Err(e).with_context(|| {
-                format!("filing github issue for finding {} in {}", record.id, self.repo)
+                format!(
+                    "filing github issue for finding {} in {}",
+                    record.id, self.repo
+                )
             }),
         }
     }
