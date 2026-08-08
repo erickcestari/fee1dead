@@ -9,16 +9,6 @@ out_dir      = "/work/out"
 concurrency  =10
 # Per-agent wall-clock timeout.
 agent_timeout_secs = 1800
-# Cap on a hunter's agent turns. Cost scales with turns (each re-reads the whole
-# cached context), and a few runaway hunters dominate spend; this bounds the
-# worst case. Set very high to effectively disable. Only claude-code enforces it.
-hunter_max_turns = 60
-# Cap on recon's agent turns. Recon orients (structure-first) and emits the
-# threat model; it should not read the whole repo. Every turn re-reads recon's
-# growing context, which is then replayed into every forked hunter, so an
-# unbounded recon dominates a run's cost. Keeping recon compact also holds its
-# context under the long-context pricing tier. Only claude-code enforces it.
-recon_max_turns = 30
 # Delay between launching consecutive hunters, in milliseconds. Each forked
 # hunter replays recon's (large) session as its first request; releasing the
 # whole concurrency batch at once fires that burst simultaneously and the API
@@ -27,11 +17,11 @@ recon_max_turns = 30
 hunter_stagger_ms = 750
 # Fork each hunter from the recon agent's session so it inherits recon's
 # codebase context instead of re-injecting the architecture doc into every
-# hunter prompt. Only the claude-code provider supports this. Forks share
+# hunter prompt. Supported by the claude-code and opencode providers. Forks share
 # recon's history as a cached prefix (cache-read rates) when hunters start
 # within the cache window. Set false to opt out.
 #
-# Now that recon orients shallow (recon_max_turns), the shared prefix is mostly
+# Now that recon orients shallow, the shared prefix is mostly
 # the threat model + orient output rather than deep file reads, so forking's edge
 # over cold hunters (which read only their per-task targets) is an empirical call.
 # A/B both on your target: each agent's stream log records its cost/usage, so
@@ -66,8 +56,9 @@ use_skills = true
 # dir  = "/work/reference" # where to clone it (a path the agents can read)
 
 [provider]
-# Which [providers.*] block to use. Only "claude-code" is implemented as a
-# built-in adapter today; others are added via type = "exec" (zero code).
+# Which [providers.*] block below to use. Switch CLI by changing this one line:
+# "claude-code" or "opencode" (both built-in adapters). Any other CLI is added
+# via type = "exec" (zero code).
 default = "claude-code"
 
 [providers.claude-code]
@@ -75,6 +66,29 @@ type       = "claude-code"
 model      = "claude-opus-4-8"
 # The container is the security boundary, so the agent runs unrestricted.
 extra_args = ["--dangerously-skip-permissions"]
+
+# The opencode CLI (https://opencode.ai). Set provider.default = "opencode" to
+# use it. Auth like opencode itself does (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY
+# in the environment, or a mounted ~/.local/share/opencode/auth.json), and add
+# models.dev plus your model provider's API host to [firewall].allow below.
+[providers.opencode]
+type    = "opencode"
+# opencode's provider/model form — a bare model id is rejected at config load.
+# `opencode models` lists what your auth can reach.
+model   = "anthropic/claude-opus-4-5"
+# Optional: a configured opencode agent (`--agent`) to run as.
+# agent = "build"
+# Optional: provider-specific reasoning effort (`--variant`), e.g. high | max |
+# minimal. Left unset, opencode uses the model's default.
+# variant = "high"
+# Auto-approve tool permissions (`--auto`). On by default: the container is the
+# security boundary, and the agent must be able to write its answer file.
+auto    = true
+# Any extra flags to pass through verbatim.
+extra_args = []
+# Ignored by this adapter (opencode has no equivalent): per-tool allow/deny
+# lists. run.fork_hunters IS
+# supported (opencode sessions fork).
 
 # Example: add any other CLI with no Rust changes. {prompt} and {working_dir}
 # are substituted per task.
@@ -90,6 +104,12 @@ extra_args = ["--dangerously-skip-permissions"]
 allow = [
   "api.anthropic.com",
   "registry.npmjs.org",
+  # Required by the opencode provider: the models.dev catalogue (opencode fails
+  # to resolve any model without it), its own endpoints, and the npm registry it
+  # pulls provider SDK packages from. Also add your model provider's API host
+  # (api.anthropic.com above, api.moonshot.ai for moonshotai/*, ...).
+  # "models.dev",
+  # "opencode.ai",
   "static.crates.io",
   "index.crates.io",
   # Add your git host here when using [target].repo, e.g.:

@@ -90,7 +90,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             allowed_tools: Vec::new(),
             disallowed_tools: super::disabled_tools(),
             timeout,
-            max_turns: None,
             resume: None,
             // Leaf agent: nothing forks from it, so the default 5m cache suffices.
             cache_1h: false,

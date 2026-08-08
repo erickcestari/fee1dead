@@ -156,10 +156,6 @@ fn build_invocation(
         args.push("--disallowedTools".to_string());
         args.push(req.disallowed_tools.join(","));
     }
-    if let Some(max_turns) = req.max_turns {
-        args.push("--max-turns".to_string());
-        args.push(max_turns.to_string());
-    }
     args.extend(extra_args.iter().cloned());
 
     (args, cwd)
@@ -321,7 +317,6 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             timeout: Duration::from_secs(1),
-            max_turns: None,
             resume: None,
             cache_1h: false,
             effort: Effort::Xhigh,
@@ -428,13 +423,11 @@ mod tests {
         r.system = Some("be terse".into());
         r.allowed_tools = vec!["Read".into(), "Grep".into()];
         r.disallowed_tools = vec!["Task".into()];
-        r.max_turns = Some(7);
         let extra = vec!["--dangerously-skip-permissions".to_string()];
         let (args, _) = build_invocation(&r, None, &extra);
         assert_eq!(arg_after(&args, "--append-system-prompt"), Some("be terse"));
         assert_eq!(arg_after(&args, "--allowedTools"), Some("Read,Grep"));
         assert_eq!(arg_after(&args, "--disallowedTools"), Some("Task"));
-        assert_eq!(arg_after(&args, "--max-turns"), Some("7"));
         assert_eq!(args.last().unwrap(), "--dangerously-skip-permissions");
     }
 
@@ -443,7 +436,6 @@ mod tests {
         let (args, _) = build_invocation(&req(), None, &[]);
         assert!(!args.contains(&"--allowedTools".to_string()));
         assert!(!args.contains(&"--disallowedTools".to_string()));
-        assert!(!args.contains(&"--max-turns".to_string()));
         assert!(!args.contains(&"--append-system-prompt".to_string()));
     }
 }

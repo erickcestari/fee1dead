@@ -149,7 +149,6 @@ async fn judge_is_duplicate(
         allowed_tools: Vec::new(),
         disallowed_tools: super::disabled_tools(),
         timeout: std::time::Duration::from_secs(ctx.config.run.agent_timeout_secs),
-        max_turns: None,
         resume: None,
         cache_1h: false,
         // A one-shot yes/no over two short texts: cheap model, shallow thinking.

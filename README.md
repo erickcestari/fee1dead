@@ -126,7 +126,6 @@ Differences worth knowing before switching:
 | Knob | claude-code | opencode |
 |------|-------------|----------|
 | `run.fork_hunters` | yes | yes (`--session … --fork`) |
-| `run.hunter_max_turns` / `recon_max_turns` | enforced | no equivalent; ignored |
 | Per-tool allow/deny lists | enforced | no equivalent; ignored |
 | Reasoning effort per stage | `CLAUDE_CODE_EFFORT_LEVEL` | fixed `variant` from config |
 | Trail of Bits skills | registered as personal skills | not registered; prompts name them but the agent must find them under `/opt/skills` |

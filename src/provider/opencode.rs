@@ -12,7 +12,7 @@
 //! `--session <id> --fork` in the session's project dir.
 //!
 //! Knobs opencode does not expose are ignored, not emulated: there is no
-//! per-tool allow/deny list, no max-turns cap, and no system-prompt flag (a
+//! per-tool allow/deny list and no system-prompt flag (a
 //! request's `system` prompt is prepended to the user prompt instead). Reasoning
 //! effort maps to `--variant`, which is provider-specific, so it is opt-in via
 //! the `variant` config field rather than derived from [`super::Effort`].
@@ -348,7 +348,6 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             timeout: Duration::from_secs(1),
-            max_turns: None,
             resume: None,
             cache_1h: false,
             effort: Effort::Xhigh,

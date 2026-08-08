@@ -146,7 +146,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let sem = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let target = ctx.config.run.target_dir.clone();
     let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
-    let max_turns = ctx.config.run.hunter_max_turns;
     // Reference repo (spec / known-good impl), if configured: appended to each
     // hunter's prompt and added to its readable dirs.
     let reference_note = ctx.config.reference.prompt_note();
@@ -219,7 +218,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 // already runs hunters in parallel) plus the tools no stage uses.
                 disallowed_tools: super::disabled_tools(),
                 timeout,
-                max_turns: Some(max_turns),
                 resume,
                 // A leaf agent: nothing forks from a hunter, and its own context
                 // is re-read only by its own sub-5m-apart turns, so 1h caching

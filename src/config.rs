@@ -162,8 +162,8 @@ pub struct RunConfig {
     /// recon's directory, so recon's history is a shared, cached prefix across
     /// hunters (cache-read rates) when they start within the cache window.
     ///
-    /// The amortized win shrinks now that recon orients shallow (`recon_max_turns`,
-    /// structure-first prompt): the shared prefix is mostly the threat model plus
+    /// The amortized win shrinks now that recon orients shallow (structure-first
+    /// prompt): the shared prefix is mostly the threat model plus
     /// orient output, not deep file reads a hunter would otherwise repeat. Forking
     /// still spares every hunter from re-orienting, but with good per-task `targets`
     /// a cold hunter reads only what it needs — so which regime is cheaper per
@@ -179,21 +179,6 @@ pub struct RunConfig {
     /// produce runnable PoCs at higher cost.
     #[serde(default = "default_require_poc")]
     pub require_poc: bool,
-    /// Cap on a hunter's agent turns. Cost scales with turns (each turn re-reads
-    /// the whole cached context), and a long tail of runaway hunters dominates
-    /// spend, so this bounds the worst case. Set very high to effectively
-    /// disable. Only the claude-code provider enforces it (opencode has no
-    /// turn cap).
-    #[serde(default = "default_hunter_max_turns")]
-    pub hunter_max_turns: u32,
-    /// Cap on recon's agent turns. Recon's job is to orient (structure-first)
-    /// and emit the threat model, not to read the whole repo: every turn re-reads
-    /// recon's growing context, and a bloated recon session is then replayed into
-    /// every forked hunter, so an unbounded recon dominates a run's cost. Keeping
-    /// recon compact also keeps its context under the long-context pricing tier.
-    /// Only the claude-code provider enforces it.
-    #[serde(default = "default_recon_max_turns")]
-    pub recon_max_turns: u32,
     /// Delay between launching consecutive hunters, in milliseconds. Forked
     /// hunters each replay recon's (often large) session as their first request;
     /// releasing the whole concurrency batch at once fires that burst
@@ -228,14 +213,6 @@ impl RunConfig {
 
 fn default_concurrency() -> usize {
     50
-}
-
-fn default_hunter_max_turns() -> u32 {
-    60
-}
-
-fn default_recon_max_turns() -> u32 {
-    60
 }
 
 fn default_hunter_stagger_ms() -> u64 {
@@ -398,12 +375,6 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.run.concurrency == 0 {
             bail!("run.concurrency must be >= 1");
-        }
-        if self.run.hunter_max_turns == 0 {
-            bail!("run.hunter_max_turns must be >= 1");
-        }
-        if self.run.recon_max_turns == 0 {
-            bail!("run.recon_max_turns must be >= 1");
         }
         if !self.providers.contains_key(&self.provider.default) {
             bail!(
@@ -777,8 +748,6 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert_eq!(cfg.run.agent_timeout_secs, 1800);
         assert!(cfg.run.fork_hunters);
         assert!(!cfg.run.require_poc);
-        assert_eq!(cfg.run.hunter_max_turns, 60);
-        assert_eq!(cfg.run.recon_max_turns, 60);
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
     }

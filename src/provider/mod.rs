@@ -191,8 +191,6 @@ pub struct AgentRequest {
     pub disallowed_tools: Vec<String>,
     /// Wall-clock timeout.
     pub timeout: Duration,
-    /// Max agent turns, when supported.
-    pub max_turns: Option<u32>,
     /// When set, fork a prior agent session so this run inherits its
     /// conversation context. Providers without a session concept ignore it.
     pub resume: Option<ResumeSession>,
@@ -367,7 +365,6 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             timeout: Duration::from_secs(1),
-            max_turns: None,
             resume: None,
             cache_1h: false,
             effort: Effort::Low,
@@ -394,7 +391,6 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             timeout: Duration::from_secs(1),
-            max_turns: None,
             resume: None,
             cache_1h: false,
             effort: Effort::Low,

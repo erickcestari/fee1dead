@@ -101,11 +101,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // along with the tools no stage uses.
         disallowed_tools: super::disabled_tools(),
         timeout: Duration::from_secs(ctx.config.run.agent_timeout_secs),
-        // Bound recon's turns: each turn re-reads its growing context, and that
-        // context is replayed into every forked hunter, so an unbounded recon is
-        // a run's worst-case cost. The prompt's orient discipline keeps the work
-        // inside this budget.
-        max_turns: Some(ctx.config.run.recon_max_turns),
         resume: None,
         // Recon is the one session every later stage forks. Its prefix must
         // survive past the default 5m TTL until the last forked agent launches,
