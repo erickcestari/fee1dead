@@ -58,7 +58,11 @@ RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/in
       | env RTK_INSTALL_DIR=/usr/local/bin RTK_VERSION=${RTK_VERSION} sh
 
 # Go toolchain, so hunters can compile and run PoCs against Go targets (e.g. lnd).
-ARG GO_VERSION=1.23.4
+# Keep this AHEAD of the `go` directive of every target you hunt: when the target
+# needs a newer toolchain than this one, `go` would otherwise try to fetch it
+# from the module proxy on first use — a ~70MB download that every hunter pays
+# for, through the egress firewall, mid-run.
+ARG GO_VERSION=1.26.5
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) GOARCH=amd64 ;; \
@@ -67,9 +71,16 @@ RUN ARCH=$(dpkg --print-architecture) && \
     esac && \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" -o /tmp/go.tgz && \
     tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+# GOTOOLCHAIN=local pins `go` to the toolchain above instead of silently
+# downloading the one named in the target's go.mod. A target that needs newer
+# then fails loudly, once, in `[target].prepare` — rather than leaving every
+# hunter to rediscover it as an unexplained network error. Raise GO_VERSION when
+# that happens.
 ENV PATH="/usr/local/go/bin:/home/agent/go/bin:${PATH}" \
     GOPATH="/home/agent/go" \
+    GOMODCACHE="/home/agent/go/pkg/mod" \
     GOCACHE="/home/agent/.cache/go-build" \
+    GOTOOLCHAIN="local" \
     GOFLAGS="-mod=mod"
 
 # Non-root user the agent runs as. Built with the host's uid/gid (passed by the
@@ -79,7 +90,7 @@ ARG HOST_UID=1000
 ARG HOST_GID=1000
 RUN groupadd -o -g ${HOST_GID} agent && \
     useradd -o -u ${HOST_UID} -g ${HOST_GID} --create-home --shell /bin/bash agent && \
-    mkdir -p /home/agent/go /home/agent/.cache/go-build && \
+    mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build && \
     chown -R agent:agent /home/agent
 
 # The Trail of Bits skills (vendored in the repo as a plugin marketplace:
