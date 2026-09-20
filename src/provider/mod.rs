@@ -26,9 +26,10 @@ use crate::config::ProviderConfig;
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     /// The backend rejected the request because an account usage / session /
-    /// rate limit was reached. Retrying immediately just bounces off the same
-    /// limit, so a stage that sees this should stop spawning new agents rather
-    /// than burn the rest of its queue on certain failures.
+    /// rate limit was reached, or the operator's own usage cap was. Retrying
+    /// immediately just bounces off the same limit, so a stage that sees this
+    /// should stop spawning new agents rather than burn the rest of its queue
+    /// on certain failures.
     #[error("usage limit reached: {0}")]
     UsageLimited(String),
 }
@@ -258,10 +259,15 @@ pub trait AgentRunner: Send + Sync {
 /// adapter types are wired in here.
 pub fn build_runner(name: &str, cfg: &ProviderConfig) -> Box<dyn AgentRunner> {
     match cfg {
-        ProviderConfig::ClaudeCode { model, extra_args } => Box::new(ClaudeCodeRunner::new(
+        ProviderConfig::ClaudeCode {
+            model,
+            extra_args,
+            max_weekly_usage_pct,
+        } => Box::new(ClaudeCodeRunner::new(
             name.to_string(),
             model.clone(),
             extra_args.clone(),
+            *max_weekly_usage_pct,
         )),
         ProviderConfig::OpenCode {
             model,

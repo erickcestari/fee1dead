@@ -448,7 +448,7 @@ mod tests {
             t
         };
         use crate::domain::Priority::{High, Low, Medium};
-        let mut tasks = vec![
+        let mut tasks = [
             mk("recon-low", TaskOrigin::Recon, Low),
             mk("recon-high", TaskOrigin::Recon, High),
             mk("gapfill", TaskOrigin::Gapfill, Medium),

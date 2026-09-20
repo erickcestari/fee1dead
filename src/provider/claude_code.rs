@@ -74,16 +74,39 @@ pub struct ClaudeCodeRunner {
     name: String,
     model: Option<String>,
     extra_args: Vec<String>,
+    max_weekly_usage_pct: Option<u8>,
 }
 
 impl ClaudeCodeRunner {
-    pub fn new(name: String, model: Option<String>, extra_args: Vec<String>) -> Self {
+    pub fn new(
+        name: String,
+        model: Option<String>,
+        extra_args: Vec<String>,
+        max_weekly_usage_pct: Option<u8>,
+    ) -> Self {
         Self {
             name,
             model,
             extra_args,
+            max_weekly_usage_pct,
         }
     }
+}
+
+/// The account's weekly (seven-day) utilization as a 0..=1 fraction, if `event`
+/// is a `rate_limit_event` carrying one. API-key auth emits no such event.
+fn weekly_utilization(event: &serde_json::Value) -> Option<f64> {
+    if event.get("type")?.as_str()? != "rate_limit_event" {
+        return None;
+    }
+    event
+        .pointer("/rate_limit_info/unifiedWindows/seven_day/utilization")?
+        .as_f64()
+}
+
+/// Whether a weekly utilization fraction has reached the configured cap.
+fn reached_cap(utilization: f64, cap_pct: u8) -> bool {
+    utilization >= f64::from(cap_pct) / 100.0
 }
 
 /// Build the `claude` argv (after the program name) and the directory to run
@@ -214,6 +237,11 @@ impl AgentRunner for ClaudeCodeRunner {
         // final `result` event (the only one carrying cost/usage/session id).
         let mut lines = BufReader::new(stdout).lines();
         let mut result_event: Option<serde_json::Value> = None;
+        // The weekly cap gates agent *starts*: only an agent's first reading is
+        // checked, so one that crosses the cap mid-run still finishes instead of
+        // throwing away the tokens it already spent.
+        let mut weekly_cap = self.max_weekly_usage_pct;
+        let mut over_cap: Option<f64> = None;
         let pump = async {
             while let Some(line) = lines.next_line().await? {
                 if let Some(f) = log.as_mut() {
@@ -223,10 +251,19 @@ impl AgentRunner for ClaudeCodeRunner {
                     f.write_all(b"\n").await?;
                     f.flush().await?;
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-                    && v.get("type").and_then(|t| t.as_str()) == Some("result")
-                {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                     result_event = Some(v);
+                } else if let Some(cap) = weekly_cap
+                    && let Some(used) = weekly_utilization(&v)
+                {
+                    weekly_cap = None;
+                    if reached_cap(used, cap) {
+                        over_cap = Some(used);
+                        break;
+                    }
                 }
             }
             anyhow::Ok(())
@@ -245,6 +282,16 @@ impl AgentRunner for ClaudeCodeRunner {
                     .with_context(|| format!("reading claude stream for '{}'", self.name));
             }
             Ok(Ok(())) => {}
+        }
+
+        if let Some(used) = over_cap {
+            let _ = child.start_kill();
+            return Err(super::ProviderError::UsageLimited(format!(
+                "weekly usage at {:.0}%, max_weekly_usage_pct is {}%",
+                used * 100.0,
+                self.max_weekly_usage_pct.unwrap_or_default()
+            ))
+            .into());
         }
 
         let status = child
@@ -429,6 +476,30 @@ mod tests {
         assert_eq!(arg_after(&args, "--allowedTools"), Some("Read,Grep"));
         assert_eq!(arg_after(&args, "--disallowedTools"), Some("Task"));
         assert_eq!(args.last().unwrap(), "--dangerously-skip-permissions");
+    }
+
+    #[test]
+    fn weekly_utilization_is_read_from_rate_limit_events_only() {
+        // A real event from `claude -p --output-format stream-json`.
+        let event: serde_json::Value = serde_json::from_str(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1789880400,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.01,"resetsAt":1789880400},"seven_day":{"utilization":0.13,"resetsAt":1790028000}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(weekly_utilization(&event), Some(0.13));
+        // No seven-day window, or another event type: no reading.
+        let no_week =
+            serde_json::json!({"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}});
+        assert_eq!(weekly_utilization(&no_week), None);
+        let other = serde_json::json!({"type":"result","rate_limit_info":{"unifiedWindows":{"seven_day":{"utilization":0.9}}}});
+        assert_eq!(weekly_utilization(&other), None);
+    }
+
+    #[test]
+    fn cap_trips_at_the_threshold_not_below() {
+        assert!(!reached_cap(0.79, 80));
+        assert!(reached_cap(0.8, 80));
+        assert!(reached_cap(0.93, 80));
+        assert!(reached_cap(1.0, 100));
     }
 
     #[test]

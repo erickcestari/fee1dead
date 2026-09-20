@@ -94,6 +94,7 @@ default = "claude-code"   # or "opencode"
 type       = "claude-code"
 model      = "claude-opus-4-8"
 extra_args = ["--dangerously-skip-permissions"]
+# max_weekly_usage_pct = 80  # optional: stop starting agents at 80% weekly usage
 
 [providers.opencode]
 type    = "opencode"
@@ -129,6 +130,7 @@ Differences worth knowing before switching:
 | Per-tool allow/deny lists | enforced | no equivalent; ignored |
 | Reasoning effort per stage | `CLAUDE_CODE_EFFORT_LEVEL` | fixed `variant` from config |
 | Trail of Bits skills | registered as personal skills | not registered; prompts name them but the agent must find them under `/opt/skills` |
+| `max_weekly_usage_pct` | yes (subscription auth) | no equivalent |
 | `report.dedupe_model` | `claude-haiku-4-5` | set the `provider/model` form, e.g. `anthropic/claude-haiku-4-5` |
 
 Any other CLI is a `type = "exec"` block with no Rust code (`{prompt}` and

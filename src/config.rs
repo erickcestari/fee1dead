@@ -250,6 +250,11 @@ pub enum ProviderConfig {
         model: Option<String>,
         #[serde(default)]
         extra_args: Vec<String>,
+        /// Stop starting agents once the account's weekly (seven-day) usage
+        /// reaches this percentage, so a run cannot eat the whole weekly limit.
+        /// Read from the CLI's `rate_limit_event`; unset means no cap.
+        #[serde(default)]
+        max_weekly_usage_pct: Option<u8>,
     },
     /// The opencode CLI (`opencode run`). `model` is opencode's
     /// `provider/model` form (e.g. `anthropic/claude-opus-4-5`); `agent` picks a
@@ -386,6 +391,14 @@ impl Config {
         // "kimi-k3") is rejected deep inside opencode's server as an opaque
         // "Unexpected server error", so catch it here instead.
         for (name, provider) in &self.providers {
+            if let ProviderConfig::ClaudeCode {
+                max_weekly_usage_pct: Some(pct),
+                ..
+            } = provider
+                && !(1..=100).contains(pct)
+            {
+                bail!("providers.{name}.max_weekly_usage_pct = {pct} must be between 1 and 100");
+            }
             if let ProviderConfig::OpenCode {
                 model: Some(model), ..
             } = provider
@@ -566,6 +579,30 @@ enabled = ["recon", "hunt", "validate", "report"]
             "\"fireworks-ai/accounts/fireworks/models/kimi-k3\"",
         );
         assert!(Config::load(write_tmp(&ok).path()).is_ok());
+    }
+
+    #[test]
+    fn max_weekly_usage_pct_is_optional_and_range_checked() {
+        let cfg = Config::load(write_tmp(VALID).path()).unwrap();
+        let ProviderConfig::ClaudeCode {
+            max_weekly_usage_pct,
+            ..
+        } = &cfg.providers["claude-code"]
+        else {
+            panic!("expected a claude-code provider");
+        };
+        assert_eq!(*max_weekly_usage_pct, None);
+
+        let with_cap = |pct: u32| {
+            VALID.replace(
+                "type = \"claude-code\"",
+                &format!("type = \"claude-code\"\nmax_weekly_usage_pct = {pct}"),
+            )
+        };
+        assert!(Config::load(write_tmp(&with_cap(80)).path()).is_ok());
+        assert!(Config::load(write_tmp(&with_cap(100)).path()).is_ok());
+        assert!(Config::load(write_tmp(&with_cap(0)).path()).is_err());
+        assert!(Config::load(write_tmp(&with_cap(101)).path()).is_err());
     }
 
     #[test]
