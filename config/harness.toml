@@ -44,6 +44,14 @@ use_skills = true
 # [target]
 # repo = "https://github.com/org/name.git"
 # ref  = "main"        # branch, tag, or commit SHA; defaults to the default branch
+# Shell commands run once in target_dir after checkout, before any stage. Use
+# them to warm the toolchain's package cache while the run still has the network:
+# agents cannot read dependency source or build a PoC out of an empty cache, and
+# paying for it here costs one download instead of one per agent. A failure warns
+# and the run continues. Any registry these reach must be in [firewall].allow.
+# prepare = ["go mod download"]        # Go     (also: "go build ./..." to warm GOCACHE)
+# prepare = ["cargo fetch"]            # Rust
+# prepare = ["npm ci --ignore-scripts"] # Node
 
 # Optional: clone a reference repository — a spec or known-good implementation —
 # and expose it to the recon, hunt, and validate agents as ground truth (it is
@@ -66,6 +74,11 @@ type       = "claude-code"
 model      = "claude-opus-4-8"
 # The container is the security boundary, so the agent runs unrestricted.
 extra_args = ["--dangerously-skip-permissions"]
+# Optional: stop starting agents once the account's weekly usage reaches this
+# percentage, so a run cannot eat the whole weekly limit. Agents already running
+# finish (their tokens are spent), so leave headroom. Subscription auth only:
+# API-key auth reports no weekly usage, so the cap never trips.
+# max_weekly_usage_pct = 80
 
 # The opencode CLI (https://opencode.ai). Set provider.default = "opencode" to
 # use it. Auth like opencode itself does (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY
