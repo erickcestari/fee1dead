@@ -92,5 +92,7 @@ and no prose around it. Shape:
 
 `poc_path` is optional. `confidence` is in [0,1]: how sure you are the bug is
 real and reachable (latent or guarded means low). Each gap becomes a follow-up
-hunter whose only brief is your `area`, `attack_class`, and `reason`, so emit
-one only for a concrete lead. Empty arrays are a valid result.
+hunter whose only brief is your `area`, `attack_class`, and `reason`. Emit up to
+5, one per area you traced far enough to name a specific bug class worth a
+dedicated pass, whether or not you could confirm it. Do not pad with areas you
+only glanced at or with pattern matches. Empty arrays are a valid result.
