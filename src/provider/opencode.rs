@@ -27,7 +27,7 @@ use tokio::process::Command;
 use tracing::warn;
 
 use super::{
-    AgentRequest, AgentResult, AgentRunner, ProviderError, is_usage_limit_message, open_log,
+    AgentRequest, AgentResult, AgentRunner, clear_final_output, limit_error, open_log,
     read_final_output, with_final_output_instruction,
 };
 
@@ -68,7 +68,7 @@ fn full_prompt(req: &AgentRequest) -> String {
         Some(system) => format!("{system}\n\n---\n\n{}", req.prompt),
         None => req.prompt.clone(),
     };
-    with_final_output_instruction(&body, &req.working_dir)
+    with_final_output_instruction(&body, &req.output_dir)
 }
 
 /// Build the `opencode` argv (after the program name) and the directory to run
@@ -229,6 +229,7 @@ impl AgentRunner for OpenCodeRunner {
             self.auto,
             &self.extra_args,
         );
+        clear_final_output(&req).await?;
 
         let mut cmd = Command::new("opencode");
         cmd.args(&args)
@@ -285,10 +286,10 @@ impl AgentRunner for OpenCodeRunner {
         match tokio::time::timeout(req.timeout, pump).await {
             Err(_) => {
                 let _ = child.start_kill();
-                bail!(
-                    "provider '{}' timed out (partial stream log kept)",
-                    self.name
-                );
+                return Err(crate::provider::ProviderError::TimedOut {
+                    session_id: outcome.session_id,
+                }
+                .into());
             }
             Ok(Err(e)) => {
                 return Err(e)
@@ -305,11 +306,11 @@ impl AgentRunner for OpenCodeRunner {
         let stderr_out = stderr_task.await.unwrap_or_default();
 
         // opencode reports model/provider failures as an `error` event and exits
-        // non-zero. Tag the account-limit ones so the orchestrator can stop
-        // spawning agents instead of burning the queue on certain failures.
+        // non-zero. Tag limits so the orchestrator can stop on a quota and back
+        // off on a throttle instead of burning the queue on certain failures.
         if let Some(msg) = &outcome.error {
-            if is_usage_limit_message(msg) {
-                return Err(ProviderError::UsageLimited(msg.clone()).into());
+            if let Some(limit) = limit_error(msg) {
+                return Err(limit.into());
             }
             bail!(
                 "opencode reported an error: {msg}{}",
@@ -344,6 +345,7 @@ mod tests {
             prompt: "find bugs".into(),
             system: None,
             working_dir: PathBuf::from("/work/scratch/t1"),
+            output_dir: PathBuf::from("/work/scratch/t1"),
             extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
@@ -367,7 +369,7 @@ mod tests {
     fn base_invocation_streams_json_and_runs_in_the_working_dir() {
         let (args, cwd) = build_invocation(
             &req(),
-            Some("anthropic/claude-opus-4-5"),
+            Some("anthropic/claude-opus-5"),
             None,
             None,
             true,
@@ -376,10 +378,7 @@ mod tests {
         assert_eq!(args[0], "run");
         assert_eq!(arg_after(&args, "--format"), Some("json"));
         assert_eq!(arg_after(&args, "--dir"), Some("/work/scratch/t1"));
-        assert_eq!(
-            arg_after(&args, "--model"),
-            Some("anthropic/claude-opus-4-5")
-        );
+        assert_eq!(arg_after(&args, "--model"), Some("anthropic/claude-opus-5"));
         assert!(args.contains(&"--auto".to_string()));
         assert_eq!(cwd, PathBuf::from("/work/scratch/t1"));
         // No resume: nothing to fork.
@@ -456,8 +455,11 @@ mod tests {
             r#"{"type":"error","sessionID":"ses_abc","error":{"name":"ProviderAuthError","data":{"message":"rate limit exceeded"}}}"#,
         );
         assert_eq!(outcome.error.as_deref(), Some("rate limit exceeded"));
-        // ...and that message is what the usage-limit classifier sees.
-        assert!(is_usage_limit_message(outcome.error.as_deref().unwrap()));
+        // ...and that message is what the limit classifier sees.
+        assert!(matches!(
+            limit_error(outcome.error.as_deref().unwrap()),
+            Some(crate::provider::ProviderError::RateLimited(_))
+        ));
     }
 
     #[test]

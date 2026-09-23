@@ -52,11 +52,16 @@
     },
     "poc_path": {
       "type": "string",
-      "description": "Optional path to a proof-of-concept artifact."
+      "description": "Proof-of-concept path relative to the run's out dir, set by the harness."
     },
     "evidence": {
       "type": "string",
       "description": "Validator evidence supporting the finding."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["confirmed", "downgraded", "needs_review"],
+      "description": "Review verdict, set by the harness. needs_review means unverified: a human must confirm it."
     }
   }
 }

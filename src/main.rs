@@ -24,6 +24,11 @@ enum Command {
         /// Path to the harness config TOML.
         #[arg(short, long, default_value = "config/harness.toml")]
         config: PathBuf,
+        /// Continue the last run in `run.out_dir` instead of starting fresh:
+        /// skips recon and keeps every artifact, so hunt picks up the tasks a
+        /// usage limit or crash left unprocessed.
+        #[arg(long)]
+        resume: bool,
     },
     /// Parse and validate a config, printing the resolved stages.
     Check {
@@ -60,10 +65,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { config } => {
+        Command::Run { config, resume } => {
             let cfg = Config::load(&config)?;
             let pipeline = Pipeline::new(cfg)?;
-            pipeline.run().await
+            if resume {
+                pipeline.resume().await
+            } else {
+                pipeline.run().await
+            }
         }
         Command::Check { config } => {
             let cfg = Config::load(&config)?;

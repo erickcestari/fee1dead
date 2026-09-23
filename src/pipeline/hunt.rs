@@ -2,16 +2,19 @@
 //! scratch dir. Hunters emit candidate findings and gap markers.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::StageCtx;
+use super::salvage::run_parsed;
 use crate::artifacts::{Artifacts, extract_json_block, names};
 use crate::domain::{Finding, GapMarker, Severity, Task};
 use crate::provider::{AgentRequest, AgentRunner, Effort, ResumeSession, is_usage_limited};
@@ -47,6 +50,8 @@ fn half() -> f64 {
 #[derive(Debug, Deserialize)]
 struct RawGap {
     area: String,
+    #[serde(default)]
+    attack_class: String,
     reason: String,
 }
 
@@ -56,6 +61,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         warn!("hunt queue is empty; did recon run?");
         return Ok(());
     }
+    // The pipeline writes it before any stage runs.
+    let run_id = ctx.artifacts.read_text(names::RUN_ID)?.trim().to_string();
     // Cold hunters (non-forking providers) get recon's threat model injected as
     // context; forked hunters already carry it in their inherited session.
     let recon_report = ctx
@@ -82,12 +89,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         info!("no new tasks to hunt; all queue entries already processed");
         return Ok(());
     }
-    // Schedule deeper tasks first. Concurrency only runs `concurrency` hunters at
-    // once (and a usage limit can truncate the tail), so spawn order is value
-    // order: hunter-surfaced tasks (gapfill, feedback) before recon's broad
-    // sweep, then recon's own priority within each origin. Stable, so queue order
-    // breaks ties.
-    tasks.sort_by_key(|t| (t.origin.hunt_priority(), t.priority.hunt_rank()));
+    spawn_order(&mut tasks);
 
     // Fork each hunter from recon's session so it inherits the codebase context
     // recon built up, not just the architecture doc. Absent a recorded session
@@ -103,6 +105,12 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     };
     if recon_session.is_some() {
         info!("hunters will fork from recon's session");
+        if ctx.config.stage_model("hunt") != ctx.config.stage_model("recon") {
+            warn!(
+                "hunt and recon run on different models; forked hunters cannot reuse \
+                 recon's prompt cache and pay full input price for its session"
+            );
+        }
     }
 
     // A forked hunter already carries recon's session (threat model and
@@ -158,8 +166,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
     // Set by the first hunter that hits an account usage/session limit. Once
     // set, spawning more hunters is pointless — every one bounces off the same
-    // limit until it resets — so the spawn loop stops and the unspawned tasks
-    // (never marked processed) are retried on the next run.
+    // limit until it resets — so the spawn loop stops. The unspawned tasks are
+    // never marked processed, so `fee1dead run --resume` hunts them later.
     let limited = Arc::new(AtomicBool::new(false));
     let total = tasks.len();
 
@@ -169,19 +177,36 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     // rate limiting. Stagger consecutive launches to spread the first requests.
     let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
 
-    let mut handles = Vec::new();
+    // Each hunter's output is persisted the moment it finishes, even while the
+    // loop is still waiting for a slot, so a crash mid-hunt loses only the
+    // hunters still running.
+    let mut running = JoinSet::new();
+    let mut tally = Tally::default();
     let mut spawned = 0usize;
-    for task in tasks {
+    'spawn: for task in tasks {
         if limited.load(Ordering::Relaxed) {
             break;
         }
         if spawned > 0 && !stagger.is_zero() {
             tokio::time::sleep(stagger).await;
         }
-        let permit = Arc::clone(&sem).acquire_owned().await.unwrap();
+        let permit = loop {
+            tokio::select! {
+                permit = Arc::clone(&sem).acquire_owned() => {
+                    break permit.expect("hunt semaphore is never closed");
+                }
+                Some(done) = running.join_next() => {
+                    record(ctx, &run_id, done.context("hunter task panicked")?, &mut tally)?;
+                    if limited.load(Ordering::Relaxed) {
+                        break 'spawn;
+                    }
+                }
+            }
+        };
         let runner = Arc::clone(&ctx.runner);
         let limited = Arc::clone(&limited);
-        let scratch_dir = ctx.scratch.for_task(&task.id)?;
+        let hunt_model = ctx.config.stage_model("hunt");
+        let scratch_dir = ctx.scratch.for_agent(&task.id)?;
         let stream_log_path = ctx.artifacts.log_path(&format!("hunt-{}.jsonl", task.id));
         let prompt = PROMPT
             .replace("{attack_class}", &task.attack_class)
@@ -206,12 +231,12 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             project_dir: target.clone(),
         });
 
-        handles.push(tokio::spawn(async move {
-            let _permit = permit; // released on drop
+        running.spawn(async move {
             let req = AgentRequest {
                 prompt,
                 system: None,
-                working_dir: scratch_dir,
+                working_dir: scratch_dir.clone(),
+                output_dir: scratch_dir.clone(),
                 extra_dirs,
                 allowed_tools: Vec::new(),
                 // Shared deny-list: no sub-agent fan-out (the orchestrator
@@ -228,7 +253,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 // deepest thinking earns its keep here, and a hunter's effort is
                 // not fork-amplified. This is the stage xhigh is for.
                 effort: Effort::Xhigh,
-                model: None,
+                model: hunt_model,
                 stream_log_path: Some(stream_log_path),
             };
             info!(task = %task.id, attack_class = %task.attack_class, "hunter started");
@@ -239,56 +264,22 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 limited.store(true, Ordering::Relaxed);
             }
             info!(task = %task.id, ok = out.is_ok(), "hunter finished");
-            (task, out)
-        }));
+            Finished {
+                task,
+                scratch_dir,
+                out,
+                slot: permit,
+            }
+        });
         spawned += 1;
     }
-
-    let mut total_findings = 0usize;
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-    let mut limit_failures = 0usize;
-    for handle in handles {
-        let (task, out) = handle.await.context("hunter task panicked")?;
-        match out {
-            Ok((findings, gaps)) => {
-                succeeded += 1;
-                for (i, rf) in findings.into_iter().enumerate() {
-                    let finding = Finding {
-                        id: format!("{}-F{:02}", task.id, i + 1),
-                        task_id: task.id.clone(),
-                        title: rf.title,
-                        attack_class: task.attack_class.clone(),
-                        severity: rf.severity,
-                        location: rf.location,
-                        description: rf.description,
-                        confidence: rf.confidence,
-                        poc_path: rf.poc_path,
-                    };
-                    append_finding(&ctx.artifacts, &finding)?;
-                    total_findings += 1;
-                }
-                for g in gaps {
-                    let marker = GapMarker {
-                        task_id: task.id.clone(),
-                        area: g.area,
-                        reason: g.reason,
-                    };
-                    ctx.artifacts.append_jsonl(names::GAPS, &marker)?;
-                }
-                // Record the task as processed only on success, so a failed
-                // hunter is retried on the next pass.
-                ctx.artifacts.append_jsonl(names::HUNTED, &task.id)?;
-            }
-            // One hunter failing must not abort the whole stage.
-            Err(e) => {
-                failed += 1;
-                if is_usage_limited(&e) {
-                    limit_failures += 1;
-                }
-                warn!(task = %task.id, error = %e, "hunter failed");
-            }
-        }
+    while let Some(done) = running.join_next().await {
+        record(
+            ctx,
+            &run_id,
+            done.context("hunter task panicked")?,
+            &mut tally,
+        )?;
     }
 
     // `total` is the queue size; `spawned` may be smaller if a usage limit cut
@@ -298,25 +289,133 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     info!(
         total,
         spawned,
-        succeeded,
-        failed,
+        succeeded = tally.succeeded,
+        failed = tally.failed,
         skipped,
-        findings = total_findings,
+        findings = tally.findings,
         "hunt complete"
     );
-    if limit_failures > 0 {
+    if tally.limit_failures > 0 {
         warn!(
-            limit_failures,
+            limit_failures = tally.limit_failures,
             skipped,
-            "hunt stopped early: account usage limit reached; \
-             unprocessed tasks will be retried on the next run after it resets"
+            "hunt stopped early: account usage limit reached; once it resets, \
+             `fee1dead run --resume` hunts the unprocessed tasks"
         );
     }
     Ok(())
 }
 
-fn append_finding(artifacts: &Artifacts, finding: &Finding) -> Result<()> {
-    artifacts.append_jsonl(names::CANDIDATES, finding)
+/// One hunter's outcome, handed from its task back to the stage.
+struct Finished {
+    task: Task,
+    scratch_dir: PathBuf,
+    out: Result<(Vec<RawFinding>, Vec<RawGap>)>,
+    /// The hunter's concurrency slot, held until [`record`] has persisted the
+    /// outcome, so a new hunter never starts ahead of a finished one's save.
+    slot: OwnedSemaphorePermit,
+}
+
+/// Running totals for the end-of-hunt summary.
+#[derive(Default)]
+struct Tally {
+    succeeded: usize,
+    failed: usize,
+    limit_failures: usize,
+    findings: usize,
+}
+
+/// Persist one finished hunter: its findings (PoCs copied out of scratch), its
+/// gaps, and then its ledger entry. The task is marked processed only on
+/// success, so a failed hunter is retried on the next pass.
+fn record(ctx: &StageCtx, run_id: &str, done: Finished, tally: &mut Tally) -> Result<()> {
+    let Finished {
+        task,
+        scratch_dir,
+        out,
+        slot: _slot,
+    } = done;
+    let (findings, gaps) = match out {
+        Ok(output) => output,
+        // One hunter failing must not abort the whole stage.
+        Err(e) => {
+            tally.failed += 1;
+            if is_usage_limited(&e) {
+                tally.limit_failures += 1;
+            }
+            warn!(task = %task.id, error = %e, "hunter failed");
+            return Ok(());
+        }
+    };
+    tally.succeeded += 1;
+    for (i, rf) in findings.into_iter().enumerate() {
+        let id = finding_id(run_id, &task.id, i);
+        // Keep the hunter's own path if the copy fails, so the lead survives.
+        let poc_path = rf
+            .poc_path
+            .map(|p| persist_poc(&ctx.artifacts, &scratch_dir, &id, &p).unwrap_or(p));
+        let finding = Finding {
+            id,
+            task_id: task.id.clone(),
+            title: rf.title,
+            attack_class: task.attack_class.clone(),
+            severity: rf.severity,
+            location: rf.location,
+            description: rf.description,
+            confidence: rf.confidence,
+            poc_path,
+        };
+        ctx.artifacts.append_jsonl(names::CANDIDATES, &finding)?;
+        tally.findings += 1;
+    }
+    for g in gaps {
+        let marker = GapMarker {
+            task_id: task.id.clone(),
+            area: g.area,
+            attack_class: g.attack_class,
+            reason: g.reason,
+        };
+        ctx.artifacts.append_jsonl(names::GAPS, &marker)?;
+    }
+    ctx.artifacts.append_jsonl(names::HUNTED, &task.id)
+}
+
+/// Copy a finding's PoC out of the hunter's scratch dir, which does not outlive
+/// the container, into `out_dir/pocs/<finding id>/`. Returns the copy's path
+/// relative to `out_dir`, or `None` (with a warning) when `poc_path` does not
+/// exist or points outside the scratch dir.
+fn persist_poc(
+    artifacts: &Artifacts,
+    scratch_dir: &Path,
+    finding_id: &str,
+    poc_path: &str,
+) -> Option<String> {
+    let copy = || -> Result<String> {
+        let scratch = scratch_dir.canonicalize()?;
+        // Joining an absolute path replaces the base, so both forms resolve.
+        let src = scratch.join(poc_path).canonicalize()?;
+        anyhow::ensure!(
+            src.starts_with(&scratch),
+            "outside the scratch dir {}",
+            scratch.display()
+        );
+        let name = src.file_name().context("PoC path has no file name")?;
+        let rel = Path::new(names::POCS).join(finding_id).join(name);
+        artifacts.import(&rel, &src)?;
+        Ok(rel.to_string_lossy().into_owned())
+    };
+    match copy() {
+        Ok(rel) => Some(rel),
+        Err(e) => {
+            warn!(finding = finding_id, poc_path, error = %e, "could not keep PoC");
+            None
+        }
+    }
+}
+
+/// A finding id unique across runs: `<run>-<task>-F<nn>`, `index` 0-based.
+fn finding_id(run_id: &str, task_id: &str, index: usize) -> String {
+    format!("{run_id}-{task_id}-F{:02}", index + 1)
 }
 
 /// The scope shown to the hunter: recon's path-prefix list when present, else
@@ -364,15 +463,28 @@ fn skills_line(task: &Task, use_skills: bool) -> String {
     }
 }
 
+/// Order tasks for spawning. Concurrency only runs `concurrency` hunters at once
+/// and a usage limit can truncate the tail, so spawn order is value order:
+/// recon's priority first, since only its tasks passed the admission bar, then
+/// origin as a tiebreak (see [`crate::domain::TaskOrigin::hunt_priority`]).
+/// Stable, so queue order breaks the remaining ties.
+fn spawn_order(tasks: &mut [Task]) {
+    tasks.sort_by_key(|t| (t.priority.hunt_rank(), t.origin.hunt_priority()));
+}
+
+/// Run one hunter; an unusable answer or a timeout gets one repair turn in the
+/// hunter's own session (see [`run_parsed`]) before the task counts as failed.
 async fn run_hunter(
     runner: &dyn AgentRunner,
     req: AgentRequest,
 ) -> Result<(Vec<RawFinding>, Vec<RawGap>)> {
-    let result = runner.run(req).await?;
-    let json = extract_json_block(&result.stdout).context("hunter output had no json block")?;
-    let out: HunterOutput =
-        serde_json::from_str(json).context("hunter output was not valid json")?;
-    Ok((out.findings, out.gaps))
+    run_parsed(runner, req, |result| {
+        let json = extract_json_block(&result.stdout).context("hunter output had no json block")?;
+        let out: HunterOutput =
+            serde_json::from_str(json).context("hunter output was not valid json")?;
+        Ok((out.findings, out.gaps))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -393,6 +505,43 @@ mod tests {
             priority: crate::domain::Priority::default(),
             origin: TaskOrigin::Recon,
         }
+    }
+
+    #[test]
+    fn poc_is_copied_out_of_scratch_relative_or_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch").join("T-0001");
+        std::fs::create_dir_all(scratch.join("poc")).unwrap();
+        std::fs::write(scratch.join("poc").join("main.go"), "package main").unwrap();
+        let art = Artifacts::new(dir.path().join("out")).unwrap();
+
+        let rel = persist_poc(&art, &scratch, "R-T-0001-F01", "poc").unwrap();
+        assert_eq!(rel, "pocs/R-T-0001-F01/poc");
+        assert!(art.path(&rel).join("main.go").exists());
+
+        let abs = scratch.join("poc").join("main.go");
+        let rel = persist_poc(&art, &scratch, "R-T-0001-F02", abs.to_str().unwrap()).unwrap();
+        assert_eq!(rel, "pocs/R-T-0001-F02/main.go");
+    }
+
+    #[test]
+    fn poc_outside_scratch_or_missing_is_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(dir.path().join("secret"), "s").unwrap();
+        let art = Artifacts::new(dir.path().join("out")).unwrap();
+        assert!(persist_poc(&art, &scratch, "F", "../secret").is_none());
+        assert!(persist_poc(&art, &scratch, "F", "nope.go").is_none());
+        assert!(!art.path(names::POCS).exists());
+    }
+
+    #[test]
+    fn finding_ids_carry_the_run_so_they_never_repeat_across_runs() {
+        let a = finding_id("20260901T000000Z", "T-0001", 0);
+        let b = finding_id("20260902T000000Z", "T-0001", 0);
+        assert_eq!(a, "20260901T000000Z-T-0001-F01");
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -437,9 +586,8 @@ mod tests {
     }
 
     #[test]
-    fn spawn_order_is_origin_then_priority() {
-        // Mirrors the sort key in run(): hunter-surfaced origins first, then
-        // recon's own priority within an origin, queue order breaking ties.
+    fn spawn_order_is_priority_then_origin() {
+        // Unvetted tasks never jump ahead of recon's higher-priority ones.
         let mk = |id: &str, origin: TaskOrigin, priority: crate::domain::Priority| {
             let mut t = task("h", &[], &[]);
             t.id = id.into();
@@ -450,12 +598,12 @@ mod tests {
         use crate::domain::Priority::{High, Low, Medium};
         let mut tasks = [
             mk("recon-low", TaskOrigin::Recon, Low),
+            mk("recon-med", TaskOrigin::Recon, Medium),
             mk("recon-high", TaskOrigin::Recon, High),
             mk("gapfill", TaskOrigin::Gapfill, Medium),
-            mk("recon-med", TaskOrigin::Recon, Medium),
         ];
-        tasks.sort_by_key(|t| (t.origin.hunt_priority(), t.priority.hunt_rank()));
+        spawn_order(&mut tasks);
         let order: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(order, ["gapfill", "recon-high", "recon-med", "recon-low"]);
+        assert_eq!(order, ["recon-high", "gapfill", "recon-med", "recon-low"]);
     }
 }

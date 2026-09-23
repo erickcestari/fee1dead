@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 /// A single unit of hunting work: one attack class pointed at one scope hint.
 ///
-/// The Recon stage seeds the queue with these; Hunt consumes them. Gapfill and
-/// Feedback (later phases) append more.
+/// The Recon stage seeds the queue with these; Hunt consumes them. Gapfill
+/// appends more mid-run. Feedback persists seeds in the same shape, which the
+/// next run's recon vets as leads rather than queueing directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -86,13 +87,12 @@ pub enum TaskOrigin {
 }
 
 impl TaskOrigin {
-    /// Hunt scheduling priority; lower is scheduled first.
+    /// Tiebreak between tasks of equal [`Priority`]; lower is scheduled first.
     ///
-    /// Tasks a hunter caused are narrower and higher-value than recon's broad
-    /// sweep: a gap marker is an area a hunter touched but could not finish, and
-    /// a feedback seed is a lead distilled from a past run's findings. Both took
-    /// hunting to surface, so they run ahead of the initial recon tasks when
-    /// concurrency forces an order.
+    /// Among equally ranked tasks, the ones a hunter surfaced are narrower than
+    /// recon's sweep: a gap marker is an area a hunter touched but could not
+    /// finish. They never outrank a higher [`Priority`], since only recon's
+    /// tasks passed its admission bar.
     pub fn hunt_priority(self) -> u8 {
         match self {
             TaskOrigin::Gapfill => 0,
@@ -129,6 +129,25 @@ fn default_confidence() -> f64 {
     0.5
 }
 
+impl Finding {
+    /// The source file of [`Finding::location`] (`path:line`), line stripped.
+    pub fn file(&self) -> &str {
+        self.location
+            .rsplit_once(':')
+            .map_or(self.location.as_str(), |(file, _line)| file)
+            .trim()
+    }
+}
+
+/// A finding Dedupe collapsed into another with the same root cause. Recorded
+/// rather than deleted, so a wrong merge can be spotted and undone by hand.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Duplicate {
+    /// Id of the finding kept in `candidates.jsonl` for this root cause.
+    pub duplicate_of: String,
+    pub finding: Finding,
+}
+
 /// Variants are declared in ascending order so the derived `Ord` ranks
 /// severity: `Info < Low < Medium < High < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -144,10 +163,10 @@ pub enum Severity {
 /// Review verdict produced by the (independent) Validate stage.
 ///
 /// The reviewer never deletes a finding; it *tags* it. A latent or
-/// defense-in-depth issue is downgraded, not dropped, so a real bug the hunter
-/// could not fully prove still reaches a human instead of vanishing. Only
-/// `LikelyFalsePositive` is held back from the report (it stays in the
-/// validated artifact for review).
+/// defense-in-depth issue is downgraded, not dropped, and one the reviewer could
+/// not settle is `NeedsReview`, so a real bug nobody could fully prove still
+/// reaches a human instead of vanishing. Only `LikelyFalsePositive` is held
+/// back from the report (it stays in the validated artifact for review).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Validation {
     pub finding_id: String,
@@ -158,9 +177,16 @@ pub struct Validation {
     /// correct, which the report stage applies in place of the hunter's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corrected_severity: Option<Severity>,
+    /// What an attacker concretely gains. Written by the reviewer, who traced
+    /// the bug, for every verdict but `LikelyFalsePositive`; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub impact: String,
+    /// The specific fix or mitigation, under the same rule as `impact`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recommendation: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
     /// Data flow holds, attacker control proven; file as-is.
@@ -170,28 +196,70 @@ pub enum Verdict {
     /// Unreachable, mis-cited, or operational-not-security; keep for review,
     /// do not report.
     LikelyFalsePositive,
+    /// Not settled: inconclusive after a real attempt, or the reviewer returned
+    /// no verdict. Reported, marked so a human verifies it before acting.
+    NeedsReview,
 }
 
 impl Verdict {
     /// Whether a finding with this verdict advances to the report. Downgraded
-    /// findings still ship (with corrected severity); only likely-false-
-    /// positives are held back.
+    /// findings ship with corrected severity, unsettled ones marked for human
+    /// review; only likely-false-positives are held back.
     pub fn is_reportable(self) -> bool {
+        !matches!(self, Verdict::LikelyFalsePositive)
+    }
+
+    /// Whether the reviewer judged the bug real (at some severity). Stricter
+    /// than [`Verdict::is_reportable`]: an unsettled finding is surfaced, but
+    /// not treated as a proven bug (e.g. not seeded for variant hunts).
+    pub fn is_real_bug(self) -> bool {
         matches!(self, Verdict::Confirmed | Verdict::Downgraded)
     }
 }
 
 /// An area a hunter touched but did not cover thoroughly.
 ///
-/// Gapfill (later phase) re-queues these as new tasks to counteract the model's
-/// drift toward attack classes it has already had success with.
+/// Gapfill re-queues these as new tasks to counteract the model's drift toward
+/// attack classes it has already had success with; Feedback carries them to
+/// the next run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GapMarker {
     pub task_id: String,
     /// The under-explored area (file/module/function).
     pub area: String,
-    /// Why it was left uncovered, and what an attack class might be.
+    /// The attack class worth a follow-up pass on `area`. Usually differs from
+    /// the reporting hunter's own class. Empty for older artifacts.
+    #[serde(default)]
+    pub attack_class: String,
+    /// Why it was left uncovered.
     pub reason: String,
+}
+
+impl GapMarker {
+    /// The attack class of the follow-up task this gap becomes.
+    pub fn follow_up_class(&self) -> &str {
+        match self.attack_class.trim() {
+            "" => "uncovered area",
+            class => class,
+        }
+    }
+
+    /// The follow-up hunt task this gap becomes: the hunter's area as scope and
+    /// first target, its reason as the hypothesis to test.
+    pub fn to_task(&self, id: String, origin: TaskOrigin) -> Task {
+        Task {
+            id,
+            attack_class: self.follow_up_class().to_string(),
+            scope_hint: self.area.clone(),
+            scope_paths: Vec::new(),
+            hypothesis: self.reason.clone(),
+            targets: vec![self.area.clone()],
+            suggested_skills: Vec::new(),
+            tags: Vec::new(),
+            priority: Priority::default(),
+            origin,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -247,13 +315,26 @@ mod tests {
             serde_json::to_string(&Verdict::LikelyFalsePositive).unwrap(),
             "\"likely_false_positive\""
         );
+        assert_eq!(
+            serde_json::to_string(&Verdict::NeedsReview).unwrap(),
+            "\"needs_review\""
+        );
     }
 
     #[test]
-    fn only_confirmed_and_downgraded_are_reportable() {
+    fn only_likely_false_positives_are_held_back_from_the_report() {
         assert!(Verdict::Confirmed.is_reportable());
         assert!(Verdict::Downgraded.is_reportable());
+        assert!(Verdict::NeedsReview.is_reportable());
         assert!(!Verdict::LikelyFalsePositive.is_reportable());
+    }
+
+    #[test]
+    fn an_unsettled_finding_is_not_a_proven_bug() {
+        assert!(Verdict::Confirmed.is_real_bug());
+        assert!(Verdict::Downgraded.is_real_bug());
+        assert!(!Verdict::NeedsReview.is_real_bug());
+        assert!(!Verdict::LikelyFalsePositive.is_real_bug());
     }
 
     #[test]
@@ -266,8 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn hunter_surfaced_origins_outrank_recon_for_scheduling() {
-        // Deeper tasks (a hunter had to surface them) run before the broad sweep.
+    fn hunter_surfaced_origins_break_ties_ahead_of_recon() {
+        // Among equal priorities, deeper tasks (a hunter surfaced them) go first.
         assert!(TaskOrigin::Gapfill.hunt_priority() < TaskOrigin::Recon.hunt_priority());
         assert!(TaskOrigin::Feedback.hunt_priority() < TaskOrigin::Recon.hunt_priority());
 
@@ -277,6 +358,33 @@ mod tests {
             origins,
             [TaskOrigin::Gapfill, TaskOrigin::Feedback, TaskOrigin::Recon]
         );
+    }
+
+    #[test]
+    fn finding_file_strips_the_line() {
+        let mut f: Finding = serde_json::from_str(
+            "{\"id\":\"F\",\"task_id\":\"T\",\"title\":\"t\",\"attack_class\":\"c\",\"severity\":\"low\",\"location\":\"src/a.rs:12\",\"description\":\"d\"}",
+        )
+        .unwrap();
+        assert_eq!(f.file(), "src/a.rs");
+        f.location = "src/a.rs".into();
+        assert_eq!(f.file(), "src/a.rs");
+    }
+
+    #[test]
+    fn a_gap_becomes_a_task_with_its_reason_as_the_hypothesis() {
+        let gap = GapMarker {
+            task_id: "T-0001".into(),
+            area: "src/a.rs:decode".into(),
+            attack_class: String::new(),
+            reason: "error path not traced".into(),
+        };
+        let t = gap.to_task("G-0002".into(), TaskOrigin::Gapfill);
+        assert_eq!(t.attack_class, "uncovered area");
+        assert_eq!(t.scope_hint, "src/a.rs:decode");
+        assert_eq!(t.targets, vec!["src/a.rs:decode"]);
+        assert_eq!(t.hypothesis, "error path not traced");
+        assert_eq!(t.priority, Priority::Medium);
     }
 
     #[test]

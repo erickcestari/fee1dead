@@ -11,17 +11,19 @@ mod gapfill;
 mod hunt;
 mod recon;
 mod report;
+mod salvage;
+mod similarity;
 mod skip_reported;
 mod validate;
 
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::artifacts::Artifacts;
 use crate::config::Config;
-use crate::provider::{AgentRunner, build_runner};
+use crate::provider::{AgentRunner, RetryOnRateLimit, build_runner};
 use crate::scratch::ScratchRoot;
 
 /// Tools every stage agent is denied, for two reasons:
@@ -29,6 +31,8 @@ use crate::scratch::ScratchRoot;
 /// - `Task` and the orchestration tools (`Task*`, `Workflow`): the harness owns
 ///   parallelism. A stage spawning its own sub-agents only multiplies cost
 ///   without adding coverage.
+/// - `AskUserQuestion`: agents run unattended, so a question would only stall
+///   the agent until its timeout (skills such as fp-check suggest asking).
 /// - The rest are irrelevant to reading code and finding bugs — scheduling,
 ///   notebooks, notifications, worktrees, deferred-tool search, and web access
 ///   (egress is firewalled to a deny-default allow-list anyway). Every tool's
@@ -49,6 +53,7 @@ const DISABLED_TOOLS: &[&str] = &[
     "TaskStop",
     "TaskUpdate",
     "Workflow",
+    "AskUserQuestion",
     "CronCreate",
     "CronDelete",
     "CronList",
@@ -86,20 +91,11 @@ pub struct Pipeline {
 impl Pipeline {
     /// Build a pipeline from config, constructing the default provider runner.
     pub fn new(config: Config) -> Result<Self> {
-        let artifacts = Artifacts::new(&config.run.out_dir)?;
-        let scratch = ScratchRoot::new(&config.run.scratch_root)?;
-        let runner: Arc<dyn AgentRunner> = Arc::from(build_runner(
+        let runner = Arc::from(build_runner(
             &config.provider.default,
             config.default_provider(),
         ));
-        Ok(Self {
-            ctx: StageCtx {
-                config,
-                artifacts,
-                scratch,
-                runner,
-            },
-        })
+        Self::with_runner(config, runner)
     }
 
     /// Build a pipeline with a caller-supplied runner (used by tests and
@@ -112,43 +108,82 @@ impl Pipeline {
                 config,
                 artifacts,
                 scratch,
-                runner,
+                runner: Arc::new(RetryOnRateLimit::new(runner)),
             },
         })
     }
 
     /// Run the stages listed in `stages.enabled`, in order.
     pub async fn run(&self) -> Result<()> {
+        self.execute(false).await
+    }
+
+    /// Continue the last run in `out_dir`: run the listed stages except recon,
+    /// keeping every artifact, so hunt picks up the tasks a usage limit or crash
+    /// left unprocessed and later stages see the whole run.
+    pub async fn resume(&self) -> Result<()> {
+        self.execute(true).await
+    }
+
+    async fn execute(&self, resume: bool) -> Result<()> {
+        use crate::artifacts::names;
+
+        let mut stages = self.ctx.config.stages.enabled.clone();
+        if resume {
+            if !self.ctx.artifacts.exists(names::QUEUE) {
+                bail!(
+                    "nothing to resume: {} has no {}; run without --resume",
+                    self.ctx.config.run.out_dir.display(),
+                    names::QUEUE
+                );
+            }
+            stages.retain(|s| s != "recon");
+        }
+
         // Acquire the target and optional reference repo (clone if configured)
         // before any stage reads them.
         crate::target::ensure_target(&self.ctx.config)?;
         crate::target::ensure_reference(&self.ctx.config)?;
 
-        let stages = self.ctx.config.stages.enabled.clone();
-
         // A recon-led run starts fresh: clear last run's per-run artifacts so a
         // reused out_dir cannot leak stale state (e.g. the hunt ledger). The
         // durable feedback memory (SEEDS) is deliberately preserved.
         if stages.iter().any(|s| s == "recon") {
-            for name in crate::artifacts::names::PER_RUN {
+            for name in names::PER_RUN {
                 self.ctx.artifacts.remove(name)?;
             }
-            // Stream transcripts live in a directory, not a single file, so they
-            // are cleared separately from the PER_RUN file list.
+            for dir in names::PER_RUN_DIRS {
+                self.ctx.artifacts.remove_dir(dir)?;
+            }
+        }
+        if !self.ctx.artifacts.exists(names::RUN_ID) {
             self.ctx
                 .artifacts
-                .remove_dir(crate::artifacts::names::LOGS)?;
+                .write_text(names::RUN_ID, &new_run_id())?;
         }
 
         info!(
             provider = self.ctx.runner.name(),
             ?stages,
+            resume,
             "starting pipeline"
         );
+        // A failed stage does not stop the ones after it: each reads whatever
+        // artifacts exist, so e.g. a report that fails on a sink error still
+        // leaves feedback to record the run. The run still exits non-zero.
+        let mut failed = Vec::new();
         for stage in &stages {
             info!(stage = %stage, "stage start");
-            run_stage(stage, &self.ctx).await?;
-            info!(stage = %stage, "stage done");
+            match run_stage(stage, &self.ctx).await {
+                Ok(()) => info!(stage = %stage, "stage done"),
+                Err(e) => {
+                    error!(stage = %stage, error = format!("{e:#}"), "stage failed; continuing");
+                    failed.push(stage.as_str());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            bail!("stages failed: {}", failed.join(", "));
         }
         Ok(())
     }
@@ -163,6 +198,11 @@ impl Pipeline {
 pub fn aggregate_dir(out_dir: impl Into<std::path::PathBuf>) -> Result<()> {
     let artifacts = Artifacts::new(out_dir)?;
     aggregate::write_report(&artifacts)
+}
+
+/// A fresh run id: the UTC start time, so ids sort by run and read as a date.
+fn new_run_id() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 async fn run_stage(stage: &str, ctx: &StageCtx) -> Result<()> {

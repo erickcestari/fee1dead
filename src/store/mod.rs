@@ -27,15 +27,21 @@ pub struct ReportRecord {
     pub payload: Value,
 }
 
-/// A finding already present in the destination, surfaced so the report stage
-/// can dedup new findings against it (e.g. issues already filed in GitHub).
+/// A finding already present in the destination, surfaced so new findings can
+/// be deduped against it (e.g. issues already filed in GitHub).
+///
+/// `title`, `location`, and `attack_class` are recovered as the finding had
+/// them, so they compare like-for-like with a new finding's same fields; empty
+/// when the sink cannot recover one.
 #[derive(Debug, Clone)]
 pub struct ExistingReport {
     /// Finding id the report was filed under, when recoverable (the github sink
     /// reads it from the issue's hidden marker). Empty when unknown.
     pub id: String,
     pub title: String,
-    /// Free text used for similarity scoring (the issue body / description).
+    pub location: String,
+    pub attack_class: String,
+    /// The full report text (e.g. the issue body), context for the model judge.
     pub text: String,
 }
 
@@ -107,7 +113,6 @@ mod tests {
             url: url.map(Into::into),
             token_env: None,
             repo: None,
-            dedupe_model: None,
         }
     }
 

@@ -6,7 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -21,6 +21,9 @@ pub mod names {
     pub const QUEUE: &str = "queue.jsonl";
     pub const CANDIDATES: &str = "candidates.jsonl";
     pub const GAPS: &str = "gaps.jsonl";
+    /// Findings Dedupe collapsed into another with the same root cause, each
+    /// with the id it duplicates. Kept so a wrong merge can be spotted.
+    pub const DUPLICATES: &str = "duplicates.jsonl";
     pub const VALIDATED: &str = "validated.jsonl";
     /// Single human-reviewable JSON document the Aggregate stage compiles from
     /// the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`), enriched with
@@ -42,11 +45,19 @@ pub mod names {
     /// The recon agent's session id, so hunters can fork from its context.
     /// Holds a single line of text, not JSONL.
     pub const RECON_SESSION: &str = "recon-session.txt";
+    /// This run's id, prefixed to every finding id. Task ids are positional and
+    /// repeat every run, so without it `T-0001-F01` would name a different bug
+    /// each run and collide in any sink that outlives a run (github issues, a
+    /// reused sqlite db). Single line of text; kept across a `--resume`.
+    pub const RUN_ID: &str = "run-id.txt";
     /// Directory of per-agent event-stream transcripts (one JSONL file per agent
     /// run). Each transcript's final `result` event carries that agent's cost,
     /// token usage, and prompt-cache hits, so a run is profiled from here. Cleared
     /// wholesale at the start of a recon-led run.
     pub const LOGS: &str = "logs";
+    /// Hunters' proof-of-concept code, copied out of their scratch dirs (which
+    /// do not outlive the container) to `pocs/<finding id>/`.
+    pub const POCS: &str = "pocs";
 
     /// Artifacts produced fresh by a single run (everything except SEEDS).
     /// Cleared at the start of a run that includes recon.
@@ -55,12 +66,18 @@ pub mod names {
         QUEUE,
         CANDIDATES,
         GAPS,
+        DUPLICATES,
         VALIDATED,
         REPORT_JSON,
         FINDINGS_JSONL,
         HUNTED,
         RECON_SESSION,
+        RUN_ID,
     ];
+
+    /// Directory artifacts produced fresh by a single run, cleared alongside
+    /// [`PER_RUN`].
+    pub const PER_RUN_DIRS: &[&str] = &[LOGS, POCS];
 }
 
 /// Handle to a run's output directory.
@@ -164,6 +181,14 @@ impl Artifacts {
         }
     }
 
+    /// Copy a file or directory tree into `out_dir/rel`, creating parent dirs.
+    /// Symlinks are skipped: an agent-written link could point anywhere.
+    pub fn import(&self, rel: &Path, src: &Path) -> Result<()> {
+        let dest = self.out_dir.join(rel);
+        copy_tree(src, &dest)
+            .with_context(|| format!("copying {} to {}", src.display(), dest.display()))
+    }
+
     /// Recursively delete a directory artifact if present (no error when absent).
     pub fn remove_dir(&self, name: &str) -> Result<()> {
         let path = self.path(name);
@@ -173,6 +198,23 @@ impl Artifacts {
             Err(e) => Err(e).with_context(|| format!("removing dir {}", path.display())),
         }
     }
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        std::fs::create_dir_all(dest)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dest)?;
+    }
+    Ok(())
 }
 
 /// Best-effort extraction of a fenced ```json ... ``` block from agent text,
@@ -222,6 +264,26 @@ mod tests {
         let art = Artifacts::new(dir.path()).unwrap();
         let got: Vec<Row> = art.read_jsonl("nope.jsonl").unwrap();
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn import_copies_a_tree_and_skips_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("poc");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("main.go"), "package main").unwrap();
+        std::fs::write(src.join("sub").join("x.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", src.join("leak")).unwrap();
+
+        let art = Artifacts::new(dir.path().join("out")).unwrap();
+        art.import(Path::new("pocs/F-1/poc"), &src).unwrap();
+        let out = dir.path().join("out/pocs/F-1/poc");
+        assert_eq!(
+            std::fs::read_to_string(out.join("main.go")).unwrap(),
+            "package main"
+        );
+        assert!(out.join("sub/x.txt").exists());
+        assert!(!out.join("leak").exists());
     }
 
     #[test]

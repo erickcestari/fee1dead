@@ -30,10 +30,11 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `{prompt}`/`{working_dir}` placeholders). `mock.rs` is feature-gated. Fields an
   adapter's CLI has no equivalent for (max turns, tool allow/deny lists) are
   ignored, never emulated.
-- `src/pipeline/` — `mod.rs` sequences stages; one file per stage. All seven
+- `src/pipeline/` — `mod.rs` sequences stages; one file per stage. All nine
   are built. `feedback.rs` is a cross-run memory (no consumer repos): it writes
-  durable seed tasks to `feedback-seeds.jsonl`, which recon merges into the next
-  run's queue. Add a stage: create the file, add to the `run_stage` match, and
+  durable seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads
+  as leads (and consumes). `salvage.rs` gives an agent whose answer does not
+  parse, or that timed out, one repair turn in its own session. Add a stage: create the file, add to the `run_stage` match, and
   to `KNOWN_STAGES` in `config.rs`.
 - `src/store/` — `ReportSink` trait + sqlite/jsonl/http sinks. New sinks
   implement the trait and wire into `build_sink`.
@@ -41,12 +42,13 @@ schema-validated findings. See `README.md` for the user-facing overview.
   This is the operator-input trust boundary; fail fast here, assume valid below.
 - `src/target.rs` — acquires the target repo before stages run: clones
   `[target].repo` at `ref` into `target_dir`, or asserts a mounted target is
-  present. Called at the top of `Pipeline::run`.
+  present, then runs `[target].prepare`. Called at the top of `Pipeline::run`.
 - `src/domain.rs` — the inter-stage data contract (`Task`, `Finding`,
   `Validation`, `GapMarker`, `Severity`). Change here ripples to artifacts.
 - `src/artifacts.rs` — JSON/JSONL stage IO. **Stages communicate ONLY through
   artifacts** in `out_dir` (`queue.jsonl`, `candidates.jsonl`, `gaps.jsonl`,
-  `validated.jsonl`, `findings.json`, `hunted.jsonl`, `recon.json`), never by
+  `duplicates.jsonl`, `validated.jsonl`, `findings.json`, `hunted.jsonl`,
+  `recon.json`, `run-id.txt`, plus the `logs/` and `pocs/` dirs), never by
   calling each other. Keep it that way: it is what makes stages decoupled and
   runs resumable. `aggregate.rs` joins the hunters' raw output into the single
   reviewable `findings.json` with no agent call, and is also exposed as the
@@ -72,7 +74,9 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - A recon-led run resets per-run artifacts (`artifacts::names::PER_RUN`) at
   startup; `feedback-seeds.jsonl` (`SEEDS`) is deliberately excluded so the
   cross-run memory persists. If you add a durable artifact, keep it out of
-  `PER_RUN`.
+  `PER_RUN`. `run --resume` skips recon and resets nothing.
+- Every agent gets its own `output_dir` (a scratch dir) for its answer file;
+  never share one between agents, or one can read another's answer.
 - The container is the security boundary. The agent runs
   `--dangerously-skip-permissions`; the only real restriction is the
   default-deny egress firewall (`docker/init-firewall.sh`, allow-list sourced

@@ -19,6 +19,9 @@ pub struct CannedReply {
     pub stdout: String,
     /// Session id this reply reports, mimicking a real provider's envelope.
     pub session_id: Option<String>,
+    /// When set, builds the reply from the prompt instead of using `stdout`,
+    /// for stages whose reply must echo ids the harness assigned at run time.
+    pub render: Option<fn(&str) -> String>,
 }
 
 pub struct MockRunner {
@@ -64,7 +67,7 @@ impl AgentRunner for MockRunner {
             .cloned();
         match reply {
             Some(r) => Ok(AgentResult {
-                stdout: r.stdout,
+                stdout: r.render.map_or(r.stdout, |render| render(&req.prompt)),
                 exit_code: 0,
                 session_id: r.session_id,
             }),

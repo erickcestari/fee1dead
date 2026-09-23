@@ -26,6 +26,7 @@ use anyhow::Result;
 use tracing::{info, warn};
 
 use super::StageCtx;
+use super::similarity::{jaccard, tokenize};
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::Finding;
 use crate::provider::{AgentRequest, Effort};
@@ -141,10 +142,14 @@ async fn judge_is_duplicate(
             &format!("{}\n{}", candidate.title, candidate.text),
         );
 
+    // Judges run back to back; each needs its own dir so one judge can never
+    // read another's `{"duplicate": true}`.
+    let dir = ctx.scratch.for_agent(&format!("judge-{}", finding.id))?;
     let req = AgentRequest {
         prompt,
         system: None,
-        working_dir: ctx.config.run.out_dir.clone(),
+        working_dir: dir.clone(),
+        output_dir: dir,
         extra_dirs: Vec::new(),
         allowed_tools: Vec::new(),
         disallowed_tools: super::disabled_tools(),
@@ -153,7 +158,7 @@ async fn judge_is_duplicate(
         cache_1h: false,
         // A one-shot yes/no over two short texts: cheap model, shallow thinking.
         effort: Effort::Low,
-        model: Some(ctx.config.report.dedupe_model().to_string()),
+        model: ctx.config.stage_model("skip-reported"),
         stream_log_path: Some(
             ctx.artifacts
                 .log_path(&format!("skip-reported-{}.jsonl", finding.id)),
@@ -184,27 +189,11 @@ fn signature_of_finding(f: &Finding) -> String {
     format!("{} {} {}", f.title, f.location, f.attack_class)
 }
 
-/// The signature of an already-reported finding, from what the sink recovered.
+/// The signature of an already-reported finding: the same fields as
+/// [`signature_of_finding`]. Scoring a short signature against a whole issue
+/// body would dilute every overlap below [`DUP_LOW`], so nothing ever matched.
 fn signature_of_existing(e: &ExistingReport) -> String {
-    format!("{} {}", e.title, e.text)
-}
-
-/// Split text into a lowercased set of alphanumeric word tokens.
-fn tokenize(s: &str) -> std::collections::HashSet<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 2)
-        .map(str::to_lowercase)
-        .collect()
-}
-
-/// Jaccard overlap of two token sets: |A ∩ B| / |A ∪ B|, in [0,1].
-fn jaccard(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f64 {
-    if a.is_empty() && b.is_empty() {
-        return 0.0;
-    }
-    let inter = a.intersection(b).count() as f64;
-    let union = a.union(b).count() as f64;
-    inter / union
+    format!("{} {} {}", e.title, e.location, e.attack_class)
 }
 
 #[cfg(test)]
@@ -257,6 +246,23 @@ mod tests {
         let s = sig("anything", "a.rs:1", "c");
         // No existing signatures → best score is 0 → distinct.
         assert_eq!(classify(&s, &[]), Band::Distinct);
+    }
+
+    #[test]
+    fn same_finding_filed_with_a_long_body_is_a_duplicate() {
+        let body = "## Description\n\n".to_string() + &"lots of prose ".repeat(40);
+        let existing = ExistingReport {
+            id: "old-T-0003-F01".into(),
+            title: "Unbounded alloc".into(),
+            location: "src/net.rs:42".into(),
+            attack_class: "resource exhaustion".into(),
+            text: body,
+        };
+        let s = sig("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
+        assert_eq!(
+            classify(&s, &[signature_of_existing(&existing)]),
+            Band::Duplicate
+        );
     }
 
     #[test]

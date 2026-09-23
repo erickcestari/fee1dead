@@ -5,7 +5,7 @@
 target_dir   = "/work/target"
 scratch_root = "/work/scratch"
 out_dir      = "/work/out"
-# Max hunters running at once.
+# Max agents running at once: hunters, and validate's review batches.
 concurrency  =10
 # Per-agent wall-clock timeout.
 agent_timeout_secs = 1800
@@ -71,7 +71,7 @@ default = "claude-code"
 
 [providers.claude-code]
 type       = "claude-code"
-model      = "claude-opus-4-8"
+model      = "claude-opus-5"
 # The container is the security boundary, so the agent runs unrestricted.
 extra_args = ["--dangerously-skip-permissions"]
 # Optional: stop starting agents once the account's weekly usage reaches this
@@ -88,7 +88,7 @@ extra_args = ["--dangerously-skip-permissions"]
 type    = "opencode"
 # opencode's provider/model form — a bare model id is rejected at config load.
 # `opencode models` lists what your auth can reach.
-model   = "anthropic/claude-opus-4-5"
+model   = "anthropic/claude-opus-5"
 # Optional: a configured opencode agent (`--agent`) to run as.
 # agent = "build"
 # Optional: provider-specific reasoning effort (`--variant`), e.g. high | max |
@@ -144,8 +144,7 @@ path = "/work/out/findings.db"
 # The github sink needs api.github.com in [firewall].allow.
 # Before filing, new findings are deduped against issues already filed: a
 # token-overlap score decides the clear cases, and only ambiguous pairs go to a
-# lightweight judge model (defaults to claude-haiku-4-5; override below).
-# dedupe_model = "claude-haiku-4-5"
+# lightweight judge model (the skip-reported model under [stages.models]).
 
 # Cross-run feedback memory (see [stages] "feedback").
 [feedback]
@@ -154,13 +153,23 @@ max_seeds = 200
 
 [stages]
 # Stages run in the listed order; a stage name may repeat. To exploit gapfill,
-# run hunt again after it, e.g.:
-#   ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "aggregate", "validate", "report", "feedback"]
+# run hunt again after it, as below.
 # skip-reported drops candidates already reported in the sink (e.g. filed as
 # GitHub issues) BEFORE validate, so no validation tokens are spent re-reviewing
 # findings a past run already surfaced. It is a no-op unless report.sink tracks
 # external state (the github sink), so it is safe to leave in the list.
-# feedback runs last: it distils this run into feedback-seeds.jsonl, which the
-# next run's recon merges back into the queue. Keep the same out_dir to retain
-# that memory across runs.
-enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "aggregate", "validate", "report", "feedback"]
+# feedback distils this run into feedback-seeds.jsonl, which the next run's
+# recon reads as leads. Keep the same out_dir to retain that memory across runs.
+# aggregate runs last so findings.json carries every verdict; it needs no agent,
+# so it completes even after a failed stage.
+enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "validate", "report", "feedback", "aggregate"]
+
+# Optional per-stage model, in the provider's own id form; unset stages use the
+# provider's `model`. Keys: recon, hunt, validate, skip-reported. Forked hunters
+# reuse recon's prompt cache only on the same model (caches are per model), so
+# keep hunt and recon on one model unless a measurement says otherwise. The
+# skip-reported judge answers yes/no over two short texts; on claude-code it
+# defaults to claude-haiku-4-5.
+# [stages.models]
+# validate      = "claude-opus-5"
+# skip-reported = "claude-haiku-4-5"

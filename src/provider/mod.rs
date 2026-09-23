@@ -10,6 +10,7 @@ mod generic_exec;
 #[cfg(any(test, feature = "mock-runner"))]
 mod mock;
 mod opencode;
+mod retry;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,13 +26,24 @@ use crate::config::ProviderConfig;
 /// error.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
-    /// The backend rejected the request because an account usage / session /
-    /// rate limit was reached, or the operator's own usage cap was. Retrying
-    /// immediately just bounces off the same limit, so a stage that sees this
-    /// should stop spawning new agents rather than burn the rest of its queue
-    /// on certain failures.
+    /// The account's usage / session / weekly quota is spent, or the
+    /// operator's own usage cap was reached. Retrying before it resets just
+    /// bounces off the same limit, so a stage that sees this should stop
+    /// spawning new agents rather than burn the rest of its queue on certain
+    /// failures.
     #[error("usage limit reached: {0}")]
     UsageLimited(String),
+    /// The backend is throttling requests (429 / overloaded) regardless of the
+    /// account's quota, e.g. when forked hunters start in a burst. Transient:
+    /// retried after a backoff (see [`RetryOnRateLimit`]), never a reason to
+    /// stop the run.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+    /// The agent ran past its wall-clock timeout and was killed. Its partial
+    /// transcript is kept, and `session_id` (when the stream got far enough to
+    /// report one) lets a stage resume it to salvage the work done so far.
+    #[error("agent timed out (partial stream log kept)")]
+    TimedOut { session_id: Option<String> },
 }
 
 /// Whether an error chain carries a [`ProviderError::UsageLimited`].
@@ -40,18 +52,33 @@ pub fn is_usage_limited(err: &anyhow::Error) -> bool {
         .is_some_and(|e| matches!(e, ProviderError::UsageLimited(_)))
 }
 
+/// Whether an error chain carries a [`ProviderError::RateLimited`].
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ProviderError>()
+        .is_some_and(|e| matches!(e, ProviderError::RateLimited(_)))
+}
+
+/// The session of an agent that timed out, when the error is a
+/// [`ProviderError::TimedOut`] that recorded one.
+pub fn timed_out_session(err: &anyhow::Error) -> Option<String> {
+    match err.downcast_ref::<ProviderError>()? {
+        ProviderError::TimedOut { session_id } => session_id.clone(),
+        _ => None,
+    }
+}
+
 /// Filename the agent is instructed to write its complete final answer to,
-/// inside its working dir. The harness reads this back as the agent's result,
-/// so the consumed output is decoupled from the streamed event log (and survives
-/// even if the chat output is noisy). A `.json` file because every stage's final
-/// answer is a bare JSON document (no markdown fence). Defined once here because
-/// it is a contract shared between the prompt instruction and the read-back; see
-/// [`final_output_path`].
+/// inside its [`AgentRequest::output_dir`]. The harness reads this back as the
+/// agent's result, so the consumed output is decoupled from the streamed event
+/// log (and survives even if the chat output is noisy). A `.json` file because
+/// every stage's final answer is a bare JSON document (no markdown fence).
+/// Defined once here because it is a contract shared between the prompt
+/// instruction and the read-back; see [`final_output_path`].
 pub const FINAL_OUTPUT_FILE: &str = "agent-final-output.json";
 
-/// Absolute path of the agent's final-output file for a given working dir.
-pub fn final_output_path(working_dir: &Path) -> PathBuf {
-    working_dir.join(FINAL_OUTPUT_FILE)
+/// Absolute path of the agent's final-output file for a given output dir.
+pub fn final_output_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(FINAL_OUTPUT_FILE)
 }
 
 /// Append the "write your final answer to a file" instruction to the user
@@ -59,18 +86,35 @@ pub fn final_output_path(working_dir: &Path) -> PathBuf {
 /// the harness reads results back through (see [`FINAL_OUTPUT_FILE`]).
 ///
 /// It goes in the per-agent user prompt — never a shared system prefix — on
-/// purpose: the path is per-agent (the working dir), so injecting it into the
-/// cached system prompt would bust the cross-fork cache the whole design relies
-/// on. A new user turn is uncached regardless, so this costs nothing extra.
-pub(crate) fn with_final_output_instruction(prompt: &str, working_dir: &Path) -> String {
-    let path = final_output_path(working_dir);
+/// purpose: the path is per-agent, so injecting it into the cached system
+/// prompt would bust the cross-fork cache the whole design relies on. A new
+/// user turn is uncached regardless, so this costs nothing extra.
+pub(crate) fn with_final_output_instruction(prompt: &str, output_dir: &Path) -> String {
+    let path = final_output_path(output_dir);
     format!(
         "{prompt}\n\n---\nWhen you are finished, use the Write tool to save your \
-         COMPLETE final answer — the exact content you would otherwise print, \
-         verbatim and in full — to this file:\n  {}\nThat file, not your chat \
-         output, is what gets consumed downstream, so it must stand on its own.",
+         complete final answer to this file:\n  {}\nThe harness reads that file, \
+         not your chat output, so it must stand on its own. After writing it, \
+         reply with only the word `done`: repeating the answer in chat would \
+         pay for all of its tokens a second time.",
         path.display()
     )
+}
+
+/// Remove any final-output file left in the request's output dir (creating the
+/// dir if needed), so the read-back can only ever see this run's answer. Without
+/// it, an agent that fails to write the file would be credited with whatever a
+/// previous agent left there.
+pub(crate) async fn clear_final_output(req: &AgentRequest) -> Result<()> {
+    fs::create_dir_all(&req.output_dir)
+        .await
+        .with_context(|| format!("creating output dir {}", req.output_dir.display()))?;
+    let path = final_output_path(&req.output_dir);
+    match fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing stale {}", path.display())),
+    }
 }
 
 /// Read back the answer the agent was told to write to [`FINAL_OUTPUT_FILE`],
@@ -81,7 +125,7 @@ pub(crate) fn with_final_output_instruction(prompt: &str, working_dir: &Path) ->
 /// when the agent forgot to write the file (or lacked a write tool), so a stray
 /// run still makes progress. Mirroring is best-effort: it must never fail a run.
 pub(crate) async fn read_final_output(req: &AgentRequest, fallback: &str) -> String {
-    let final_path = final_output_path(&req.working_dir);
+    let final_path = final_output_path(&req.output_dir);
     let output = match fs::read_to_string(&final_path).await {
         Ok(s) if !s.trim().is_empty() => s,
         _ => {
@@ -121,20 +165,33 @@ pub(crate) async fn open_log(path: &Path) -> Result<fs::File> {
         .with_context(|| format!("creating stream log {}", path.display()))
 }
 
-/// Heuristic: does an error message describe a usage/session/rate limit?
+/// Classify a CLI error message as an account quota or a transient throttle.
 ///
 /// Matched against the human strings the CLIs surface, e.g. claude's "You've hit
-/// your session limit · resets 2:50am" or an upstream provider's "rate limit
-/// exceeded". Kept deliberately broad-but-anchored on the word "limit" so a new
-/// phrasing still trips it without matching unrelated errors.
-pub(crate) fn is_usage_limit_message(msg: &str) -> bool {
+/// your session limit · resets 2:50am" (quota) or an API "rate_limit_error"
+/// (throttle). The two need opposite handling: a quota stops the run until it
+/// resets, a throttle is retried after a backoff. Claude labels server-side
+/// throttling "not your usage limit", which must not read as a quota.
+pub(crate) fn limit_error(msg: &str) -> Option<ProviderError> {
     let m = msg.to_lowercase();
-    m.contains("limit")
-        && (m.contains("session")
-            || m.contains("usage")
-            || m.contains("rate")
-            || m.contains("hit your")
-            || m.contains("resets"))
+    let quota = !m.contains("not your usage limit")
+        && m.contains("limit")
+        && ["session", "usage", "weekly", "hit your", "resets"]
+            .iter()
+            .any(|w| m.contains(w));
+    if quota {
+        return Some(ProviderError::UsageLimited(msg.to_string()));
+    }
+    let throttled = [
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "overloaded",
+        "temporarily limiting",
+    ]
+    .iter()
+    .any(|w| m.contains(w));
+    throttled.then(|| ProviderError::RateLimited(msg.to_string()))
 }
 
 pub use claude_code::ClaudeCodeRunner;
@@ -142,6 +199,7 @@ pub use generic_exec::ExecRunner;
 #[cfg(any(test, feature = "mock-runner"))]
 pub use mock::{CannedReply, MockRunner};
 pub use opencode::OpenCodeRunner;
+pub use retry::RetryOnRateLimit;
 
 /// Reasoning effort for an agent run, mapped to `CLAUDE_CODE_EFFORT_LEVEL`.
 ///
@@ -178,6 +236,11 @@ pub struct AgentRequest {
     pub system: Option<String>,
     /// The directory the agent runs in (its per-task scratch dir).
     pub working_dir: PathBuf,
+    /// Private directory the agent writes its final answer into (see
+    /// [`FINAL_OUTPUT_FILE`]). Must be unique per agent run: the provider clears
+    /// the answer file before the run and reads it back after, so two agents
+    /// sharing it could be credited with each other's answer.
+    pub output_dir: PathBuf,
     /// Extra directories the agent may read beyond `working_dir` (e.g. the
     /// cloned reference repo). Providers that gate file access by directory add
     /// each one; others ignore them.
@@ -223,6 +286,17 @@ pub struct AgentRequest {
 pub struct ResumeSession {
     pub session_id: String,
     pub project_dir: PathBuf,
+}
+
+impl AgentRequest {
+    /// The directory this request's own session lives in, for forking it
+    /// later: a fork runs (and stores its session) in the forked session's
+    /// project dir, a fresh run in its working dir.
+    pub fn session_dir(&self) -> &Path {
+        self.resume
+            .as_ref()
+            .map_or(&self.working_dir, |r| &r.project_dir)
+    }
 }
 
 /// The result of an agent run.
@@ -302,13 +376,15 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[test]
-    fn final_output_instruction_keeps_prompt_and_points_at_working_dir() {
+    fn final_output_instruction_keeps_prompt_and_points_at_output_dir() {
         let out = with_final_output_instruction("do the thing", Path::new("/work/scratch/t1"));
         // Original prompt is preserved verbatim at the front.
         assert!(out.starts_with("do the thing"));
         // And the agent is pointed at the file the harness will read back.
         assert!(out.contains("/work/scratch/t1/agent-final-output.json"));
         assert!(out.contains("Write tool"));
+        // The answer must not be repeated in chat, doubling its output tokens.
+        assert!(out.contains("reply with only the word `done`"));
     }
 
     #[test]
@@ -320,19 +396,47 @@ mod tests {
         );
     }
 
+    fn is_quota(msg: &str) -> bool {
+        matches!(limit_error(msg), Some(ProviderError::UsageLimited(_)))
+    }
+
+    fn is_throttle(msg: &str) -> bool {
+        matches!(limit_error(msg), Some(ProviderError::RateLimited(_)))
+    }
+
     #[test]
-    fn detects_usage_limit_messages_only() {
-        // The real strings the CLIs emit for a depleted account.
-        assert!(is_usage_limit_message(
+    fn separates_account_quota_from_transient_throttling() {
+        // A depleted account: stop spawning until it resets.
+        assert!(is_quota(
             "You've hit your session limit · resets 2:50am (UTC)"
         ));
-        assert!(is_usage_limit_message("Usage limit reached"));
-        assert!(is_usage_limit_message("rate limit exceeded, please retry"));
-        // Ordinary failures must NOT be classified as a usage limit, or the
-        // stage would abort on a one-off error.
-        assert!(!is_usage_limit_message("hunter output was not valid json"));
-        assert!(!is_usage_limit_message("file not found"));
-        assert!(!is_usage_limit_message(""));
+        assert!(is_quota("Usage limit reached"));
+        assert!(is_quota("Weekly limit reached ∙ resets Mon 9am"));
+        // Server-side throttling: back off and retry, never stop the run.
+        assert!(is_throttle("rate limit exceeded, please retry"));
+        assert!(is_throttle(
+            r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}"#
+        ));
+        assert!(is_throttle(
+            "Server is temporarily limiting requests (not your usage limit)"
+        ));
+        assert!(is_throttle("overloaded_error"));
+        // Ordinary failures are neither, or a one-off error would stop a stage.
+        assert!(limit_error("hunter output was not valid json").is_none());
+        assert!(limit_error("file not found").is_none());
+        assert!(limit_error("").is_none());
+    }
+
+    #[test]
+    fn a_timeout_exposes_its_session_for_salvage() {
+        let err: anyhow::Error = ProviderError::TimedOut {
+            session_id: Some("s-1".into()),
+        }
+        .into();
+        assert_eq!(timed_out_session(&err).as_deref(), Some("s-1"));
+        let early: anyhow::Error = ProviderError::TimedOut { session_id: None }.into();
+        assert_eq!(timed_out_session(&early), None);
+        assert_eq!(timed_out_session(&anyhow::anyhow!("boom")), None);
     }
 
     #[test]
@@ -340,8 +444,10 @@ mod tests {
         let err: anyhow::Error =
             ProviderError::UsageLimited("hit your session limit".into()).into();
         assert!(is_usage_limited(&err));
-        // A plain error is not a usage limit.
+        assert!(!is_rate_limited(&err));
+        // A plain error is neither.
         assert!(!is_usage_limited(&anyhow::anyhow!("boom")));
+        assert!(!is_rate_limited(&anyhow::anyhow!("boom")));
     }
 
     #[tokio::test]
@@ -354,19 +460,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
     }
 
-    #[tokio::test]
-    async fn final_output_file_wins_over_the_fallback_and_is_mirrored() {
-        let dir = tempfile::tempdir().unwrap();
-        let working_dir = dir.path().join("scratch");
-        std::fs::create_dir_all(&working_dir).unwrap();
-        std::fs::write(final_output_path(&working_dir), "{\"findings\":[]}").unwrap();
-        let log = dir.path().join("logs").join("hunt-T-0001.jsonl");
-        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-
-        let req = AgentRequest {
+    /// A request whose working and output dirs are both `dir`.
+    fn req_in(dir: &Path, stream_log_path: Option<PathBuf>) -> AgentRequest {
+        AgentRequest {
             prompt: "find bugs".into(),
             system: None,
-            working_dir,
+            working_dir: dir.to_path_buf(),
+            output_dir: dir.to_path_buf(),
             extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
@@ -375,8 +475,20 @@ mod tests {
             cache_1h: false,
             effort: Effort::Low,
             model: None,
-            stream_log_path: Some(log.clone()),
-        };
+            stream_log_path,
+        }
+    }
+
+    #[tokio::test]
+    async fn final_output_file_wins_over_the_fallback_and_is_mirrored() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("scratch");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(final_output_path(&output_dir), "{\"findings\":[]}").unwrap();
+        let log = dir.path().join("logs").join("hunt-T-0001.jsonl");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+
+        let req = req_in(&output_dir, Some(log.clone()));
         let out = read_final_output(&req, "chat text").await;
         assert_eq!(out, "{\"findings\":[]}");
         // Mirrored beside the transcript so the answer is visible in the out dir.
@@ -389,20 +501,26 @@ mod tests {
     #[tokio::test]
     async fn missing_final_output_falls_back_to_the_provider_message() {
         let dir = tempfile::tempdir().unwrap();
-        let req = AgentRequest {
-            prompt: "find bugs".into(),
-            system: None,
-            working_dir: dir.path().to_path_buf(),
-            extra_dirs: Vec::new(),
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
-            timeout: Duration::from_secs(1),
-            resume: None,
-            cache_1h: false,
-            effort: Effort::Low,
-            model: None,
-            stream_log_path: None,
-        };
+        let req = req_in(dir.path(), None);
         assert_eq!(read_final_output(&req, "chat text").await, "chat text");
+    }
+
+    #[tokio::test]
+    async fn a_previous_agents_answer_is_never_read_back() {
+        // A stale answer from an earlier agent in the same dir must be cleared,
+        // so an agent that writes nothing falls back instead of inheriting it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(final_output_path(dir.path()), "{\"duplicate\": true}").unwrap();
+        let req = req_in(dir.path(), None);
+        clear_final_output(&req).await.unwrap();
+        assert_eq!(read_final_output(&req, "chat text").await, "chat text");
+    }
+
+    #[tokio::test]
+    async fn clearing_creates_a_missing_output_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = req_in(&dir.path().join("agents").join("recon"), None);
+        clear_final_output(&req).await.unwrap();
+        assert!(req.output_dir.is_dir());
     }
 }

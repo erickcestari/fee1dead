@@ -4,9 +4,11 @@
 
 use std::sync::Arc;
 
+use fee1dead::artifacts::extract_json_block;
 use fee1dead::config::Config;
 use fee1dead::pipeline::Pipeline;
-use fee1dead::provider::{CannedReply, MockRunner};
+use fee1dead::provider::{AgentRequest, AgentResult, AgentRunner, CannedReply, MockRunner};
+use serde_json::{Value, json};
 
 /// Canned agent responses keyed by a substring unique to each stage's prompt.
 fn replies() -> Vec<CannedReply> {
@@ -33,6 +35,7 @@ fn replies() -> Vec<CannedReply> {
 }"#
                 .into(),
             session_id: Some(RECON_SESSION_ID.into()),
+            render: None,
         },
         // Hunter: one finding (with confidence), one gap.
         CannedReply {
@@ -49,35 +52,36 @@ fn replies() -> Vec<CannedReply> {
 ```"#
                 .into(),
             session_id: None,
+            render: None,
         },
-        // Reviewer: batched verdict array, keyed by finding_id. Confirms it.
+        // Reviewer: confirms every finding, echoing the run-scoped ids.
         CannedReply {
             match_substr: Some("You are the Reviewer".into()),
-            stdout: r#"```json
-[{"finding_id": "T-0001-F01", "verdict": "confirmed", "evidence": "len*4 wraps for len > u32::MAX/4"}]
-```"#
-                .into(),
+            stdout: String::new(),
             session_id: None,
-        },
-        // Report: batched array of schema-valid records, keyed by id.
-        CannedReply {
-            match_substr: Some("You are the Report agent".into()),
-            stdout: r#"```json
-[{
-  "id": "T-0001-F01",
-  "title": "unchecked add overflows length",
-  "attack_class": "integer overflow",
-  "severity": "high",
-  "location": "src/parse.rs:42",
-  "description": "attacker-controlled length added without bounds check",
-  "impact": "heap buffer overflow leading to RCE",
-  "recommendation": "use checked_add and reject oversized lengths"
-}]
-```"#
-                .into(),
-            session_id: None,
+            render: Some(confirm_all),
         },
     ]
+}
+
+/// The findings a review prompt embeds: its first ```json block.
+fn prompt_findings(prompt: &str) -> Vec<Value> {
+    serde_json::from_str(extract_json_block(prompt).unwrap()).unwrap()
+}
+
+fn confirm_all(prompt: &str) -> String {
+    let reviews: Vec<Value> = prompt_findings(prompt)
+        .iter()
+        .map(|f| {
+            json!({
+                "finding_id": f["finding_id"], "verdict": "confirmed",
+                "evidence": "len*4 wraps for len > u32::MAX/4",
+                "impact": "heap buffer overflow leading to RCE",
+                "recommendation": "use checked_add and reject oversized lengths"
+            })
+        })
+        .collect();
+    serde_json::to_string(&reviews).unwrap()
 }
 
 /// Session id the mock recon agent reports; hunters must fork from it.
@@ -161,15 +165,21 @@ async fn full_skeleton_pipeline_with_mock() {
     let jsonl = std::fs::read_to_string(out.join("findings.jsonl")).unwrap();
     let lines: Vec<&str> = jsonl.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1, "expected one finding in the JSONL tee");
-    let payload: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let payload: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(payload["severity"], "high");
+    // The report is built from the reviewer's own impact and recommendation.
+    assert_eq!(payload["impact"], "heap buffer overflow leading to RCE");
+    assert_eq!(payload["verdict"], "confirmed");
+    // Finding ids carry the run id, so they never collide with a past run's.
+    let run_id = std::fs::read_to_string(out.join("run-id.txt")).unwrap();
+    assert_eq!(payload["id"], format!("{}-T-0001-F01", run_id.trim()));
 }
 
 /// The feedback loop: run 1 writes seeds; run 2's recon merges them, so the
 /// second run starts with more tasks than recon alone produced.
 #[tokio::test]
-async fn feedback_carries_seeds_into_next_run() {
-    use fee1dead::domain::{Task, TaskOrigin};
+async fn feedback_seeds_reach_the_next_recon_as_leads() {
+    use fee1dead::domain::Task;
 
     let tmp = tempfile::tempdir().unwrap();
     let target = tmp.path().join("target");
@@ -201,27 +211,36 @@ async fn feedback_carries_seeds_into_next_run() {
     let seeds: Vec<Task> = read_jsonl(&out.join("feedback-seeds.jsonl"));
     assert_eq!(seeds.len(), 2, "expected one variant seed + one gap seed");
 
-    // Run 2: reuses the same out_dir; recon must merge the 2 carried seeds.
-    let cfg = Config::load(&cfg_path).unwrap();
-    Pipeline::with_runner(cfg, Arc::new(MockRunner::new(replies())))
+    // Run 2 stops after recon: the seeds are in its prompt as leads, not
+    // queued directly, and recon consumed them.
+    std::fs::write(
+        &cfg_path,
+        std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace(r#""recon", "hunt", "validate", "feedback""#, r#""recon""#),
+    )
+    .unwrap();
+    let runner = Arc::new(MockRunner::new(replies()));
+    Pipeline::with_runner(Config::load(&cfg_path).unwrap(), runner.clone())
         .unwrap()
         .run()
         .await
         .unwrap();
 
+    let recon_prompt = runner.seen.lock().unwrap()[0].clone();
+    assert!(
+        recon_prompt.contains("<leads>"),
+        "no leads block in recon's prompt"
+    );
+    assert!(
+        recon_prompt.contains("src/parse.rs error path"),
+        "gap seed missing"
+    );
+    assert!(recon_prompt.contains("variant"), "variant seed missing");
     let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
-    assert_eq!(
-        queue.len(),
-        3,
-        "1 fresh recon task + 2 carried feedback seeds"
-    );
-    assert_eq!(
-        queue
-            .iter()
-            .filter(|t| t.origin == TaskOrigin::Feedback)
-            .count(),
-        2
-    );
+    assert_eq!(queue.len(), 1, "only recon's own tasks are queued");
+    let left: Vec<Task> = read_jsonl(&out.join("feedback-seeds.jsonl"));
+    assert!(left.is_empty(), "recon consumes the seeds it was shown");
 }
 
 /// Recon records its session id, and the hunter forks from it.
@@ -309,4 +328,183 @@ fn read_jsonl<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Vec<T> 
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
+}
+
+/// Writes a config for `stages` under `tmp` and returns (config, out_dir).
+fn setup(tmp: &std::path::Path, stages: &str) -> (Config, std::path::PathBuf) {
+    let target = tmp.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = tmp.join("out");
+    let cfg_path = tmp.join("harness.toml");
+    std::fs::write(
+        &cfg_path,
+        config_toml(
+            target.to_str().unwrap(),
+            tmp.join("scratch").to_str().unwrap(),
+            out.to_str().unwrap(),
+            out.join("findings.db").to_str().unwrap(),
+            stages,
+        )
+        .replace("concurrency = 4", "concurrency = 1\nhunter_stagger_ms = 0"),
+    )
+    .unwrap();
+    (Config::load(&cfg_path).unwrap(), out)
+}
+
+/// The mock replies, with recon queueing three hunt tasks instead of one.
+fn three_task_replies() -> Vec<CannedReply> {
+    let mut replies = replies();
+    replies[0].stdout = r#"{"hunt_tasks":[
+        {"attack_class":"integer overflow","scope_paths":["src/parse.rs"]},
+        {"attack_class":"panic-dos","scope_paths":["src/net.rs"]},
+        {"attack_class":"auth-bypass","scope_paths":["src/rpc.rs"]}
+    ]}"#
+    .into();
+    replies
+}
+
+/// Counts, at each hunter start, the candidates already on disk.
+struct CandidateProbe {
+    inner: MockRunner,
+    candidates: std::path::PathBuf,
+    on_disk_at_start: std::sync::Mutex<Vec<usize>>,
+}
+
+#[async_trait::async_trait]
+impl AgentRunner for CandidateProbe {
+    fn name(&self) -> &str {
+        "probe"
+    }
+
+    async fn run(&self, req: AgentRequest) -> anyhow::Result<AgentResult> {
+        if req.prompt.contains("You are a Hunter") {
+            let n = std::fs::read_to_string(&self.candidates)
+                .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                .unwrap_or(0);
+            self.on_disk_at_start.lock().unwrap().push(n);
+        }
+        self.inner.run(req).await
+    }
+}
+
+/// A finished hunter's findings are on disk before the next hunter starts, so
+/// a crash mid-hunt cannot take them with it.
+#[tokio::test]
+async fn each_hunter_is_persisted_before_the_next_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt""#);
+    let probe = Arc::new(CandidateProbe {
+        inner: MockRunner::new(three_task_replies()),
+        candidates: out.join("candidates.jsonl"),
+        on_disk_at_start: Default::default(),
+    });
+    Pipeline::with_runner(cfg, probe.clone())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(*probe.on_disk_at_start.lock().unwrap(), vec![0, 1, 2]);
+}
+
+/// `--resume` continues a stopped run: recon is skipped, the queue it left is
+/// hunted, and the run keeps its id.
+#[tokio::test]
+async fn resume_hunts_the_pending_queue_without_rerunning_recon() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Run 1 stops after recon (as a usage limit before hunt would leave it).
+    let (cfg, out) = setup(tmp.path(), r#""recon""#);
+    Pipeline::with_runner(cfg, Arc::new(MockRunner::new(replies())))
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    let run_id = std::fs::read_to_string(out.join("run-id.txt")).unwrap();
+
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let runner = Arc::new(MockRunner::new(replies()));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .resume()
+        .await
+        .unwrap();
+
+    let seen = runner.seen.lock().unwrap();
+    assert!(
+        !seen.iter().any(|p| p.contains("reconnaissance phase")),
+        "resume must not rerun recon"
+    );
+    let candidates: Vec<Value> = read_jsonl(&out.join("candidates.jsonl"));
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(out.join("run-id.txt")).unwrap(),
+        run_id
+    );
+}
+
+#[tokio::test]
+async fn resume_without_a_prior_run_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let err = Pipeline::with_runner(cfg, Arc::new(MockRunner::new(replies())))
+        .unwrap()
+        .resume()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("nothing to resume"), "got: {err}");
+}
+
+/// A failed stage is reported but does not stop the stages after it.
+#[tokio::test]
+async fn a_failed_stage_does_not_stop_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "validate", "feedback""#);
+    // No reviewer reply: the validate agent fails.
+    let mut replies = replies();
+    replies.retain(|r| r.match_substr.as_deref() != Some("You are the Reviewer"));
+    let err = Pipeline::with_runner(cfg, Arc::new(MockRunner::new(replies)))
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("validate"), "got: {err}");
+    // Feedback still ran and recorded the hunter's gap for the next run.
+    let seeds: Vec<Value> = read_jsonl(&out.join("feedback-seeds.jsonl"));
+    assert_eq!(seeds.len(), 1);
+}
+
+/// A hunter whose answer does not parse is resumed once to rewrite it, and its
+/// finding is kept instead of the whole task being discarded.
+#[tokio::test]
+async fn a_malformed_hunter_answer_is_repaired_not_discarded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt""#);
+    let mut replies = replies();
+    let hunter = replies
+        .iter_mut()
+        .find(|r| r.match_substr.as_deref() == Some("You are a Hunter"))
+        .unwrap();
+    let good = std::mem::replace(&mut hunter.stdout, "{\"findings\": [ oops".into());
+    hunter.session_id = Some("hunter-sess".into());
+    replies.push(CannedReply {
+        match_substr: Some("could not use the final answer".into()),
+        stdout: good,
+        session_id: None,
+        render: None,
+    });
+
+    let runner = Arc::new(MockRunner::new(replies));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+
+    let candidates: Vec<Value> = read_jsonl(&out.join("candidates.jsonl"));
+    assert_eq!(candidates.len(), 1, "the repaired answer's finding is kept");
+    let resumes = runner.seen_resume.lock().unwrap();
+    assert_eq!(
+        resumes.last().unwrap().as_deref(),
+        Some("hunter-sess"),
+        "the repair forks the hunter's own session"
+    );
 }

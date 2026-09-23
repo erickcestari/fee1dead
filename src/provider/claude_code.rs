@@ -1,4 +1,4 @@
-//! Claude Code CLI adapter — the only built-in provider implementation.
+//! Claude Code CLI adapter.
 //!
 //! Invokes `claude -p <prompt> --output-format stream-json --verbose ...` and
 //! consumes the event stream line by line, teeing it to a per-agent log file as
@@ -19,8 +19,8 @@ use tokio::process::Command;
 use tracing::warn;
 
 use super::{
-    AgentRequest, AgentResult, AgentRunner, is_usage_limit_message, open_log, read_final_output,
-    with_final_output_instruction,
+    AgentRequest, AgentResult, AgentRunner, clear_final_output, limit_error, open_log,
+    read_final_output, with_final_output_instruction,
 };
 
 /// Environment applied to every `claude` invocation, regardless of stage. These
@@ -48,7 +48,7 @@ const BASE_ENV: &[(&str, &str)] = &[
 
 /// Extend the prompt-cache TTL from 5m to 1h. Set only for a session that is
 /// *forked from* and whose prefix must outlive the 5m window — i.e. recon, which
-/// every hunter (and the validate/report agents) forks. Recon runs at
+/// every hunter forks. Hunters run at
 /// `concurrency` 10+ with per-agent timeouts of 30–40 minutes, so under the
 /// default 5m TTL its prefix expires before most forked agents start, re-billing
 /// recon's whole context at full input rates instead of cache-read rates.
@@ -114,7 +114,7 @@ fn reached_cap(utilization: f64, cap_pct: u8) -> bool {
 ///
 /// Factored out of [`ClaudeCodeRunner::run`] so the flag wiring — in particular
 /// the cache-stabilization flag every forked stage depends on — is unit-testable
-/// without spawning a process. The cache env (`CACHE_ENV`) is applied separately
+/// without spawning a process. The env ([`agent_env`]) is applied separately
 /// at spawn time; it is not part of the argv.
 fn build_invocation(
     req: &AgentRequest,
@@ -123,7 +123,7 @@ fn build_invocation(
 ) -> (Vec<String>, std::path::PathBuf) {
     let mut args = vec![
         "-p".to_string(),
-        with_final_output_instruction(&req.prompt, &req.working_dir),
+        with_final_output_instruction(&req.prompt, &req.output_dir),
         // Stream the event log so a long-running (or timed-out) agent can be
         // teed to disk live; `--verbose` is required for stream-json under -p.
         "--output-format".to_string(),
@@ -142,8 +142,12 @@ fn build_invocation(
         "--exclude-dynamic-system-prompt-sections".to_string(),
     ];
 
-    // Extra readable dirs (e.g. the cloned reference repo) so the agent can read
-    // them without a permission prompt.
+    // The answer file's dir must be writable, and extra readable dirs (e.g. the
+    // cloned reference repo) readable, without a permission prompt.
+    if req.output_dir != req.working_dir {
+        args.push("--add-dir".to_string());
+        args.push(req.output_dir.to_string_lossy().into_owned());
+    }
     for dir in &req.extra_dirs {
         args.push("--add-dir".to_string());
         args.push(dir.to_string_lossy().into_owned());
@@ -195,6 +199,7 @@ impl AgentRunner for ClaudeCodeRunner {
         // provider's configured model; otherwise fall back to the configured one.
         let model = req.model.as_deref().or(self.model.as_deref());
         let (args, cwd) = build_invocation(&req, model, &self.extra_args);
+        clear_final_output(&req).await?;
 
         let mut cmd = Command::new("claude");
         cmd.args(&args);
@@ -237,6 +242,9 @@ impl AgentRunner for ClaudeCodeRunner {
         // final `result` event (the only one carrying cost/usage/session id).
         let mut lines = BufReader::new(stdout).lines();
         let mut result_event: Option<serde_json::Value> = None;
+        // Every event carries the session id, starting with the init event, so
+        // a timed-out agent can still be resumed.
+        let mut session_id: Option<String> = None;
         // The weekly cap gates agent *starts*: only an agent's first reading is
         // checked, so one that crosses the cap mid-run still finishes instead of
         // throwing away the tokens it already spent.
@@ -254,6 +262,11 @@ impl AgentRunner for ClaudeCodeRunner {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue;
                 };
+                if session_id.is_none()
+                    && let Some(id) = v.get("session_id").and_then(|s| s.as_str())
+                {
+                    session_id = Some(id.to_owned());
+                }
                 if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                     result_event = Some(v);
                 } else if let Some(cap) = weekly_cap
@@ -272,10 +285,7 @@ impl AgentRunner for ClaudeCodeRunner {
         match tokio::time::timeout(req.timeout, pump).await {
             Err(_) => {
                 let _ = child.start_kill();
-                bail!(
-                    "provider '{}' timed out (partial stream log kept)",
-                    self.name
-                );
+                return Err(super::ProviderError::TimedOut { session_id }.into());
             }
             Ok(Err(e)) => {
                 return Err(e)
@@ -301,7 +311,23 @@ impl AgentRunner for ClaudeCodeRunner {
         let exit_code = status.code().unwrap_or(-1);
         let stderr_out = stderr_task.await.unwrap_or_default();
 
+        // claude reports usage/session/rate limits as a result event with
+        // is_error=true and a human message in `.result`, whatever its exit
+        // code, so read that before the exit code. Tag limits so the
+        // orchestrator can stop on a quota and back off on a throttle.
+        if let Some(event) = &result_event
+            && event.get("is_error").and_then(|v| v.as_bool()) == Some(true)
+        {
+            let msg = event.get("result").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(limit) = limit_error(msg) {
+                return Err(limit.into());
+            }
+            bail!("claude reported an error: {msg}");
+        }
         if exit_code != 0 {
+            if let Some(limit) = limit_error(&stderr_out) {
+                return Err(limit.into());
+            }
             bail!(
                 "claude exited with code {exit_code}: stderr=[{}]",
                 stderr_out.trim()
@@ -310,19 +336,6 @@ impl AgentRunner for ClaudeCodeRunner {
 
         let result_event = result_event
             .with_context(|| format!("claude stream for '{}' had no result event", self.name))?;
-        if result_event.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
-            // claude reports usage/session/rate limits as a successful-subtype
-            // result with is_error=true and a human message in `.result`. Tag
-            // those so the orchestrator can stop hammering a limited account.
-            let msg = result_event
-                .get("result")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if is_usage_limit_message(msg) {
-                return Err(super::ProviderError::UsageLimited(msg.to_string()).into());
-            }
-            bail!("claude reported an error: {msg}");
-        }
 
         // The agent was told to write its complete final answer to a file; that
         // is the result we consume, with the result event's text as the fallback.
@@ -338,7 +351,8 @@ impl AgentRunner for ClaudeCodeRunner {
         let session_id = result_event
             .get("session_id")
             .and_then(|v| v.as_str())
-            .map(str::to_owned);
+            .map(str::to_owned)
+            .or(session_id);
 
         Ok(AgentResult {
             stdout,
@@ -360,6 +374,7 @@ mod tests {
             prompt: "find bugs".into(),
             system: None,
             working_dir: PathBuf::from("/work/scratch/t1"),
+            output_dir: PathBuf::from("/work/scratch/t1"),
             extra_dirs: Vec::new(),
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
@@ -383,7 +398,7 @@ mod tests {
     fn base_invocation_always_stabilizes_cache_prefix() {
         // The whole point of the cache work: every invocation, forked or not,
         // must carry the prefix-stabilization flag or forks miss recon's cache.
-        let (args, cwd) = build_invocation(&req(), Some("claude-opus-4-8"), &[]);
+        let (args, cwd) = build_invocation(&req(), Some("claude-opus-5"), &[]);
         assert!(args.contains(&"--exclude-dynamic-system-prompt-sections".to_string()));
         // The prompt carries the original text plus the final-output instruction
         // (with the working dir's path), and the stream-json format is requested.
@@ -394,7 +409,7 @@ mod tests {
         assert_eq!(arg_after(&args, "--output-format"), Some("stream-json"));
         assert!(args.contains(&"--verbose".to_string()));
         assert_eq!(arg_after(&args, "--add-dir"), Some("/work/scratch/t1"));
-        assert_eq!(arg_after(&args, "--model"), Some("claude-opus-4-8"));
+        assert_eq!(arg_after(&args, "--model"), Some("claude-opus-5"));
         // No resume: run in the working dir, no --resume/--fork-session.
         assert_eq!(cwd, PathBuf::from("/work/scratch/t1"));
         assert!(!args.contains(&"--resume".to_string()));
@@ -420,6 +435,25 @@ mod tests {
             add_dirs,
             vec!["/work/scratch/t1", "/work/reference", "/work/spec"]
         );
+    }
+
+    #[test]
+    fn separate_output_dir_is_writable_and_named_in_the_prompt() {
+        // Recon/validate run in the (possibly read-only) target but answer into
+        // a private scratch dir.
+        let mut r = req();
+        r.working_dir = PathBuf::from("/work/target");
+        r.output_dir = PathBuf::from("/work/scratch/recon");
+        let (args, _) = build_invocation(&r, None, &[]);
+        let prompt = arg_after(&args, "-p").unwrap();
+        assert!(prompt.contains("/work/scratch/recon/agent-final-output.json"));
+        let add_dirs: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--add-dir")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        assert_eq!(add_dirs, vec!["/work/target", "/work/scratch/recon"]);
     }
 
     #[test]

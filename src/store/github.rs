@@ -136,11 +136,7 @@ impl ReportSink for GithubSink {
                 }
                 let title = issue.get("title").and_then(Value::as_str).unwrap_or("");
                 let body = issue.get("body").and_then(Value::as_str).unwrap_or("");
-                out.push(ExistingReport {
-                    id: marker_id(body).unwrap_or_default(),
-                    title: title.to_string(),
-                    text: format!("{title}\n{body}"),
-                });
+                out.push(existing_report(title, body));
             }
             if count < 100 {
                 break;
@@ -153,6 +149,39 @@ impl ReportSink for GithubSink {
 /// Cap on issue-list pages fetched for dedup, so a repo with a huge backlog
 /// cannot make the report stage page forever.
 const MAX_ISSUE_PAGES: u32 = 20;
+
+/// Recover the finding fields from an issue this sink filed (see
+/// [`issue_payload`] for the layout it parses back).
+fn existing_report(issue_title: &str, body: &str) -> ExistingReport {
+    // Issues edited in the web UI come back with CRLF line endings.
+    let body = body.replace("\r\n", "\n");
+    let title = issue_title
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(issue_title, |(_severity, title)| title);
+    ExistingReport {
+        id: marker_id(&body).unwrap_or_default(),
+        title: title.to_string(),
+        location: section(&body, "Location").trim_matches('`').to_string(),
+        attack_class: section(&body, "Attack class").to_string(),
+        text: format!("{issue_title}\n{body}"),
+    }
+}
+
+/// The text under a `## heading` of an issue body; empty when absent.
+fn section<'a>(body: &'a str, heading: &str) -> &'a str {
+    let open = format!("## {heading}\n\n");
+    let Some(start) = body.find(&open) else {
+        return "";
+    };
+    let rest = &body[start + open.len()..];
+    let end = [rest.find("\n\n## "), rest.find("<!--")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(rest.len());
+    rest[..end].trim()
+}
 
 /// Recover the finding id fee1dead stamped into an issue body, if present.
 fn marker_id(body: &str) -> Option<String> {
@@ -191,11 +220,21 @@ fn issue_payload(id: &str, finding: &Value) -> Value {
     section("Impact", get("impact"));
     section("Recommendation", get("recommendation"));
     section("Evidence", get("evidence"));
+    if !get("poc_path").is_empty() {
+        section(
+            "Proof of concept",
+            &format!("`{}` in the run's out dir", get("poc_path")),
+        );
+    }
     body.push_str(&marker(id));
 
     let mut labels = vec![SINK_LABEL.to_string()];
     if !severity.is_empty() {
         labels.push(format!("severity:{severity}"));
+    }
+    // The reviewer could not settle it: flag it so nobody acts on it unverified.
+    if get("verdict") == "needs_review" {
+        labels.push("needs-review".to_string());
     }
 
     json!({ "title": title, "body": body, "labels": labels })
@@ -244,6 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn unsettled_finding_is_labeled_and_poc_is_linked() {
+        let mut f = finding();
+        f["verdict"] = json!("needs_review");
+        f["poc_path"] = json!("pocs/F-1/poc.go");
+        let p = issue_payload("F-1", &f);
+        assert!(
+            p["labels"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("needs-review"))
+        );
+        assert!(p["body"].as_str().unwrap().contains("`pocs/F-1/poc.go`"));
+        // A confirmed finding carries no such label.
+        let p = issue_payload("F-1", &finding());
+        assert!(
+            !p["labels"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("needs-review"))
+        );
+    }
+
+    #[test]
     fn marker_id_round_trips_from_body() {
         // The id stamped into a body must be recoverable for dedup.
         let body = issue_payload("F-42", &finding())["body"]
@@ -253,6 +315,20 @@ mod tests {
         assert_eq!(marker_id(&body).as_deref(), Some("F-42"));
         // A body without a marker yields nothing.
         assert_eq!(marker_id("just some issue text"), None);
+    }
+
+    #[test]
+    fn filed_issue_parses_back_to_the_findings_own_fields() {
+        let p = issue_payload("F-1", &finding());
+        let e = existing_report(
+            p["title"].as_str().unwrap(),
+            &p["body"].as_str().unwrap().replace('\n', "\r\n"),
+        );
+        assert_eq!(e.id, "F-1");
+        assert_eq!(e.title, "Unbounded allocation");
+        assert_eq!(e.location, "src/net.rs:42");
+        assert_eq!(e.attack_class, "resource exhaustion");
+        assert!(e.text.contains("attacker crashes the node"));
     }
 
     #[test]

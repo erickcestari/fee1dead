@@ -101,18 +101,18 @@ RUN groupadd -o -g ${HOST_GID} agent && \
 # location `claude` auto-discovers, so they're invokable by name (fp-check,
 # spec-to-code-compliance, …). One plugin may ship several skills.
 #
-# Register ONLY the skills the pipeline actually routes to: recon names
-# audit-context-building/entry-point-analyzer, validate names fp-check, and the
-# recon hunt allow-list (prompts/recon.md) names the rest. Every registered skill
-# adds its name+description to each agent's system preamble, so keeping this list
-# tight cuts per-spawn tokens and stops recon suggesting skills that don't apply.
+# Register ONLY the skills the pipeline actually routes to: validate names
+# fp-check, and the recon hunt allow-list (prompts/recon.md) names the rest.
+# Recon itself uses none: every read it makes is re-billed to each forked
+# hunter. Every registered skill adds its name+description to each agent's
+# system preamble, so keeping this list tight cuts per-spawn tokens and stops
+# recon suggesting skills that don't apply.
 # The full vendored suite stays in /opt/skills for reference; widen the list here
 # when you widen the recon allow-list.
 COPY skills /opt/skills
 RUN mkdir -p /home/agent/.claude/skills && \
     for skill in \
         audit-context-building \
-        entry-point-analyzer \
         fp-check \
         sharp-edges \
         insecure-defaults \

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub run: RunConfig,
     /// Optional: clone the target into `run.target_dir` at startup instead of
@@ -33,9 +34,10 @@ pub struct Config {
 
 /// Controls the cross-run feedback memory. The Feedback stage distils each
 /// run's confirmed findings and unresolved gaps into durable seed tasks
-/// (`feedback-seeds.jsonl` in `out_dir`); the next run's Recon merges them into
-/// the hunt queue, so each run starts a little smarter.
+/// (`feedback-seeds.jsonl` in `out_dir`); the next run's Recon reads them as
+/// leads and queues the ones that pass its admission bar.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeedbackConfig {
     /// Cap on persisted seeds, so the memory cannot grow without bound.
     #[serde(default = "default_max_seeds")]
@@ -59,6 +61,7 @@ impl Default for FeedbackConfig {
 /// `[firewall].allow`). When unset, `run.target_dir` is expected to already
 /// contain the code (e.g. mounted into the container).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     /// Git URL to clone (https recommended so the firewall can scope it).
     #[serde(default)]
@@ -66,6 +69,11 @@ pub struct TargetConfig {
     /// Branch, tag, or commit SHA to check out. Defaults to the repo's default branch.
     #[serde(default, rename = "ref")]
     pub git_ref: Option<String>,
+    /// Shell commands run once in `run.target_dir` before any stage, e.g. to
+    /// warm the toolchain's package cache while the network is still reachable.
+    /// A failing command warns; the run continues.
+    #[serde(default)]
+    pub prepare: Vec<String>,
 }
 
 /// Optional reference repository: a specification or known-good implementation
@@ -75,6 +83,7 @@ pub struct TargetConfig {
 /// `repo` is unset. Like the target clone, the git host must be in
 /// `[firewall].allow`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceConfig {
     /// Git URL to clone. Unset disables the reference.
     #[serde(default)]
@@ -146,11 +155,12 @@ impl ReferenceConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub target_dir: PathBuf,
     pub scratch_root: PathBuf,
     pub out_dir: PathBuf,
-    /// Max hunters running concurrently.
+    /// Max agents (hunters, or review batches) running concurrently.
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     /// Per-agent wall-clock timeout in seconds.
@@ -236,6 +246,7 @@ fn default_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderSelection {
     pub default: String,
 }
@@ -243,7 +254,7 @@ pub struct ProviderSelection {
 /// A provider definition. `type` selects the adapter; remaining fields are
 /// adapter-specific. The `exec` type is the zero-code path for adding any CLI.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ProviderConfig {
     ClaudeCode {
         #[serde(default)]
@@ -257,7 +268,7 @@ pub enum ProviderConfig {
         max_weekly_usage_pct: Option<u8>,
     },
     /// The opencode CLI (`opencode run`). `model` is opencode's
-    /// `provider/model` form (e.g. `anthropic/claude-opus-4-5`); `agent` picks a
+    /// `provider/model` form (e.g. `anthropic/claude-opus-5`); `agent` picks a
     /// configured opencode agent; `variant` is the provider-specific reasoning
     /// effort (`high`, `max`, `minimal`, …). `auto` auto-approves permissions —
     /// on by default, since the container is the security boundary and the agent
@@ -306,12 +317,14 @@ pub enum ExecOutput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FirewallConfig {
     /// Hostnames allowed for egress. Consumed by docker/init-firewall.sh.
     pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportConfig {
     pub sink: SinkKind,
     /// Path for file-backed sinks (sqlite db / jsonl file).
@@ -328,13 +341,6 @@ pub struct ReportConfig {
     /// `owner/repo` slug the github sink files issues into.
     #[serde(default)]
     pub repo: Option<String>,
-    /// Model the github sink's semantic-dedup judge uses on borderline pairs
-    /// (findings whose algorithmic similarity to an already-filed issue is
-    /// inconclusive). A lightweight model keeps that extra cost small; defaults
-    /// to `claude-haiku-4-5`. Passed through to whichever provider is selected,
-    /// so with opencode it must be in `provider/model` form.
-    #[serde(default)]
-    pub dedupe_model: Option<String>,
 }
 
 impl ReportConfig {
@@ -342,12 +348,6 @@ impl ReportConfig {
     /// `token_env` if set, else `GITHUB_PAT`.
     pub fn github_token_env(&self) -> &str {
         self.token_env.as_deref().unwrap_or("GITHUB_PAT")
-    }
-
-    /// The model the dedup judge runs on: the operator's `dedupe_model` if set,
-    /// else a lightweight default.
-    pub fn dedupe_model(&self) -> &str {
-        self.dedupe_model.as_deref().unwrap_or("claude-haiku-4-5")
     }
 }
 
@@ -361,9 +361,14 @@ pub enum SinkKind {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StagesConfig {
     /// Ordered list of stages to run, e.g. ["recon", "hunt", "validate", "report"].
     pub enabled: Vec<String>,
+    /// Per-stage model override, keyed by an [`AGENT_STAGES`] name, in the
+    /// provider's own model id form. Unset stages use the provider's `model`.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -406,7 +411,7 @@ impl Config {
             {
                 bail!(
                     "providers.{name}.model = {model:?} is not an opencode model id; \
-                     use the \"provider/model\" form (e.g. \"anthropic/claude-opus-4-5\", \
+                     use the \"provider/model\" form (e.g. \"anthropic/claude-opus-5\", \
                      \"moonshotai/kimi-k3\"). Run `opencode models` to list them."
                 );
             }
@@ -426,6 +431,25 @@ impl Config {
                     "unknown stage \"{}\"; known stages: {}",
                     stage,
                     KNOWN_STAGES.join(", ")
+                );
+            }
+        }
+        for (stage, model) in &self.stages.models {
+            if !AGENT_STAGES.contains(&stage.as_str()) {
+                bail!(
+                    "stages.models.{stage}: only stages that run an agent take a model ({})",
+                    AGENT_STAGES.join(", ")
+                );
+            }
+            if model.trim().is_empty() {
+                bail!("stages.models.{stage} is empty");
+            }
+            if matches!(self.default_provider(), ProviderConfig::OpenCode { .. })
+                && !is_provider_qualified_model(model)
+            {
+                bail!(
+                    "stages.models.{stage} = {model:?} is not an opencode model id; \
+                     use the \"provider/model\" form"
                 );
             }
         }
@@ -463,7 +487,27 @@ impl Config {
         // Safe: validated at load.
         &self.providers[&self.provider.default]
     }
+
+    /// The model a stage's agents run on: its `stages.models` override, else
+    /// `None` (the provider's `model`). The skip-reported judge answers a
+    /// yes/no over two short texts, so on claude-code it defaults to Haiku;
+    /// other providers keep their own model, whose ids differ per backend.
+    pub fn stage_model(&self, stage: &str) -> Option<String> {
+        debug_assert!(AGENT_STAGES.contains(&stage), "{stage} runs no agent");
+        if let Some(model) = self.stages.models.get(stage) {
+            return Some(model.clone());
+        }
+        match (stage, self.default_provider()) {
+            ("skip-reported", ProviderConfig::ClaudeCode { .. }) => {
+                Some("claude-haiku-4-5".to_string())
+            }
+            _ => None,
+        }
+    }
 }
+
+/// Stages that run an agent, so `stages.models` can pick their model.
+pub const AGENT_STAGES: &[&str] = &["recon", "hunt", "validate", "skip-reported"];
 
 pub const KNOWN_STAGES: &[&str] = &[
     "recon",
@@ -500,12 +544,12 @@ default = "claude-code"
 
 [providers.claude-code]
 type = "claude-code"
-model = "claude-opus-4-8"
+model = "claude-opus-5"
 extra_args = ["--dangerously-skip-permissions"]
 
 [providers.opencode]
 type = "opencode"
-model = "anthropic/claude-opus-4-5"
+model = "anthropic/claude-opus-5"
 
 [providers.codex]
 type = "exec"
@@ -549,7 +593,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         else {
             panic!("expected an opencode provider");
         };
-        assert_eq!(model.as_deref(), Some("anthropic/claude-opus-4-5"));
+        assert_eq!(model.as_deref(), Some("anthropic/claude-opus-5"));
         assert_eq!(agent.as_deref(), None);
         // The container is the security boundary, and the agent must be able to
         // write its final-output file, so permissions are auto-approved unless
@@ -561,7 +605,7 @@ enabled = ["recon", "hunt", "validate", "report"]
     fn rejects_opencode_model_without_a_provider_prefix() {
         // A bare id is what opencode itself reports only as an opaque
         // "Unexpected server error", so the config load must catch it.
-        let bad = VALID.replace("\"anthropic/claude-opus-4-5\"", "\"kimi-k3\"");
+        let bad = VALID.replace("\"anthropic/claude-opus-5\"", "\"kimi-k3\"");
         let err = Config::load(write_tmp(&bad).path())
             .unwrap_err()
             .to_string();
@@ -575,7 +619,7 @@ enabled = ["recon", "hunt", "validate", "report"]
     fn accepts_opencode_models_whose_id_contains_slashes() {
         // e.g. fireworks-ai/accounts/fireworks/models/kimi-k3
         let ok = VALID.replace(
-            "\"anthropic/claude-opus-4-5\"",
+            "\"anthropic/claude-opus-5\"",
             "\"fireworks-ai/accounts/fireworks/models/kimi-k3\"",
         );
         assert!(Config::load(write_tmp(&ok).path()).is_ok());
@@ -674,6 +718,67 @@ enabled = ["recon", "hunt", "validate", "report"]
             format!("{VALID}\n[reference]\nrepo = \"https://x/y.git\"\ndir = \"/work/spec\"\n");
         let cfg = Config::load(write_tmp(&with_ref).path()).unwrap();
         assert_eq!(cfg.reference.active_dir().unwrap(), Path::new("/work/spec"));
+    }
+
+    #[test]
+    fn rejects_unknown_keys_instead_of_ignoring_them() {
+        // A misspelled or removed key must fail at load, not silently no-op.
+        let bad = VALID.replace("concurrency = 8", "concurrency = 8\nmax_turns = 60");
+        let err = format!("{:#}", Config::load(write_tmp(&bad).path()).unwrap_err());
+        assert!(err.contains("max_turns"), "got: {err}");
+        // Provider blocks are tagged enums; they must be strict too.
+        let bad = VALID.replace("type = \"opencode\"", "type = \"opencode\"\nmodle = \"x\"");
+        assert!(Config::load(write_tmp(&bad).path()).is_err());
+    }
+
+    #[test]
+    fn target_prepare_parses_and_defaults_empty() {
+        let cfg = Config::load(write_tmp(VALID).path()).unwrap();
+        assert!(cfg.target.prepare.is_empty());
+        let with = format!("{VALID}\n[target]\nprepare = [\"go mod download\"]\n");
+        let cfg = Config::load(write_tmp(&with).path()).unwrap();
+        assert_eq!(cfg.target.prepare, vec!["go mod download"]);
+    }
+
+    #[test]
+    fn stage_models_override_the_provider_model_per_stage() {
+        let cfg = Config::load(write_tmp(VALID).path()).unwrap();
+        // Unset stages use the provider's model; the claude-code judge is Haiku.
+        assert_eq!(cfg.stage_model("hunt"), None);
+        assert_eq!(
+            cfg.stage_model("skip-reported").as_deref(),
+            Some("claude-haiku-4-5")
+        );
+
+        let with = format!(
+            "{VALID}\n[stages.models]\nvalidate = \"claude-sonnet-5\"\nskip-reported = \"x\"\n"
+        );
+        let cfg = Config::load(write_tmp(&with).path()).unwrap();
+        assert_eq!(
+            cfg.stage_model("validate").as_deref(),
+            Some("claude-sonnet-5")
+        );
+        assert_eq!(cfg.stage_model("skip-reported").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn stage_models_are_checked_at_load() {
+        // Only agent stages take a model.
+        let bad = format!("{VALID}\n[stages.models]\nreport = \"claude-opus-5\"\n");
+        let err = Config::load(write_tmp(&bad).path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stages.models.report"), "got: {err}");
+        // Under opencode, a stage model needs the provider/model form too.
+        let opencode = VALID.replace("default = \"claude-code\"", "default = \"opencode\"");
+        let bad = format!("{opencode}\n[stages.models]\nhunt = \"kimi-k3\"\n");
+        let err = Config::load(write_tmp(&bad).path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider/model"), "got: {err}");
+        // And opencode keeps its own model for the judge.
+        let cfg = Config::load(write_tmp(&opencode).path()).unwrap();
+        assert_eq!(cfg.stage_model("skip-reported"), None);
     }
 
     #[test]

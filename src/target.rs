@@ -7,7 +7,8 @@
 //! If `[reference].repo` is configured, that spec / known-good implementation is
 //! cloned into `[reference].dir` and exposed to the agents as ground truth.
 //!
-//! Submodules, when present, are initialized recursively after checkout.
+//! Submodules, when present, are initialized recursively after checkout, then
+//! `[target].prepare` commands run in the target dir.
 //!
 //! Clones run after the egress firewall is up, so each git host must be in
 //! `[firewall].allow` — including the hosts of any submodule URL.
@@ -16,27 +17,50 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 
-/// Make `run.target_dir` contain the code to hunt. Idempotent: an existing
-/// clone is fetched and re-checked-out rather than re-cloned.
+/// Make `run.target_dir` contain the code to hunt, then run `[target].prepare`.
+/// Idempotent: an existing clone is fetched and re-checked-out rather than
+/// re-cloned.
 pub fn ensure_target(cfg: &Config) -> Result<()> {
     let dir = &cfg.run.target_dir;
 
-    let Some(repo) = cfg.target.repo.as_deref() else {
+    match cfg.target.repo.as_deref() {
+        Some(repo) => clone_or_update(repo, dir, cfg.target.git_ref.as_deref(), "target")?,
         // No repo configured: the target must already be present.
-        if !dir.exists() {
-            bail!(
-                "run.target_dir {} does not exist and no [target].repo is configured",
-                dir.display()
-            );
-        }
-        return Ok(());
-    };
+        None if !dir.exists() => bail!(
+            "run.target_dir {} does not exist and no [target].repo is configured",
+            dir.display()
+        ),
+        None => {}
+    }
 
-    clone_or_update(repo, dir, cfg.target.git_ref.as_deref(), "target")
+    for command in &cfg.target.prepare {
+        run_prepare(command, dir);
+    }
+    Ok(())
+}
+
+/// Run one prepare command in the target dir. A failure only warns: a cold
+/// package cache makes agents slower, not wrong, so it must not sink the run.
+fn run_prepare(command: &str, dir: &Path) {
+    info!(command, "running target prepare command");
+    match Command::new("sh")
+        .args(["-c", command])
+        .current_dir(dir)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => warn!(
+            command,
+            code = out.status.code(),
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "prepare command failed; continuing"
+        ),
+        Err(e) => warn!(command, error = %e, "prepare command could not start; continuing"),
+    }
 }
 
 /// Clone the optional reference repo (spec / known-good implementation) into
@@ -132,4 +156,48 @@ fn git_capture(args: &[&str]) -> Result<String> {
         bail!("git {} failed", args.join(" "));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(target_dir: &Path, prepare: &[&str]) -> Config {
+        let prepare = prepare
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        toml::from_str(&format!(
+            r#"
+[run]
+target_dir = {target:?}
+scratch_root = "/tmp/s"
+out_dir = "/tmp/o"
+[target]
+prepare = [{prepare}]
+[provider]
+default = "c"
+[providers.c]
+type = "claude-code"
+[firewall]
+allow = ["x"]
+[report]
+sink = "jsonl"
+path = "/tmp/o/f.jsonl"
+[stages]
+enabled = ["recon"]
+"#,
+            target = target_dir.to_str().unwrap(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn prepare_runs_in_the_mounted_target_and_a_failure_does_not_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path(), &["exit 3", "touch prepared"]);
+        ensure_target(&cfg).unwrap();
+        assert!(dir.path().join("prepared").exists());
+    }
 }

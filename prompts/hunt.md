@@ -85,12 +85,12 @@ and no prose around it. Shape:
     }
   ],
   "gaps": [
-    {"area": "file or function touched but not fully covered", "reason": "why, and the attack class worth a follow-up pass"}
+    {"area": "file or function touched but not fully covered", "attack_class": "the bug class worth a follow-up pass there", "reason": "why it was left uncovered"}
   ]
 }
 ```
 
 `poc_path` is optional. `confidence` is in [0,1]: how sure you are the bug is
 real and reachable (latent or guarded means low). Each gap becomes a follow-up
-hunter whose only brief is your `area` and `reason`, so emit one only for a
-concrete lead. Empty arrays are a valid result.
+hunter whose only brief is your `area`, `attack_class`, and `reason`, so emit
+one only for a concrete lead. Empty arrays are a valid result.

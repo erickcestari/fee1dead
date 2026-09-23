@@ -76,6 +76,20 @@ run-clone: image
       {{opencode_mounts}} \
       {{image}}
 
+# Continue the last run in `out` after a usage limit or crash: skips recon and
+# hunts the tasks not yet processed. Mounts `target` when it exists (else the
+# config's [target].repo is cloned again).
+resume: image
+    @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
+    docker run --rm \
+      --cap-add=NET_ADMIN \
+      {{auth}} \
+      $([ -d "{{target}}" ] && echo "-v $(realpath '{{target}}'):/work/target:ro") \
+      -v "$(realpath '{{out}}')":/work/out \
+      -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
+      {{opencode_mounts}} \
+      {{image}} run --resume --config /opt/fee1dead/config/harness.toml
+
 # Run with the egress firewall disabled (local debugging only).
 run-nofw: image
     @test -d "{{target}}" || (echo "target repo not found: {{target}}" && exit 1)

@@ -10,8 +10,12 @@
 //! The harness pre-computes the repo's LOC and size tier and substitutes them
 //! into the prompt, so the prompt's size-adaptive caps are deterministic and the
 //! agent spends no turns measuring the repo.
+//!
+//! Feedback seeds from past runs enter the prompt as leads, not the queue: they
+//! go through recon's admission bar like any task it derives itself, since a
+//! seed is only a hypothesis and the code may have changed since. Recon then
+//! consumes the seed file.
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -20,6 +24,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use super::StageCtx;
+use super::salvage::run_parsed;
 use crate::artifacts::{extract_json_block, names};
 use crate::domain::{Priority, Task, TaskOrigin};
 use crate::provider::{AgentRequest, Effort};
@@ -76,12 +81,15 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .map(|d| d.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    let seeds: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
+
     let prompt = PROMPT
         .replace("$REPO_PATH", &target.to_string_lossy())
         .replace("$REPO_NAME", &repo_name)
         .replace("$REPO_SIZE", size)
         .replace("$LOC", &loc.to_string())
         .replace("$SPEC_PATH", &spec_path)
+        .replace("$LEADS", &leads_block(&seeds))
         + &ctx.config.reference.recon_directive()
         + &ctx.config.run.skills_directive();
 
@@ -89,6 +97,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         prompt,
         system: None,
         working_dir: target.clone(),
+        // The target may be mounted read-only; answer into a private dir.
+        output_dir: ctx.scratch.for_agent("recon")?,
         extra_dirs: ctx
             .config
             .reference
@@ -110,45 +120,47 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // most cost-amplified in a run (re-read each turn, forked into hunters),
         // so it sits a notch below the open-ended tracing hunters do.
         effort: Effort::High,
-        model: None,
+        model: ctx.config.stage_model("recon"),
         stream_log_path: Some(ctx.artifacts.log_path("recon-recon.jsonl")),
     };
 
-    let result = ctx.runner.run(req).await.context("recon agent failed")?;
-
     // The agent's whole final answer is the JSON threat model. Pull it back out
-    // (tolerating a stray prose wrapper) and parse out the queue.
-    let json =
-        extract_json_block(&result.stdout).context("recon output had no json threat model")?;
-    let report: ReconReport =
-        serde_json::from_str(json).context("recon output was not a valid threat-model object")?;
+    // (tolerating a stray prose wrapper) and parse out the queue; a malformed
+    // one gets a repair turn in recon's own session instead of a rerun.
+    let (json, report, session_id) = run_parsed(ctx.runner.as_ref(), req, |result| {
+        let json =
+            extract_json_block(&result.stdout).context("recon output had no json threat model")?;
+        let report: ReconReport = serde_json::from_str(json)
+            .context("recon output was not a valid threat-model object")?;
+        Ok((json.to_string(), report, result.session_id.clone()))
+    })
+    .await
+    .context("recon agent failed")?;
 
     // Persist the threat model verbatim: it is the run's auditable record and the
     // context a cold hunter loads. Forked hunters skip it (they have recon's
     // session), so the harness never re-parses the prose fields it dropped above.
-    ctx.artifacts.write_text(names::RECON_REPORT, json)?;
+    ctx.artifacts.write_text(names::RECON_REPORT, &json)?;
 
     // Persist recon's session id so hunters can fork from its codebase context.
     // Providers without a session concept leave this unset; hunters then fall
     // back to the architecture doc alone.
-    if let Some(session_id) = &result.session_id {
+    if let Some(session_id) = &session_id {
         ctx.artifacts.write_text(names::RECON_SESSION, session_id)?;
     }
 
-    let mut tasks = assign_ids(report.hunt_tasks);
-
-    let fresh = tasks.len();
-    let carried = merge_feedback_seeds(ctx, &mut tasks)?;
-
+    let tasks = assign_ids(report.hunt_tasks);
     info!(
         loc,
         size,
-        fresh,
-        carried,
-        total = tasks.len(),
+        tasks = tasks.len(),
+        leads = seeds.len(),
         "recon assembled hunt queue"
     );
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
+    // Every lead has now been judged against the code; the ones that passed
+    // are in the queue. Feedback writes this run's seeds afresh.
+    ctx.artifacts.write_jsonl::<Task>(names::SEEDS, &[])?;
     Ok(())
 }
 
@@ -174,31 +186,31 @@ fn assign_ids(seeds: Vec<HuntTask>) -> Vec<Task> {
         .collect()
 }
 
-/// Merge durable feedback seeds from past runs into this run's queue, skipping
-/// any whose (attack class, scope hint) recon already produced. Returns the
-/// number of seeds carried in.
-fn merge_feedback_seeds(ctx: &StageCtx, tasks: &mut Vec<Task>) -> Result<usize> {
-    let seeds: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
+/// The prompt's `<leads>` block: one line per feedback seed, or nothing when
+/// there are none, so a first run's prompt carries no empty section.
+fn leads_block(seeds: &[Task]) -> String {
     if seeds.is_empty() {
-        return Ok(0);
+        return String::new();
     }
-    let mut seen: HashSet<(String, String)> = tasks
+    let lines: Vec<String> = seeds
         .iter()
-        .map(|t| (t.attack_class.to_lowercase(), t.scope_hint.to_lowercase()))
+        .map(|s| {
+            let mut line = format!("- {}: {}", s.attack_class, s.scope_hint);
+            if !s.hypothesis.is_empty() {
+                line += &format!("; hypothesis: {}", s.hypothesis);
+            }
+            if !s.targets.is_empty() {
+                line += &format!("; targets: {}", s.targets.join(", "));
+            }
+            line
+        })
         .collect();
-
-    let mut carried = 0;
-    for seed in seeds {
-        let key = (
-            seed.attack_class.to_lowercase(),
-            seed.scope_hint.to_lowercase(),
-        );
-        if seen.insert(key) {
-            tasks.push(seed);
-            carried += 1;
-        }
-    }
-    Ok(carried)
+    format!(
+        "<leads>\nLeads carried over from earlier runs against this repository: variants \
+         of bugs a reviewer judged real, and areas a hunter flagged but could not finish. \
+         They are hypotheses, not findings, and the code may have changed since.\n{}\n</leads>\n",
+        lines.join("\n")
+    )
 }
 
 /// Repo name for the prompt context: the clone URL's basename when a target
@@ -294,6 +306,7 @@ fn count_loc(root: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::GapMarker;
 
     fn parse(out: &str) -> ReconReport {
         let json = extract_json_block(out).unwrap();
@@ -318,6 +331,24 @@ mod tests {
         assert_eq!(tasks[0].scope_paths, vec!["src/a.rs", "src/b.rs"]);
         assert_eq!(tasks[1].scope_hint, "src/auth/");
         assert!(tasks.iter().all(|t| matches!(t.origin, TaskOrigin::Recon)));
+    }
+
+    #[test]
+    fn leads_render_one_line_per_seed_and_vanish_without_seeds() {
+        assert_eq!(leads_block(&[]), "");
+        let seed = GapMarker {
+            task_id: "T-0003".into(),
+            area: "src/net.rs:decode".into(),
+            attack_class: "panic-dos".into(),
+            reason: "truncated frames not traced".into(),
+        }
+        .to_task("F-0001".into(), TaskOrigin::Feedback);
+        let block = leads_block(&[seed]);
+        assert!(block.starts_with("<leads>\n"));
+        assert!(block.contains(
+            "- panic-dos: src/net.rs:decode; hypothesis: truncated frames not traced; \
+             targets: src/net.rs:decode\n</leads>"
+        ));
     }
 
     #[test]
