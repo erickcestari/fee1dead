@@ -6,9 +6,10 @@
 //! lands in config or logs.
 //!
 //! Re-runnable: the report stage can run more than once, so each issue body
-//! carries a hidden marker keyed by the finding id. Before creating an issue the
-//! sink searches the repo for that marker and skips findings already filed, so a
-//! second run does not duplicate issues.
+//! carries a hidden marker keyed by the finding id. Before the first write the
+//! sink lists its labeled issues once and skips findings whose marker is already
+//! there, so a second run does not duplicate issues. Listing beats a per-finding
+//! search: the search API allows only 30 requests a minute and indexes with lag.
 
 use std::collections::HashSet;
 
@@ -24,24 +25,30 @@ const API_ROOT: &str = "https://api.github.com";
 const SINK_LABEL: &str = "fee1dead";
 
 pub struct GithubSink {
+    api_root: String,
     /// `owner/repo`.
     repo: String,
     token: String,
     agent: ureq::Agent,
-    /// Finding ids confirmed present as issues this session (created or found),
-    /// so repeated writes of the same id within a run never re-query or re-file.
-    filed: HashSet<String>,
+    /// Finding ids already filed as issues, loaded from the repo on the first
+    /// write and extended with each issue this sink creates.
+    filed: Option<HashSet<String>>,
     /// Issues created by this sink (excludes ones that already existed).
     created: usize,
 }
 
 impl GithubSink {
     pub fn new(repo: String, token: String) -> Self {
+        Self::with_api_root(API_ROOT.to_string(), repo, token)
+    }
+
+    fn with_api_root(api_root: String, repo: String, token: String) -> Self {
         Self {
+            api_root,
             repo,
             token,
             agent: ureq::Agent::new(),
-            filed: HashSet::new(),
+            filed: None,
             created: 0,
         }
     }
@@ -56,38 +63,37 @@ impl GithubSink {
             .set("user-agent", "fee1dead")
     }
 
-    /// Whether an issue for this finding already exists in the repo, matched by
-    /// the hidden body marker. Best-effort: a search miss (indexing lag, API
-    /// error) means we may file a duplicate rather than drop a finding.
-    fn issue_exists(&self, id: &str) -> Result<bool> {
-        let query = format!("repo:{} in:body \"{}\"", self.repo, marker(id));
-        let resp = self
-            .request("GET", &format!("{API_ROOT}/search/issues"))
-            .query("q", &query)
-            .call()
-            .with_context(|| format!("searching {} for existing issue {id}", self.repo))?;
-        let body: Value = resp.into_json().context("parsing github search response")?;
-        Ok(body.get("total_count").and_then(Value::as_u64).unwrap_or(0) > 0)
+    /// Ids of the findings already filed in the repo, listed on first use.
+    fn filed(&mut self) -> Result<&mut HashSet<String>> {
+        if self.filed.is_none() {
+            let ids = self
+                .existing_reports()?
+                .into_iter()
+                .map(|r| r.id)
+                .filter(|id| !id.is_empty())
+                .collect();
+            self.filed = Some(ids);
+        }
+        Ok(self.filed.as_mut().expect("filed ids loaded above"))
     }
 }
 
 impl ReportSink for GithubSink {
     fn write(&mut self, record: &ReportRecord) -> Result<()> {
-        if self.filed.contains(&record.id) {
-            return Ok(());
-        }
-        if self.issue_exists(&record.id)? {
-            self.filed.insert(record.id.clone());
+        if self.filed()?.contains(&record.id) {
             return Ok(());
         }
 
         let payload = issue_payload(&record.id, &record.payload);
         let resp = self
-            .request("POST", &format!("{API_ROOT}/repos/{}/issues", self.repo))
+            .request(
+                "POST",
+                &format!("{}/repos/{}/issues", self.api_root, self.repo),
+            )
             .send_json(payload);
         match resp {
             Ok(_) => {
-                self.filed.insert(record.id.clone());
+                self.filed()?.insert(record.id.clone());
                 self.created += 1;
                 Ok(())
             }
@@ -120,7 +126,10 @@ impl ReportSink for GithubSink {
         let mut out = Vec::new();
         for page in 1..=MAX_ISSUE_PAGES {
             let resp = self
-                .request("GET", &format!("{API_ROOT}/repos/{}/issues", self.repo))
+                .request(
+                    "GET",
+                    &format!("{}/repos/{}/issues", self.api_root, self.repo),
+                )
                 .query("labels", SINK_LABEL)
                 .query("state", "all")
                 .query("per_page", "100")
@@ -329,6 +338,81 @@ mod tests {
         assert_eq!(e.location, "src/net.rs:42");
         assert_eq!(e.attack_class, "resource exhaustion");
         assert!(e.text.contains("attacker crashes the node"));
+    }
+
+    /// Serves a fake GitHub API: the issue list holds one issue already filed
+    /// for `F-1`, issue creation succeeds, and anything else 404s. Returns the
+    /// base url and the `METHOD path` of every request received.
+    fn fake_github() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let filed = json!([{ "title": "[high] old", "body": marker("F-1") }]).to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut len = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = header.to_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; len]).unwrap();
+
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap().to_string();
+                let path = parts.next().unwrap().split('?').next().unwrap().to_string();
+                let (status, body) = match (method.as_str(), path.as_str()) {
+                    ("GET", "/repos/o/r/issues") => ("200 OK", filed.clone()),
+                    ("POST", "/repos/o/r/issues") => ("201 Created", "{}".to_string()),
+                    _ => ("404 Not Found", "{}".to_string()),
+                };
+                log.lock().unwrap().push(format!("{method} {path}"));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (root, seen)
+    }
+
+    #[test]
+    fn write_lists_filed_issues_once_and_skips_them() {
+        let (root, seen) = fake_github();
+        let mut sink = GithubSink::with_api_root(root, "o/r".into(), "t".into());
+        let record = |id: &str| ReportRecord {
+            id: id.into(),
+            payload: finding(),
+        };
+        for id in ["F-1", "F-2", "F-3", "F-2"] {
+            sink.write(&record(id)).unwrap();
+        }
+        assert_eq!(sink.count().unwrap(), 2);
+        // One listing, no per-finding search (rate limited to 30/min), and
+        // only the unfiled ids are created, once each.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /repos/o/r/issues",
+                "POST /repos/o/r/issues",
+                "POST /repos/o/r/issues",
+            ]
+        );
     }
 
     #[test]
