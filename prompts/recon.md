@@ -45,7 +45,7 @@ Catalog the most security-critical ones (cap per table), prioritizing untrusted 
 <phase_c name="Hypothesis Register">
 The invariants are what hunters consume: testable security claims the system must maintain (cap per table). For each:
 - `id`: INV-1, INV-2, ...
-- `statement`: a falsifiable claim, such as "HTLC amounts cannot be negative" or "no secret material is written to logs".
+- `statement`: a falsifiable claim, such as "every commitment the node signs is one its on-chain watcher recognizes" or "no secret material is written to logs".
 - `relevant_modules`: the 1–3 packages or files that enforce it.
 - `adversary`: who benefits from breaking it (remote peer, malicious RPC client, local operator).
 - `how_to_falsify`: one or two lines on what a hunter should try. An attack idea, not a grep pattern.
@@ -55,6 +55,7 @@ Prefer invariants drawn from:
 - Protocol spec clauses (MUST / SHALL / REQUIRED in BIPs, BOLTs, RFCs)
 - Trust-boundary guarantees
 - State-machine transition rules
+- Agreement between what the node signs or sends a peer and what its recovery and on-chain resolution code recognize (reestablish, retransmit, restart)
 - Cryptographic contracts (constant-time, nonce uniqueness, key isolation)
 - Resource-usage bounds
 - Contracts callers rely on that are documented in comments (idempotency, ordering, retry-safety, "safe to call N times"). Cite the comment's file:line in `how_to_falsify`.
@@ -95,7 +96,7 @@ Admission bar, all four required:
 1. **Concrete lead.** A specific defect hypothesis at a known file or function: what could be wrong, and where. "Review X for issues" fails.
 2. **Real adversary across a trust boundary.** Attacker-controlled input reaches the target. A path reachable only by trusted or local callers fails.
 3. **Material impact if true.** Fund or asset loss, auth/authz bypass, memory corruption, code or command execution, secret disclosure, or attacker-triggered DoS. Defense-in-depth nits, style, and trusted-only correctness bugs fail.
-4. **Plausible, not yet disproven.** If your own reading already showed the guard is present and total, do not send a hunter to rediscover it.
+4. **Plausible, not yet disproven.** If code you read already showed the guard is present and total, do not send a hunter to rediscover it. A protocol guarantee is not a guard.
 
 Derive candidates, then run each through the bar:
 - Each high-value invariant whose enforcement you could not confirm: one task to falsify it. An invariant you verified holds is not a task.
@@ -120,6 +121,7 @@ Attack classes and the skills that fit them, as a menu to specialize or go beyon
 | cryptographic misuse, timing side channels, nonce reuse, weak RNG | `constant-time-analysis` |
 | protocol-spec compliance: MUST/SHALL clauses honored in code | `spec-to-code-compliance` |
 | fund safety, input validation, DoS, concurrency, access control, info disclosure | `manual`, `variant-analysis` |
+| fund loss via resolution gaps: state signed but not recorded where the watcher looks; an output or forwarded-HTLC leg the victim fails to claim, learn, or settle | `manual`, `spec-to-code-compliance` |
 | under-covered paths (utilities, middleware, init, error paths), only with a concrete lead at a named function | `manual` |
 | chains where two weaker defects combine into material impact | `manual`, `property-based-testing` |
 </phase_f>
