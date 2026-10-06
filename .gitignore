@@ -1,3 +1,5 @@
 /target
 .env
 out
+/config/*
+!/config/harness.toml
