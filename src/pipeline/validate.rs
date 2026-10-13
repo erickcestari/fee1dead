@@ -170,6 +170,8 @@ fn batch_by_file(mut findings: Vec<Finding>, max: usize) -> Vec<Vec<Finding>> {
     batches
 }
 
+/// The hunter's confidence is withheld: it is not needed for any verdict and
+/// would anchor the reviewer. Severity stays, since a downgrade is against it.
 fn review_input(batch: &[Finding]) -> String {
     let items: Vec<_> = batch
         .iter()
@@ -179,7 +181,6 @@ fn review_input(batch: &[Finding]) -> String {
                 "title": f.title,
                 "attack_class": f.attack_class,
                 "severity": f.severity,
-                "confidence": f.confidence,
                 "location": f.location,
                 "description": f.description,
             })
@@ -259,6 +260,15 @@ mod tests {
         assert_eq!(reviews[0].verdict, Verdict::Confirmed);
         assert_eq!(reviews[0].impact, "i");
         assert!(json_block::parse::<Vec<RawReview>>("{\"finding_id\":1}", "review array").is_err());
+    }
+
+    #[test]
+    fn review_input_withholds_the_hunters_confidence() {
+        let input: Vec<serde_json::Value> =
+            serde_json::from_str(&review_input(&[finding("F-1")])).unwrap();
+        assert_eq!(input[0]["finding_id"], "F-1");
+        assert_eq!(input[0]["severity"], "high");
+        assert!(input[0].get("confidence").is_none());
     }
 
     #[test]
