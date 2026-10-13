@@ -1,5 +1,8 @@
-//! Hunt stage: run one hunter per queued task, concurrently, each in its own
-//! scratch dir. Hunters emit candidate findings and gap markers.
+//! Hunt stage: one hunter per queued task, concurrently, each in its own
+//! scratch dir, emitting candidate findings and gap markers.
+//!
+//! Incremental: tasks already in `hunted.jsonl` are skipped and results are
+//! appended, so a gapfill re-queue or `--resume` only hunts what is new.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -13,15 +16,24 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use super::StageCtx;
 use super::salvage::run_parsed;
-use crate::artifacts::{Artifacts, extract_json_block, names};
-use crate::domain::{Finding, GapMarker, Severity, Task};
-use crate::provider::{AgentRequest, AgentRunner, Effort, ResumeSession, is_usage_limited};
+use super::{StageCtx, prompt};
+use crate::artifacts::{Artifacts, names};
+use crate::config::Stage;
+use crate::domain::{Finding, GapMarker, Severity, Task, default_confidence};
+use crate::json_block;
+use crate::provider::{Effort, ResumeSession, is_usage_limited};
 
 const PROMPT: &str = include_str!("../../prompts/hunt.md");
 
-/// Hunter output shape (findings without harness-assigned ids).
+/// What a forked hunter gets instead of recon's report, which is already in
+/// its session. Recon's pass is shallow, so it is steered back at the code.
+const FORKED_CONTEXT: &str = "You explored this repository as the recon agent earlier in this \
+     session, so its threat model and invariants are already in your \
+     context. That pass was deliberately shallow — it read few files in \
+     full — so do not treat it as a substitute for reading the code: open \
+     this task's targets and the surrounding code yourself before reporting.";
+
 #[derive(Debug, Deserialize)]
 struct HunterOutput {
     #[serde(default)]
@@ -36,15 +48,10 @@ struct RawFinding {
     severity: Severity,
     location: String,
     description: String,
-    /// Hunter's confidence in [0,1]; defaults mid-scale if the hunter omits it.
-    #[serde(default = "half")]
+    #[serde(default = "default_confidence")]
     confidence: f64,
     #[serde(default)]
     poc_path: Option<String>,
-}
-
-fn half() -> f64 {
-    0.5
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,133 +63,28 @@ struct RawGap {
 }
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
-    let queue: Vec<Task> = ctx.artifacts.read_jsonl(names::QUEUE)?;
-    if queue.is_empty() {
-        warn!("hunt queue is empty; did recon run?");
-        return Ok(());
-    }
-    // The pipeline writes it before any stage runs.
-    let run_id = ctx.artifacts.read_text(names::RUN_ID)?.trim().to_string();
-    // Cold hunters (non-forking providers) get recon's threat model injected as
-    // context; forked hunters already carry it in their inherited session.
-    let recon_report = ctx
-        .artifacts
-        .read_text(names::RECON_REPORT)
-        .unwrap_or_default();
-
-    // Hunt incrementally: skip tasks already processed in a previous pass so
-    // gapfill re-queues only trigger work on the new tasks. Result files are
-    // appended to, never truncated.
-    let hunted: HashSet<String> = ctx
-        .artifacts
-        .read_jsonl::<String>(names::HUNTED)?
-        .into_iter()
-        .collect();
-    ctx.artifacts.ensure_jsonl(names::CANDIDATES)?;
-    ctx.artifacts.ensure_jsonl(names::GAPS)?;
-
-    let mut tasks: Vec<Task> = queue
-        .into_iter()
-        .filter(|t| !hunted.contains(&t.id))
-        .collect();
+    let tasks = pending_tasks(&ctx.artifacts)?;
     if tasks.is_empty() {
-        info!("no new tasks to hunt; all queue entries already processed");
+        info!("no tasks left to hunt");
         return Ok(());
     }
-    spawn_order(&mut tasks);
+    let run_id = ctx
+        .artifacts
+        .read_line(names::RUN_ID)
+        .context("the run has no id")?;
+    let recon_session = recon_session(ctx);
+    let prompt = HuntPrompt::new(ctx, recon_session.is_some());
 
-    // Fork each hunter from recon's session so it inherits the codebase context
-    // recon built up, not just the architecture doc. Absent a recorded session
-    // (e.g. a provider without sessions, or forking disabled), hunters run cold.
-    let recon_session = if ctx.config.run.fork_hunters {
-        ctx.artifacts
-            .read_text(names::RECON_SESSION)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    };
-    if recon_session.is_some() {
-        info!("hunters will fork from recon's session");
-        if ctx.config.stage_model("hunt") != ctx.config.stage_model("recon") {
-            warn!(
-                "hunt and recon run on different models; forked hunters cannot reuse \
-                 recon's prompt cache and pay full input price for its session"
-            );
-        }
-    }
-
-    // A forked hunter already carries recon's session (threat model and
-    // invariants included) as a cached prefix, so re-injecting the report text
-    // would re-bill those tokens per hunter — it gets a pointer instead. But
-    // recon now orients deliberately shallow (structure-first, few full-file
-    // reads), so that pass is NOT a substitute for reading the code: steer the
-    // forked hunter at its task's own targets. A cold hunter gets the report.
-    let arch_context = if recon_session.is_some() {
-        "You explored this repository as the recon agent earlier in this \
-         session, so its threat model and invariants are already in your \
-         context. That pass was deliberately shallow — it read few files in \
-         full — so do not treat it as a substitute for reading the code: open \
-         this task's targets and the surrounding code yourself before reporting."
-            .to_string()
-    } else {
-        recon_report
-    };
-
-    // PoC confirmation is the most token-hungry part of hunting (compile/run
-    // loops). When disabled, hunters substantiate by close reading instead.
-    let (poc_intro, poc_rule, poc_step) = if ctx.config.run.require_poc {
-        (
-            "Write, compile, and run any proof-of-concept code in your private \
-             scratch dir `{scratch_dir}`. ",
-            "- Confirm with a PoC when you can: write it in the scratch dir, \
-             compile and run\n  it, and report only if it behaves as the bug \
-             predicts.",
-            "- [ ] Attempt a PoC in the scratch dir; compile and run it",
-        )
-    } else {
-        (
-            "",
-            "- Do not write proof-of-concept code. Substantiate findings by \
-             tracing the data\n  flow in the source and citing exact \
-             locations; leave `poc_path` unset.",
-            "- [ ] Substantiate the hypothesis by close reading; cite exact lines",
-        )
-    };
-
-    let sem = Arc::new(Semaphore::new(ctx.config.run.concurrency));
-    let target = ctx.config.run.target_dir.clone();
-    let timeout = Duration::from_secs(ctx.config.run.agent_timeout_secs);
-    // Reference repo (spec / known-good impl), if configured: appended to each
-    // hunter's prompt and added to its readable dirs.
-    let reference_note = ctx.config.reference.prompt_note();
-    let reference_dirs: Vec<std::path::PathBuf> = ctx
-        .config
-        .reference
-        .active_dir()
-        .map(|d| vec![d.to_path_buf()])
-        .unwrap_or_default();
-
-    // Set by the first hunter that hits an account usage/session limit. Once
-    // set, spawning more hunters is pointless — every one bounces off the same
-    // limit until it resets — so the spawn loop stops. The unspawned tasks are
-    // never marked processed, so `fee1dead run --resume` hunts them later.
+    let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
+    let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
+    // Set by the first hunter to hit a usage limit: every later one would
+    // bounce off it, so spawning stops. Unspawned tasks stay unhunted for `--resume`.
     let limited = Arc::new(AtomicBool::new(false));
     let total = tasks.len();
-
-    // Forked hunters each replay recon's session as their first request; the
-    // semaphore would otherwise release the whole concurrency batch at once and
-    // fire that burst simultaneously, which the API rejects with server-side
-    // rate limiting. Stagger consecutive launches to spread the first requests.
-    let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
-
-    // Each hunter's output is persisted the moment it finishes, even while the
-    // loop is still waiting for a slot, so a crash mid-hunt loses only the
-    // hunters still running.
     let mut running = JoinSet::new();
     let mut tally = Tally::default();
-    let mut spawned = 0usize;
+    let mut spawned = 0;
+
     'spawn: for task in tasks {
         if limited.load(Ordering::Relaxed) {
             break;
@@ -190,77 +92,40 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         if spawned > 0 && !stagger.is_zero() {
             tokio::time::sleep(stagger).await;
         }
-        let permit = loop {
+        // Record finished hunters while waiting for a slot, so a crash loses
+        // only the hunters still running.
+        let slot = loop {
             tokio::select! {
-                permit = Arc::clone(&sem).acquire_owned() => {
-                    break permit.expect("hunt semaphore is never closed");
+                slot = Arc::clone(&slots).acquire_owned() => {
+                    break slot.expect("hunt semaphore is never closed");
                 }
                 Some(done) = running.join_next() => {
-                    record(ctx, &run_id, done.context("hunter task panicked")?, &mut tally)?;
+                    record(&ctx.artifacts, &run_id, done.context("hunter task panicked")?, &mut tally)?;
                     if limited.load(Ordering::Relaxed) {
                         break 'spawn;
                     }
                 }
             }
         };
+        // Open-ended multi-hop tracing, and not fork-amplified: xhigh earns its keep.
+        let mut req = ctx.agent_request(Stage::Hunt, &task.id, String::new(), Effort::Xhigh)?;
+        let scratch_dir = req.working_dir.clone();
+        req.prompt = prompt.render(&task, &scratch_dir);
+        // A forked hunter runs in recon's dir and writes PoCs to its scratch
+        // dir by absolute path.
+        req.resume = recon_session.clone().map(|session_id| ResumeSession {
+            session_id,
+            project_dir: ctx.config.run.target_dir.clone(),
+        });
         let runner = Arc::clone(&ctx.runner);
         let limited = Arc::clone(&limited);
-        let hunt_model = ctx.config.stage_model("hunt");
-        let scratch_dir = ctx.scratch.for_agent(&task.id)?;
-        let stream_log_path = ctx.artifacts.log_path(&format!("hunt-{}.jsonl", task.id));
-        let prompt = PROMPT
-            .replace("{attack_class}", &task.attack_class)
-            .replace("{scope}", &scope_line(&task))
-            .replace("{hypothesis}", &hypothesis_line(&task))
-            .replace("{targets}", &targets_block(&task))
-            .replace("{skills}", &skills_line(&task, ctx.config.run.use_skills))
-            .replace("{target_dir}", &target.to_string_lossy())
-            .replace("{poc_intro}", poc_intro)
-            .replace("{poc_rule}", poc_rule)
-            .replace("{poc_step}", poc_step)
-            // After poc_intro, since it may embed {scratch_dir}.
-            .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
-            .replace("{architecture}", &arch_context)
-            + &reference_note
-            + &ctx.config.run.skills_directive();
-        let extra_dirs = reference_dirs.clone();
-        // A forked hunter runs in recon's project dir (the target), so PoCs go
-        // to the scratch dir by absolute path; a cold hunter runs in scratch.
-        let resume = recon_session.clone().map(|session_id| ResumeSession {
-            session_id,
-            project_dir: target.clone(),
-        });
-
         running.spawn(async move {
-            let req = AgentRequest {
-                prompt,
-                system: None,
-                working_dir: scratch_dir.clone(),
-                output_dir: scratch_dir.clone(),
-                extra_dirs,
-                allowed_tools: Vec::new(),
-                // Shared deny-list: no sub-agent fan-out (the orchestrator
-                // already runs hunters in parallel) plus the tools no stage uses.
-                disallowed_tools: super::disabled_tools(),
-                timeout,
-                resume,
-                // A leaf agent: nothing forks from a hunter, and its own context
-                // is re-read only by its own sub-5m-apart turns, so 1h caching
-                // would pay a higher write premium for no reuse. It reads recon's
-                // prefix at cache rates regardless (recon owns that 1h cache).
-                cache_1h: false,
-                // Hunting is open-ended multi-hop tracing source→sink; the
-                // deepest thinking earns its keep here, and a hunter's effort is
-                // not fork-amplified. This is the stage xhigh is for.
-                effort: Effort::Xhigh,
-                model: hunt_model,
-                stream_log_path: Some(stream_log_path),
-            };
             info!(task = %task.id, attack_class = %task.attack_class, "hunter started");
-            let out = run_hunter(runner.as_ref(), req).await;
-            if let Err(e) = &out
-                && is_usage_limited(e)
-            {
+            let out = run_parsed(runner.as_ref(), req, |r| {
+                json_block::parse::<HunterOutput>(&r.stdout, "hunter report")
+            })
+            .await;
+            if out.as_ref().is_err_and(is_usage_limited) {
                 limited.store(true, Ordering::Relaxed);
             }
             info!(task = %task.id, ok = out.is_ok(), "hunter finished");
@@ -268,23 +133,20 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 task,
                 scratch_dir,
                 out,
-                slot: permit,
+                _slot: slot,
             }
         });
         spawned += 1;
     }
     while let Some(done) = running.join_next().await {
         record(
-            ctx,
+            &ctx.artifacts,
             &run_id,
             done.context("hunter task panicked")?,
             &mut tally,
         )?;
     }
 
-    // `total` is the queue size; `spawned` may be smaller if a usage limit cut
-    // the run short. Surface the breakdown so a degraded run is obvious at a
-    // glance instead of having to reconstruct it from the per-agent logs.
     let skipped = total - spawned;
     info!(
         total,
@@ -306,17 +168,168 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-/// One hunter's outcome, handed from its task back to the stage.
+/// Queued tasks not hunted yet, in spawn order.
+fn pending_tasks(artifacts: &Artifacts) -> Result<Vec<Task>> {
+    let hunted: HashSet<String> = artifacts.read_jsonl(names::HUNTED)?.into_iter().collect();
+    artifacts.ensure_jsonl(names::CANDIDATES)?;
+    artifacts.ensure_jsonl(names::GAPS)?;
+    let mut tasks: Vec<Task> = artifacts
+        .read_jsonl::<Task>(names::QUEUE)?
+        .into_iter()
+        .filter(|t| !hunted.contains(&t.id))
+        .collect();
+    spawn_order(&mut tasks);
+    Ok(tasks)
+}
+
+/// Spawn order is value order, since concurrency and a usage limit can cut
+/// the tail: recon's priority first, then origin. Stable on queue order.
+fn spawn_order(tasks: &mut [Task]) {
+    tasks.sort_by_key(|t| (t.priority.hunt_rank(), t.origin.hunt_rank()));
+}
+
+/// Recon's session, when hunters should fork it.
+fn recon_session(ctx: &StageCtx) -> Option<String> {
+    if !ctx.config.run.fork_hunters {
+        return None;
+    }
+    let session = ctx.artifacts.read_line(names::RECON_SESSION)?;
+    info!("hunters will fork from recon's session");
+    if ctx.config.stage_model(Stage::Hunt) != ctx.config.stage_model(Stage::Recon) {
+        warn!(
+            "hunt and recon run on different models; forked hunters cannot reuse \
+             recon's prompt cache and pay full input price for its session"
+        );
+    }
+    Some(session)
+}
+
+/// The run-wide parts of a hunter prompt.
+struct HuntPrompt {
+    target_dir: String,
+    /// Recon's report for a cold hunter, or [`FORKED_CONTEXT`].
+    architecture: String,
+    poc: PocText,
+    use_skills: bool,
+    suffix: String,
+}
+
+impl HuntPrompt {
+    fn new(ctx: &StageCtx, forked: bool) -> Self {
+        let architecture = if forked {
+            FORKED_CONTEXT.to_string()
+        } else {
+            ctx.artifacts
+                .read_text(names::RECON_REPORT)
+                .unwrap_or_default()
+        };
+        Self {
+            target_dir: ctx.config.run.target_dir.to_string_lossy().into_owned(),
+            architecture,
+            poc: PocText::new(ctx.config.run.require_poc),
+            use_skills: ctx.config.run.use_skills,
+            suffix: prompt::reference_note(&ctx.config) + prompt::skills_directive(&ctx.config),
+        }
+    }
+
+    fn render(&self, task: &Task, scratch_dir: &Path) -> String {
+        PROMPT
+            .replace("{attack_class}", &task.attack_class)
+            .replace("{scope}", &scope_line(task))
+            .replace("{hypothesis}", &hypothesis_line(task))
+            .replace("{targets}", &targets_block(task))
+            .replace("{skills}", &skills_line(task, self.use_skills))
+            .replace("{target_dir}", &self.target_dir)
+            .replace("{poc_intro}", self.poc.intro)
+            .replace("{poc_rule}", self.poc.rule)
+            .replace("{poc_step}", self.poc.step)
+            // After poc_intro, which may embed it.
+            .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
+            .replace("{architecture}", &self.architecture)
+            + &self.suffix
+    }
+}
+
+/// The PoC instructions. Without `require_poc`, hunters substantiate by close
+/// reading, skipping the token-hungry compile-and-run loop.
+struct PocText {
+    intro: &'static str,
+    rule: &'static str,
+    step: &'static str,
+}
+
+impl PocText {
+    fn new(require_poc: bool) -> Self {
+        if require_poc {
+            Self {
+                intro: "Write, compile, and run any proof-of-concept code in your private \
+                        scratch dir `{scratch_dir}`. ",
+                rule: "- Confirm with a PoC when you can: write it in the scratch dir, \
+                       compile and run\n  it, and report only if it behaves as the bug \
+                       predicts.",
+                step: "- [ ] Attempt a PoC in the scratch dir; compile and run it",
+            }
+        } else {
+            Self {
+                intro: "",
+                rule: "- Do not write proof-of-concept code. Substantiate findings by \
+                       tracing the data\n  flow in the source and citing exact \
+                       locations; leave `poc_path` unset.",
+                step: "- [ ] Substantiate the hypothesis by close reading; cite exact lines",
+            }
+        }
+    }
+}
+
+/// Recon's path prefixes, else the free-form hint gapfill/feedback tasks set.
+fn scope_line(task: &Task) -> String {
+    if task.scope_paths.is_empty() {
+        task.scope_hint.clone()
+    } else {
+        task.scope_paths.join(", ")
+    }
+}
+
+fn hypothesis_line(task: &Task) -> String {
+    if task.hypothesis.trim().is_empty() {
+        "(none given — form your own from the attack class and scope)".to_string()
+    } else {
+        task.hypothesis.clone()
+    }
+}
+
+fn targets_block(task: &Task) -> String {
+    if task.targets.is_empty() {
+        "(none given — locate the relevant code within scope yourself)".to_string()
+    } else {
+        task.targets
+            .iter()
+            .map(|t| format!("- {t}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn skills_line(task: &Task, use_skills: bool) -> String {
+    if !use_skills {
+        "(disabled for this run — use judgment)".to_string()
+    } else if task.suggested_skills.is_empty() {
+        "(none suggested — use judgment)".to_string()
+    } else {
+        task.suggested_skills.join(", ")
+    }
+}
+
+/// One hunter's outcome, handed back to the stage.
 struct Finished {
     task: Task,
     scratch_dir: PathBuf,
-    out: Result<(Vec<RawFinding>, Vec<RawGap>)>,
-    /// The hunter's concurrency slot, held until [`record`] has persisted the
-    /// outcome, so a new hunter never starts ahead of a finished one's save.
-    slot: OwnedSemaphorePermit,
+    out: Result<HunterOutput>,
+    /// Held until [`record`] has saved the outcome, so a new hunter never
+    /// starts ahead of a finished one's save.
+    _slot: OwnedSemaphorePermit,
 }
 
-/// Running totals for the end-of-hunt summary.
 #[derive(Default)]
 struct Tally {
     succeeded: usize,
@@ -325,35 +338,33 @@ struct Tally {
     findings: usize,
 }
 
-/// Persist one finished hunter: its findings (PoCs copied out of scratch), its
-/// gaps, and then its ledger entry. The task is marked processed only on
-/// success, so a failed hunter is retried on the next pass.
-fn record(ctx: &StageCtx, run_id: &str, done: Finished, tally: &mut Tally) -> Result<()> {
+/// Persist one hunter's findings (PoCs copied out of scratch) and gaps, then
+/// its ledger entry. A failed hunter is not marked, so the next pass retries it.
+fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally) -> Result<()> {
     let Finished {
         task,
         scratch_dir,
         out,
-        slot: _slot,
+        ..
     } = done;
-    let (findings, gaps) = match out {
+    let output = match out {
         Ok(output) => output,
-        // One hunter failing must not abort the whole stage.
         Err(e) => {
             tally.failed += 1;
             if is_usage_limited(&e) {
                 tally.limit_failures += 1;
             }
-            warn!(task = %task.id, error = %e, "hunter failed");
+            warn!(task = %task.id, error = format!("{e:#}"), "hunter failed");
             return Ok(());
         }
     };
     tally.succeeded += 1;
-    for (i, rf) in findings.into_iter().enumerate() {
+    for (i, rf) in output.findings.into_iter().enumerate() {
         let id = finding_id(run_id, &task.id, i);
         // Keep the hunter's own path if the copy fails, so the lead survives.
         let poc_path = rf
             .poc_path
-            .map(|p| persist_poc(&ctx.artifacts, &scratch_dir, &id, &p).unwrap_or(p));
+            .map(|p| persist_poc(artifacts, &scratch_dir, &id, &p).unwrap_or(p));
         let finding = Finding {
             id,
             task_id: task.id.clone(),
@@ -365,25 +376,24 @@ fn record(ctx: &StageCtx, run_id: &str, done: Finished, tally: &mut Tally) -> Re
             confidence: rf.confidence,
             poc_path,
         };
-        ctx.artifacts.append_jsonl(names::CANDIDATES, &finding)?;
+        artifacts.append_jsonl(names::CANDIDATES, &finding)?;
         tally.findings += 1;
     }
-    for g in gaps {
+    for g in output.gaps {
         let marker = GapMarker {
             task_id: task.id.clone(),
             area: g.area,
             attack_class: g.attack_class,
             reason: g.reason,
         };
-        ctx.artifacts.append_jsonl(names::GAPS, &marker)?;
+        artifacts.append_jsonl(names::GAPS, &marker)?;
     }
-    ctx.artifacts.append_jsonl(names::HUNTED, &task.id)
+    artifacts.append_jsonl(names::HUNTED, &task.id)
 }
 
-/// Copy a finding's PoC out of the hunter's scratch dir, which does not outlive
-/// the container, into `out_dir/pocs/<finding id>/`. Returns the copy's path
-/// relative to `out_dir`, or `None` (with a warning) when `poc_path` does not
-/// exist or points outside the scratch dir.
+/// Copy a PoC out of the hunter's scratch dir into `pocs/<finding id>/`,
+/// returning its path relative to `out_dir`. `None` when it is missing or
+/// lies outside the scratch dir.
 fn persist_poc(
     artifacts: &Artifacts,
     scratch_dir: &Path,
@@ -404,106 +414,29 @@ fn persist_poc(
         artifacts.import(&rel, &src)?;
         Ok(rel.to_string_lossy().into_owned())
     };
-    match copy() {
-        Ok(rel) => Some(rel),
-        Err(e) => {
-            warn!(finding = finding_id, poc_path, error = %e, "could not keep PoC");
-            None
-        }
-    }
+    copy()
+        .inspect_err(|e| warn!(finding = finding_id, poc_path, error = %e, "could not keep PoC"))
+        .ok()
 }
 
-/// A finding id unique across runs: `<run>-<task>-F<nn>`, `index` 0-based.
+/// Unique across runs: `<run>-<task>-F<nn>`.
 fn finding_id(run_id: &str, task_id: &str, index: usize) -> String {
     format!("{run_id}-{task_id}-F{:02}", index + 1)
-}
-
-/// The scope shown to the hunter: recon's path-prefix list when present, else
-/// the free-form scope hint (gapfill/feedback tasks set only the hint).
-fn scope_line(task: &Task) -> String {
-    if task.scope_paths.is_empty() {
-        task.scope_hint.clone()
-    } else {
-        task.scope_paths.join(", ")
-    }
-}
-
-/// The hypothesis line shown to the hunter, with a fallback when recon left it
-/// unset so the prompt never renders an empty field.
-fn hypothesis_line(task: &Task) -> String {
-    if task.hypothesis.trim().is_empty() {
-        "(none given — form your own from the attack class and scope)".to_string()
-    } else {
-        task.hypothesis.clone()
-    }
-}
-
-/// The starting-points block shown to the hunter, one target per line.
-fn targets_block(task: &Task) -> String {
-    if task.targets.is_empty() {
-        "(none given — locate the relevant code within scope yourself)".to_string()
-    } else {
-        task.targets
-            .iter()
-            .map(|t| format!("- {t}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-/// The Trail of Bits skills the hunter should apply, recon's per-task picks.
-/// With skills disabled for the run, the per-task picks are ignored.
-fn skills_line(task: &Task, use_skills: bool) -> String {
-    if !use_skills {
-        "(disabled for this run — use judgment)".to_string()
-    } else if task.suggested_skills.is_empty() {
-        "(none suggested — use judgment)".to_string()
-    } else {
-        task.suggested_skills.join(", ")
-    }
-}
-
-/// Order tasks for spawning. Concurrency only runs `concurrency` hunters at once
-/// and a usage limit can truncate the tail, so spawn order is value order:
-/// recon's priority first, since only its tasks passed the admission bar, then
-/// origin as a tiebreak (see [`crate::domain::TaskOrigin::hunt_priority`]).
-/// Stable, so queue order breaks the remaining ties.
-fn spawn_order(tasks: &mut [Task]) {
-    tasks.sort_by_key(|t| (t.priority.hunt_rank(), t.origin.hunt_priority()));
-}
-
-/// Run one hunter; an unusable answer or a timeout gets one repair turn in the
-/// hunter's own session (see [`run_parsed`]) before the task counts as failed.
-async fn run_hunter(
-    runner: &dyn AgentRunner,
-    req: AgentRequest,
-) -> Result<(Vec<RawFinding>, Vec<RawGap>)> {
-    run_parsed(runner, req, |result| {
-        let json = extract_json_block(&result.stdout).context("hunter output had no json block")?;
-        let out: HunterOutput =
-            serde_json::from_str(json).context("hunter output was not valid json")?;
-        Ok((out.findings, out.gaps))
-    })
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::TaskOrigin;
+    use crate::domain::fixtures;
+    use crate::domain::{Priority, TaskOrigin};
 
     fn task(hypothesis: &str, targets: &[&str], skills: &[&str]) -> Task {
         Task {
-            id: "T-0001".into(),
-            attack_class: "overflow".into(),
             scope_hint: "src/a.rs".into(),
-            scope_paths: Vec::new(),
             hypothesis: hypothesis.into(),
-            targets: targets.iter().map(|s| s.to_string()).collect(),
-            suggested_skills: skills.iter().map(|s| s.to_string()).collect(),
-            tags: Vec::new(),
-            priority: crate::domain::Priority::default(),
-            origin: TaskOrigin::Recon,
+            targets: targets.iter().map(ToString::to_string).collect(),
+            suggested_skills: skills.iter().map(ToString::to_string).collect(),
+            ..fixtures::task("T-0001")
         }
     }
 
@@ -539,9 +472,8 @@ mod tests {
     #[test]
     fn finding_ids_carry_the_run_so_they_never_repeat_across_runs() {
         let a = finding_id("20260901T000000Z", "T-0001", 0);
-        let b = finding_id("20260902T000000Z", "T-0001", 0);
         assert_eq!(a, "20260901T000000Z-T-0001-F01");
-        assert_ne!(a, b);
+        assert_ne!(a, finding_id("20260902T000000Z", "T-0001", 0));
     }
 
     #[test]
@@ -560,47 +492,45 @@ mod tests {
     }
 
     #[test]
+    fn steering_falls_back_when_unset_or_disabled() {
+        let t = task("   ", &[], &[]);
+        assert!(hypothesis_line(&t).contains("form your own"));
+        assert!(targets_block(&t).contains("locate the relevant code"));
+        assert!(skills_line(&t, true).contains("use judgment"));
+        let t = task("x", &[], &["sharp-edges"]);
+        let line = skills_line(&t, false);
+        assert!(line.contains("disabled") && !line.contains("sharp-edges"));
+    }
+
+    #[test]
     fn scope_prefers_paths_then_falls_back_to_hint() {
         let mut t = task("h", &[], &[]);
-        // With no scope_paths, the free-form hint is shown.
         assert_eq!(scope_line(&t), "src/a.rs");
-        // recon's path prefixes take precedence and render joined.
         t.scope_paths = vec!["lnwallet/".into(), "htlcswitch/".into()];
         assert_eq!(scope_line(&t), "lnwallet/, htlcswitch/");
     }
 
     #[test]
-    fn steering_falls_back_when_unset() {
-        let t = task("   ", &[], &[]);
-        assert!(hypothesis_line(&t).contains("form your own"));
-        assert!(targets_block(&t).contains("locate the relevant code"));
-        assert!(skills_line(&t, true).contains("use judgment"));
-    }
-
-    #[test]
-    fn disabling_skills_ignores_per_task_picks() {
-        let t = task("x", &["src/a.rs"], &["sharp-edges"]);
-        let line = skills_line(&t, false);
-        assert!(line.contains("disabled"));
-        assert!(!line.contains("sharp-edges"));
+    fn poc_text_embeds_the_scratch_dir_only_when_pocs_are_required() {
+        let with = PocText::new(true);
+        assert!(with.intro.contains("{scratch_dir}"));
+        let without = PocText::new(false);
+        assert!(without.intro.is_empty());
+        assert!(without.rule.contains("Do not write proof-of-concept"));
     }
 
     #[test]
     fn spawn_order_is_priority_then_origin() {
-        // Unvetted tasks never jump ahead of recon's higher-priority ones.
-        let mk = |id: &str, origin: TaskOrigin, priority: crate::domain::Priority| {
-            let mut t = task("h", &[], &[]);
-            t.id = id.into();
-            t.origin = origin;
-            t.priority = priority;
-            t
+        let mk = |id: &str, origin: TaskOrigin, priority: Priority| Task {
+            priority,
+            origin,
+            ..fixtures::task(id)
         };
-        use crate::domain::Priority::{High, Low, Medium};
         let mut tasks = [
-            mk("recon-low", TaskOrigin::Recon, Low),
-            mk("recon-med", TaskOrigin::Recon, Medium),
-            mk("recon-high", TaskOrigin::Recon, High),
-            mk("gapfill", TaskOrigin::Gapfill, Medium),
+            mk("recon-low", TaskOrigin::Recon, Priority::Low),
+            mk("recon-med", TaskOrigin::Recon, Priority::Medium),
+            mk("recon-high", TaskOrigin::Recon, Priority::High),
+            mk("gapfill", TaskOrigin::Gapfill, Priority::Medium),
         ];
         spawn_order(&mut tasks);
         let order: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();

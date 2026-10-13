@@ -1,11 +1,9 @@
-//! fee1dead CLI entry point.
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use fee1dead::config::Config;
-use fee1dead::pipeline::Pipeline;
+use fee1dead::pipeline::{self, Pipeline};
 
 #[derive(Parser)]
 #[command(
@@ -13,6 +11,9 @@ use fee1dead::pipeline::Pipeline;
     about = "AI-CLI-agnostic vulnerability discovery harness"
 )]
 struct Cli {
+    /// Path to the harness config TOML.
+    #[arg(short, long, global = true, default_value = "config/harness.toml")]
+    config: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
@@ -21,34 +22,19 @@ struct Cli {
 enum Command {
     /// Run the pipeline stages listed in the config.
     Run {
-        /// Path to the harness config TOML.
-        #[arg(short, long, default_value = "config/harness.toml")]
-        config: PathBuf,
-        /// Continue the last run in `run.out_dir` instead of starting fresh:
-        /// skips recon and keeps every artifact, so hunt picks up the tasks a
-        /// usage limit or crash left unprocessed.
+        /// Continue the last run in `run.out_dir`: skip recon and keep every
+        /// artifact, so hunt picks up the tasks left unprocessed.
         #[arg(long)]
         resume: bool,
     },
-    /// Parse and validate a config, printing the resolved stages.
-    Check {
-        #[arg(short, long, default_value = "config/harness.toml")]
-        config: PathBuf,
-    },
-    /// Print the firewall allow-list (one host per line) for init-firewall.sh.
-    FirewallHosts {
-        #[arg(short, long, default_value = "config/harness.toml")]
-        config: PathBuf,
-    },
-    /// Compile a finished or partial run's hunter output into one reviewable
-    /// findings.json, without running any agent. Use after a run that spent its
-    /// token budget before the review stages.
+    /// Validate a config, printing the resolved stages.
+    Check,
+    /// Print the firewall allow-list, one host per line, for init-firewall.sh.
+    FirewallHosts,
+    /// Compile a finished or partial run into findings.json, with no agent.
     Aggregate {
-        #[arg(short, long, default_value = "config/harness.toml")]
-        config: PathBuf,
-        /// Read artifacts from this directory instead of the config's
-        /// `run.out_dir`. Use when the config points at a container path (e.g.
-        /// `/work/out`) but the artifacts are on the host (e.g. `./out`).
+        /// Read artifacts here instead of `run.out_dir`, e.g. the host's
+        /// `./out` when the config names the container's `/work/out`.
         #[arg(short, long)]
         out_dir: Option<PathBuf>,
     },
@@ -64,9 +50,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let cfg = Config::load(&cli.config)?;
     match cli.command {
-        Command::Run { config, resume } => {
-            let cfg = Config::load(&config)?;
+        Command::Run { resume } => {
             let pipeline = Pipeline::new(cfg)?;
             if resume {
                 pipeline.resume().await
@@ -74,26 +60,23 @@ async fn main() -> Result<()> {
                 pipeline.run().await
             }
         }
-        Command::Check { config } => {
-            let cfg = Config::load(&config)?;
+        Command::Check => {
+            let stages: Vec<&str> = cfg.stages.enabled.iter().map(|s| s.name()).collect();
             println!(
                 "config OK: provider={}, stages={}",
                 cfg.provider.default,
-                cfg.stages.enabled.join(" -> ")
+                stages.join(" -> ")
             );
             Ok(())
         }
-        Command::FirewallHosts { config } => {
-            let cfg = Config::load(&config)?;
+        Command::FirewallHosts => {
             for host in &cfg.firewall.allow {
                 println!("{host}");
             }
             Ok(())
         }
-        Command::Aggregate { config, out_dir } => {
-            let cfg = Config::load(&config)?;
-            let dir = out_dir.unwrap_or_else(|| cfg.run.out_dir.clone());
-            fee1dead::pipeline::aggregate_dir(&dir)
+        Command::Aggregate { out_dir } => {
+            pipeline::aggregate_dir(out_dir.unwrap_or(cfg.run.out_dir))
         }
     }
 }

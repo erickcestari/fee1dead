@@ -75,7 +75,7 @@ Single Rust binary, modularized:
   `github` sink also exposes `ReportSink::existing_reports` (its already-filed
   issues), which the `skip-reported` stage consumes to prune duplicates before
   validate (see below).
-- `src/config.rs` — per-run TOML config, validated at load.
+- `src/config/` — per-run TOML config, validated at load.
 - `prompts/`, `schema/` — embedded into the binary at build time.
 - `skills/` — the Trail of Bits plugin suite. Recon suggests skills per task and the stage prompts name them.
 

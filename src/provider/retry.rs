@@ -1,8 +1,5 @@
-//! Retry wrapper for transient throttling.
-//!
-//! The CLIs already retry a 429 briefly on their own, so one that reaches the
-//! harness means the burst outlasted those retries: back off for longer, then
-//! run the request again. An account quota ([`ProviderError::UsageLimited`]) is
+//! Retry on transient throttling. The CLIs already retry a 429 briefly, so one
+//! that reaches the harness outlasted those: back off for longer. A quota is
 //! passed straight through, since retrying it before it resets only bounces.
 
 use std::sync::Arc;
@@ -14,9 +11,6 @@ use tracing::warn;
 
 use super::{AgentRequest, AgentResult, AgentRunner, is_rate_limited};
 
-#[cfg(doc)]
-use super::ProviderError;
-
 /// Waits before each retry; the run is attempted `len + 1` times in all.
 const BACKOFF: &[Duration] = &[
     Duration::from_secs(60),
@@ -24,8 +18,7 @@ const BACKOFF: &[Duration] = &[
     Duration::from_secs(240),
 ];
 
-/// Runs requests through `inner`, retrying the ones that fail on a transient
-/// rate limit. A retried agent starts over, so its earlier partial work is lost.
+/// A retried agent starts over; its earlier partial work is lost.
 pub struct RetryOnRateLimit {
     inner: Arc<dyn AgentRunner>,
     backoff: &'static [Duration],
@@ -86,7 +79,6 @@ mod tests {
                 Some(e) => Err(e.into()),
                 None => Ok(AgentResult {
                     stdout: "ok".into(),
-                    exit_code: 0,
                     session_id: None,
                 }),
             }
@@ -94,21 +86,12 @@ mod tests {
     }
 
     fn req() -> AgentRequest {
-        AgentRequest {
-            prompt: "p".into(),
-            system: None,
-            working_dir: PathBuf::from("/w"),
-            output_dir: PathBuf::from("/w"),
-            extra_dirs: Vec::new(),
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
-            timeout: Duration::from_secs(1),
-            resume: None,
-            cache_1h: false,
-            effort: Effort::Low,
-            model: None,
-            stream_log_path: None,
-        }
+        AgentRequest::new(
+            "p".into(),
+            PathBuf::from("/w"),
+            Duration::from_secs(1),
+            Effort::Low,
+        )
     }
 
     const NO_WAIT: &[Duration] = &[Duration::ZERO, Duration::ZERO];

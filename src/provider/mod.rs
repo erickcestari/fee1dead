@@ -1,214 +1,35 @@
-//! Provider abstraction: how the harness invokes an AI coding CLI.
-//!
-//! Every stage talks to a provider only through [`AgentRunner`]. Adding a new
-//! CLI means either implementing this trait (for custom output parsing) or, for
-//! most CLIs, adding a `[providers.<name>]` block of `type = "exec"` to the
-//! config with no Rust code at all (see [`generic_exec`]).
+//! The only seam between the harness and an AI CLI. Built-in adapters stream
+//! their CLI's events; any other CLI is a `type = "exec"` config block.
 
 mod claude_code;
+mod error;
+mod final_output;
 mod generic_exec;
 #[cfg(any(test, feature = "mock-runner"))]
 mod mock;
 mod opencode;
 mod retry;
+mod stream;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use tokio::fs;
-use tracing::warn;
 
 use crate::config::ProviderConfig;
 
-/// A provider failure the orchestrator reacts to differently than a generic
-/// error.
-#[derive(Debug, thiserror::Error)]
-pub enum ProviderError {
-    /// The account's usage / session / weekly quota is spent, or the
-    /// operator's own usage cap was reached. Retrying before it resets just
-    /// bounces off the same limit, so a stage that sees this should stop
-    /// spawning new agents rather than burn the rest of its queue on certain
-    /// failures.
-    #[error("usage limit reached: {0}")]
-    UsageLimited(String),
-    /// The backend is throttling requests (429 / overloaded) regardless of the
-    /// account's quota, e.g. when forked hunters start in a burst. Transient:
-    /// retried after a backoff (see [`RetryOnRateLimit`]), never a reason to
-    /// stop the run.
-    #[error("rate limited: {0}")]
-    RateLimited(String),
-    /// The agent ran past its wall-clock timeout and was killed. Its partial
-    /// transcript is kept, and `session_id` (when the stream got far enough to
-    /// report one) lets a stage resume it to salvage the work done so far.
-    #[error("agent timed out (partial stream log kept)")]
-    TimedOut { session_id: Option<String> },
-}
-
-/// Whether an error chain carries a [`ProviderError::UsageLimited`].
-pub fn is_usage_limited(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ProviderError>()
-        .is_some_and(|e| matches!(e, ProviderError::UsageLimited(_)))
-}
-
-/// Whether an error chain carries a [`ProviderError::RateLimited`].
-pub fn is_rate_limited(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<ProviderError>()
-        .is_some_and(|e| matches!(e, ProviderError::RateLimited(_)))
-}
-
-/// The session of an agent that timed out, when the error is a
-/// [`ProviderError::TimedOut`] that recorded one.
-pub fn timed_out_session(err: &anyhow::Error) -> Option<String> {
-    match err.downcast_ref::<ProviderError>()? {
-        ProviderError::TimedOut { session_id } => session_id.clone(),
-        _ => None,
-    }
-}
-
-/// Filename the agent is instructed to write its complete final answer to,
-/// inside its [`AgentRequest::output_dir`]. The harness reads this back as the
-/// agent's result, so the consumed output is decoupled from the streamed event
-/// log (and survives even if the chat output is noisy). A `.json` file because
-/// every stage's final answer is a bare JSON document (no markdown fence).
-/// Defined once here because it is a contract shared between the prompt
-/// instruction and the read-back; see [`final_output_path`].
-pub const FINAL_OUTPUT_FILE: &str = "agent-final-output.json";
-
-/// Absolute path of the agent's final-output file for a given output dir.
-pub fn final_output_path(output_dir: &Path) -> PathBuf {
-    output_dir.join(FINAL_OUTPUT_FILE)
-}
-
-/// Append the "write your final answer to a file" instruction to the user
-/// prompt. Shared by every streaming adapter, since the file is the contract
-/// the harness reads results back through (see [`FINAL_OUTPUT_FILE`]).
-///
-/// It goes in the per-agent user prompt — never a shared system prefix — on
-/// purpose: the path is per-agent, so injecting it into the cached system
-/// prompt would bust the cross-fork cache the whole design relies on. A new
-/// user turn is uncached regardless, so this costs nothing extra.
-pub(crate) fn with_final_output_instruction(prompt: &str, output_dir: &Path) -> String {
-    let path = final_output_path(output_dir);
-    format!(
-        "{prompt}\n\n---\nWhen you are finished, use the Write tool to save your \
-         complete final answer to this file:\n  {}\nThe harness reads that file, \
-         not your chat output, so it must stand on its own. After writing it, \
-         reply with only the word `done`: repeating the answer in chat would \
-         pay for all of its tokens a second time.",
-        path.display()
-    )
-}
-
-/// Remove any final-output file left in the request's output dir (creating the
-/// dir if needed), so the read-back can only ever see this run's answer. Without
-/// it, an agent that fails to write the file would be credited with whatever a
-/// previous agent left there.
-pub(crate) async fn clear_final_output(req: &AgentRequest) -> Result<()> {
-    fs::create_dir_all(&req.output_dir)
-        .await
-        .with_context(|| format!("creating output dir {}", req.output_dir.display()))?;
-    let path = final_output_path(&req.output_dir);
-    match fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("removing stale {}", path.display())),
-    }
-}
-
-/// Read back the answer the agent was told to write to [`FINAL_OUTPUT_FILE`],
-/// and mirror it beside its transcript in the out dir so it is visible there
-/// without reaching into the agent's scratch dir.
-///
-/// `fallback` is the provider's own notion of the agent's last message, used
-/// when the agent forgot to write the file (or lacked a write tool), so a stray
-/// run still makes progress. Mirroring is best-effort: it must never fail a run.
-pub(crate) async fn read_final_output(req: &AgentRequest, fallback: &str) -> String {
-    let final_path = final_output_path(&req.output_dir);
-    let output = match fs::read_to_string(&final_path).await {
-        Ok(s) if !s.trim().is_empty() => s,
-        _ => {
-            warn!(
-                path = %final_path.display(),
-                "agent did not write its final-output file; using the provider's last message"
-            );
-            fallback.to_string()
-        }
-    };
-
-    if let Some(log_path) = &req.stream_log_path {
-        let sidecar = output_sidecar(log_path);
-        if let Err(e) = fs::write(&sidecar, &output).await {
-            warn!(error = %e, path = %sidecar.display(), "failed to persist agent final output");
-        }
-    }
-    output
-}
-
-/// Path of the final-answer sidecar that sits beside a stream log: the
-/// transcript `<base>.jsonl` is paired with the consumed answer
-/// `<base>.output.json` in the same dir.
-fn output_sidecar(stream_log_path: &Path) -> PathBuf {
-    stream_log_path.with_extension("output.json")
-}
-
-/// Create (truncating) an agent's stream-log file, making parent dirs as needed.
-pub(crate) async fn open_log(path: &Path) -> Result<fs::File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating log dir {}", parent.display()))?;
-    }
-    fs::File::create(path)
-        .await
-        .with_context(|| format!("creating stream log {}", path.display()))
-}
-
-/// Classify a CLI error message as an account quota or a transient throttle.
-///
-/// Matched against the human strings the CLIs surface, e.g. claude's "You've hit
-/// your session limit · resets 2:50am" (quota) or an API "rate_limit_error"
-/// (throttle). The two need opposite handling: a quota stops the run until it
-/// resets, a throttle is retried after a backoff. Claude labels server-side
-/// throttling "not your usage limit", which must not read as a quota.
-pub(crate) fn limit_error(msg: &str) -> Option<ProviderError> {
-    let m = msg.to_lowercase();
-    let quota = !m.contains("not your usage limit")
-        && m.contains("limit")
-        && ["session", "usage", "weekly", "hit your", "resets"]
-            .iter()
-            .any(|w| m.contains(w));
-    if quota {
-        return Some(ProviderError::UsageLimited(msg.to_string()));
-    }
-    let throttled = [
-        "rate limit",
-        "rate_limit",
-        "too many requests",
-        "overloaded",
-        "temporarily limiting",
-    ]
-    .iter()
-    .any(|w| m.contains(w));
-    throttled.then(|| ProviderError::RateLimited(msg.to_string()))
-}
-
 pub use claude_code::ClaudeCodeRunner;
+pub use error::{ProviderError, is_rate_limited, is_usage_limited, timed_out_session};
 pub use generic_exec::ExecRunner;
 #[cfg(any(test, feature = "mock-runner"))]
 pub use mock::{CannedReply, MockRunner};
 pub use opencode::OpenCodeRunner;
 pub use retry::RetryOnRateLimit;
 
-/// Reasoning effort for an agent run, mapped to `CLAUDE_CODE_EFFORT_LEVEL`.
-///
-/// Higher levels think longer before acting: more thorough, more tokens (and
-/// more turns, each re-reading the cached context). Match it to the stage's
-/// actual need — open-ended multi-hop tracing wants [`Effort::Xhigh`]; a
-/// mechanical, schema-bound transform wants [`Effort::Low`]. Providers without
-/// an effort knob ignore it.
-#[derive(Debug, Clone, Copy)]
+/// Reasoning effort for one run. Providers without an effort knob ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
     Low,
     Medium,
@@ -227,71 +48,51 @@ impl Effort {
     }
 }
 
-/// A request to run one agent task.
+/// One agent run. Adapters ignore fields their CLI has no equivalent for.
 #[derive(Debug, Clone)]
 pub struct AgentRequest {
-    /// The user-turn prompt for the agent.
     pub prompt: String,
-    /// An optional system/role prompt, when the provider supports one.
-    pub system: Option<String>,
-    /// The directory the agent runs in (its per-task scratch dir).
     pub working_dir: PathBuf,
-    /// Private directory the agent writes its final answer into (see
-    /// [`FINAL_OUTPUT_FILE`]). Must be unique per agent run: the provider clears
-    /// the answer file before the run and reads it back after, so two agents
-    /// sharing it could be credited with each other's answer.
+    /// Where the agent writes its answer file. Must be unique per run, or one
+    /// agent could be credited with another's answer.
     pub output_dir: PathBuf,
-    /// Extra directories the agent may read beyond `working_dir` (e.g. the
-    /// cloned reference repo). Providers that gate file access by directory add
-    /// each one; others ignore them.
+    /// Extra directories the agent may read (e.g. the reference repo).
     pub extra_dirs: Vec<PathBuf>,
-    /// Tools the agent is permitted to use, when the provider supports an
-    /// allow-list. Empty means "provider default".
-    pub allowed_tools: Vec<String>,
-    /// Tools the agent is forbidden from using, when the provider supports a
-    /// deny-list. Takes precedence over the allow-list. Used to stop a stage
-    /// agent from spawning its own sub-agents (the orchestrator owns
-    /// parallelism). Empty means "no extra restriction".
+    /// Tools removed from the agent's context.
     pub disallowed_tools: Vec<String>,
-    /// Wall-clock timeout.
     pub timeout: Duration,
-    /// When set, fork a prior agent session so this run inherits its
-    /// conversation context. Providers without a session concept ignore it.
+    /// Fork this prior session, inheriting its context.
     pub resume: Option<ResumeSession>,
-    /// Extend the prompt cache from the default 5m TTL to 1h. Worth its higher
-    /// write premium only for a session that is forked from and whose prefix
-    /// must outlive the 5m window (recon); a leaf agent that nothing forks from
-    /// should leave it false. Providers without prompt caching ignore it.
+    /// Extend the prompt cache TTL from 5m to 1h. Only worth its write premium
+    /// for a session others fork from after the 5m window.
     pub cache_1h: bool,
-    /// Reasoning effort for this run. Set per stage to its actual need.
     pub effort: Effort,
-    /// Override the provider's configured model for this one run. Lets a stage
-    /// pick a cheaper model for a cheap sub-task (e.g. a lightweight dedup judge)
-    /// without a second provider. `None` uses the provider default. Providers
-    /// without a model knob ignore it.
+    /// Overrides the provider's configured model.
     pub model: Option<String>,
-    /// When set, tee the provider's full event stream to this file as it runs,
-    /// one JSON event per line. Lets a run's agent transcripts be inspected
-    /// after the fact, and preserves partial output if the agent times out.
-    /// Providers that don't stream ignore it.
+    /// Tee the CLI's event stream here, one event per line.
     pub stream_log_path: Option<PathBuf>,
 }
 
-/// A prior session to fork from.
-///
-/// `session_id` identifies the conversation; `project_dir` is the directory it
-/// was created in. Session lookup is scoped to that directory, so a forking
-/// provider must run there rather than in the request's `working_dir`.
-#[derive(Debug, Clone)]
-pub struct ResumeSession {
-    pub session_id: String,
-    pub project_dir: PathBuf,
-}
-
 impl AgentRequest {
-    /// The directory this request's own session lives in, for forking it
-    /// later: a fork runs (and stores its session) in the forked session's
-    /// project dir, a fresh run in its working dir.
+    /// A cold run in `dir` (also its output dir) with every option off.
+    pub fn new(prompt: String, dir: PathBuf, timeout: Duration, effort: Effort) -> Self {
+        Self {
+            prompt,
+            output_dir: dir.clone(),
+            working_dir: dir,
+            extra_dirs: Vec::new(),
+            disallowed_tools: Vec::new(),
+            timeout,
+            resume: None,
+            cache_1h: false,
+            effort,
+            model: None,
+            stream_log_path: None,
+        }
+    }
+
+    /// Where this run's own session lives, for forking it later: a fork runs
+    /// in the forked session's project dir.
     pub fn session_dir(&self) -> &Path {
         self.resume
             .as_ref()
@@ -299,228 +100,37 @@ impl AgentRequest {
     }
 }
 
-/// The result of an agent run.
-///
-/// Cost and usage (tokens, prompt-cache hits, timing) are intentionally *not*
-/// here: a streaming provider tees its full event log to disk
-/// ([`AgentRequest::stream_log_path`]), and the final `result` event in that log
-/// already carries `total_cost_usd`, `usage`, `duration_ms`, etc. Re-surfacing
-/// them through a struct would duplicate that record; profile a run from the
-/// logs instead.
+/// A prior session to fork. Session lookup is scoped to `project_dir`, so a
+/// forking adapter must run there.
+#[derive(Debug, Clone)]
+pub struct ResumeSession {
+    pub session_id: String,
+    pub project_dir: PathBuf,
+}
+
+/// Cost and token usage are not here: they are in the final event of the
+/// stream log, so a run is profiled from the logs.
 #[derive(Debug, Clone)]
 pub struct AgentResult {
-    /// Raw text the agent produced (its final message, or stdout).
+    /// The agent's final answer.
     pub stdout: String,
-    pub exit_code: i32,
-    /// This run's session id, when the provider exposes one. Lets a later stage
-    /// fork from this conversation (see [`ResumeSession`]).
+    /// Lets a later run fork this conversation.
     pub session_id: Option<String>,
 }
 
-/// The single seam between the harness and any AI CLI.
 #[async_trait]
 pub trait AgentRunner: Send + Sync {
     /// Provider name, for logging.
     fn name(&self) -> &str;
 
-    /// Run one agent task to completion.
     async fn run(&self, req: AgentRequest) -> Result<AgentResult>;
 }
 
-/// Build the runner selected by a [`ProviderConfig`].
-///
-/// This is the only place that maps config variants to concrete adapters; new
-/// adapter types are wired in here.
-pub fn build_runner(name: &str, cfg: &ProviderConfig) -> Box<dyn AgentRunner> {
+pub fn build_runner(name: &str, cfg: &ProviderConfig) -> Arc<dyn AgentRunner> {
+    let name = name.to_string();
     match cfg {
-        ProviderConfig::ClaudeCode {
-            model,
-            extra_args,
-            max_weekly_usage_pct,
-        } => Box::new(ClaudeCodeRunner::new(
-            name.to_string(),
-            model.clone(),
-            extra_args.clone(),
-            *max_weekly_usage_pct,
-        )),
-        ProviderConfig::OpenCode {
-            model,
-            agent,
-            variant,
-            auto,
-            extra_args,
-        } => Box::new(OpenCodeRunner::new(
-            name.to_string(),
-            model.clone(),
-            agent.clone(),
-            variant.clone(),
-            *auto,
-            extra_args.clone(),
-        )),
-        ProviderConfig::Exec {
-            command,
-            args,
-            output,
-        } => Box::new(ExecRunner::new(
-            name.to_string(),
-            command.clone(),
-            args.clone(),
-            *output,
-        )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-
-    #[test]
-    fn final_output_instruction_keeps_prompt_and_points_at_output_dir() {
-        let out = with_final_output_instruction("do the thing", Path::new("/work/scratch/t1"));
-        // Original prompt is preserved verbatim at the front.
-        assert!(out.starts_with("do the thing"));
-        // And the agent is pointed at the file the harness will read back.
-        assert!(out.contains("/work/scratch/t1/agent-final-output.json"));
-        assert!(out.contains("Write tool"));
-        // The answer must not be repeated in chat, doubling its output tokens.
-        assert!(out.contains("reply with only the word `done`"));
-    }
-
-    #[test]
-    fn output_sidecar_sits_beside_the_transcript() {
-        let log = Path::new("/work/out/logs/hunt-G-0093.jsonl");
-        assert_eq!(
-            output_sidecar(log),
-            Path::new("/work/out/logs/hunt-G-0093.output.json")
-        );
-    }
-
-    fn is_quota(msg: &str) -> bool {
-        matches!(limit_error(msg), Some(ProviderError::UsageLimited(_)))
-    }
-
-    fn is_throttle(msg: &str) -> bool {
-        matches!(limit_error(msg), Some(ProviderError::RateLimited(_)))
-    }
-
-    #[test]
-    fn separates_account_quota_from_transient_throttling() {
-        // A depleted account: stop spawning until it resets.
-        assert!(is_quota(
-            "You've hit your session limit · resets 2:50am (UTC)"
-        ));
-        assert!(is_quota("Usage limit reached"));
-        assert!(is_quota("Weekly limit reached ∙ resets Mon 9am"));
-        // Server-side throttling: back off and retry, never stop the run.
-        assert!(is_throttle("rate limit exceeded, please retry"));
-        assert!(is_throttle(
-            r#"API Error: 429 {"type":"error","error":{"type":"rate_limit_error"}}"#
-        ));
-        assert!(is_throttle(
-            "Server is temporarily limiting requests (not your usage limit)"
-        ));
-        assert!(is_throttle("overloaded_error"));
-        // Ordinary failures are neither, or a one-off error would stop a stage.
-        assert!(limit_error("hunter output was not valid json").is_none());
-        assert!(limit_error("file not found").is_none());
-        assert!(limit_error("").is_none());
-    }
-
-    #[test]
-    fn a_timeout_exposes_its_session_for_salvage() {
-        let err: anyhow::Error = ProviderError::TimedOut {
-            session_id: Some("s-1".into()),
-        }
-        .into();
-        assert_eq!(timed_out_session(&err).as_deref(), Some("s-1"));
-        let early: anyhow::Error = ProviderError::TimedOut { session_id: None }.into();
-        assert_eq!(timed_out_session(&early), None);
-        assert_eq!(timed_out_session(&anyhow::anyhow!("boom")), None);
-    }
-
-    #[test]
-    fn usage_limit_error_is_recognized_through_anyhow() {
-        let err: anyhow::Error =
-            ProviderError::UsageLimited("hit your session limit".into()).into();
-        assert!(is_usage_limited(&err));
-        assert!(!is_rate_limited(&err));
-        // A plain error is neither.
-        assert!(!is_usage_limited(&anyhow::anyhow!("boom")));
-        assert!(!is_rate_limited(&anyhow::anyhow!("boom")));
-    }
-
-    #[tokio::test]
-    async fn open_log_creates_missing_parent_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("logs").join("hunt-T-0001.jsonl");
-        let mut f = open_log(&path).await.unwrap();
-        f.write_all(b"{}\n").await.unwrap();
-        f.flush().await.unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
-    }
-
-    /// A request whose working and output dirs are both `dir`.
-    fn req_in(dir: &Path, stream_log_path: Option<PathBuf>) -> AgentRequest {
-        AgentRequest {
-            prompt: "find bugs".into(),
-            system: None,
-            working_dir: dir.to_path_buf(),
-            output_dir: dir.to_path_buf(),
-            extra_dirs: Vec::new(),
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
-            timeout: Duration::from_secs(1),
-            resume: None,
-            cache_1h: false,
-            effort: Effort::Low,
-            model: None,
-            stream_log_path,
-        }
-    }
-
-    #[tokio::test]
-    async fn final_output_file_wins_over_the_fallback_and_is_mirrored() {
-        let dir = tempfile::tempdir().unwrap();
-        let output_dir = dir.path().join("scratch");
-        std::fs::create_dir_all(&output_dir).unwrap();
-        std::fs::write(final_output_path(&output_dir), "{\"findings\":[]}").unwrap();
-        let log = dir.path().join("logs").join("hunt-T-0001.jsonl");
-        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-
-        let req = req_in(&output_dir, Some(log.clone()));
-        let out = read_final_output(&req, "chat text").await;
-        assert_eq!(out, "{\"findings\":[]}");
-        // Mirrored beside the transcript so the answer is visible in the out dir.
-        assert_eq!(
-            std::fs::read_to_string(output_sidecar(&log)).unwrap(),
-            "{\"findings\":[]}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_final_output_falls_back_to_the_provider_message() {
-        let dir = tempfile::tempdir().unwrap();
-        let req = req_in(dir.path(), None);
-        assert_eq!(read_final_output(&req, "chat text").await, "chat text");
-    }
-
-    #[tokio::test]
-    async fn a_previous_agents_answer_is_never_read_back() {
-        // A stale answer from an earlier agent in the same dir must be cleared,
-        // so an agent that writes nothing falls back instead of inheriting it.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(final_output_path(dir.path()), "{\"duplicate\": true}").unwrap();
-        let req = req_in(dir.path(), None);
-        clear_final_output(&req).await.unwrap();
-        assert_eq!(read_final_output(&req, "chat text").await, "chat text");
-    }
-
-    #[tokio::test]
-    async fn clearing_creates_a_missing_output_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let req = req_in(&dir.path().join("agents").join("recon"), None);
-        clear_final_output(&req).await.unwrap();
-        assert!(req.output_dir.is_dir());
+        ProviderConfig::ClaudeCode(c) => Arc::new(ClaudeCodeRunner::new(name, c.clone())),
+        ProviderConfig::OpenCode(c) => Arc::new(OpenCodeRunner::new(name, c.clone())),
+        ProviderConfig::Exec(c) => Arc::new(ExecRunner::new(name, c.clone())),
     }
 }

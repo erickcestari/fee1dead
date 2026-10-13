@@ -1,19 +1,8 @@
-//! Aggregate stage: compile every hunter's raw output into one reviewable JSON
-//! document.
-//!
-//! Hunters append findings to `candidates.jsonl` and uncovered areas to
-//! `gaps.jsonl` one line at a time, and the recon task that surfaced each
-//! finding lives separately in `queue.jsonl`. Reviewing that means cross-
-//! referencing several files. This stage joins them into a single
-//! `findings.json`: findings ordered by severity (then confidence), each enriched
-//! with its task's hypothesis and targets and, once validate has run, its
-//! review (verdict, evidence, impact, recommendation), plus the gap list, the
-//! findings Dedupe collapsed, and a summary.
-//!
-//! It is pure file IO and shaping with no agent call, so it always runs to
-//! completion even when a run spends its whole token budget hunting. Run it as
-//! the last pipeline stage so the reviews are in, or on its own with
-//! `fee1dead aggregate` after a partial run.
+//! Aggregate stage: join the hunters' raw output, each finding's task lead
+//! and review, the gaps, and the collapsed duplicates into one reviewable
+//! `findings.json`. Pure file IO with no agent call, so it completes even
+//! when a run spent its whole budget hunting; `fee1dead aggregate` runs it
+//! standalone on a partial run.
 
 use std::collections::HashMap;
 
@@ -25,13 +14,11 @@ use super::StageCtx;
 use crate::artifacts::{Artifacts, names};
 use crate::domain::{Duplicate, Finding, GapMarker, Severity, Task, Validation, Verdict};
 
-pub async fn run(ctx: &StageCtx) -> Result<()> {
+pub fn run(ctx: &StageCtx) -> Result<()> {
     write_report(&ctx.artifacts)
 }
 
-/// Read the hunters' artifacts, shape them into the report, and write
-/// `findings.json`. Takes only [`Artifacts`] (no runner, target, or scratch) so
-/// it can be invoked standalone against a partial run's `out_dir`.
+/// Needs only [`Artifacts`], so it runs standalone against a partial run.
 pub fn write_report(artifacts: &Artifacts) -> Result<()> {
     let candidates: Vec<Finding> = artifacts.read_jsonl(names::CANDIDATES)?;
     let gaps: Vec<GapMarker> = artifacts.read_jsonl(names::GAPS)?;
@@ -39,7 +26,7 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
     let duplicates: Vec<Duplicate> = artifacts.read_jsonl(names::DUPLICATES)?;
     let validations: Vec<Validation> = artifacts.read_jsonl(names::VALIDATED)?;
 
-    let report = aggregate(candidates, gaps, tasks, duplicates, validations);
+    let report = aggregate(candidates, gaps, &tasks, duplicates, &validations);
     let json = serde_json::to_string_pretty(&report)?;
     artifacts.write_text(names::REPORT_JSON, &json)?;
 
@@ -52,13 +39,11 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
     Ok(())
 }
 
-/// The aggregated document written to `findings.json`.
 #[derive(Debug, Serialize)]
 struct Report {
     summary: Summary,
     findings: Vec<EnrichedFinding>,
     gaps: Vec<GapMarker>,
-    /// Findings Dedupe folded into one of `findings`, for spotting a bad merge.
     duplicates: Vec<Duplicate>,
 }
 
@@ -80,7 +65,7 @@ struct VerdictCounts {
     downgraded: usize,
     needs_review: usize,
     likely_false_positive: usize,
-    /// Not yet reviewed, e.g. its review batch failed; `run --resume` retries.
+    /// E.g. its review batch failed; `run --resume` retries it.
     unreviewed: usize,
 }
 
@@ -96,7 +81,7 @@ impl VerdictCounts {
     }
 }
 
-/// Per-severity finding tallies, ordered most-severe first for at-a-glance triage.
+/// Most severe first, for at-a-glance triage.
 #[derive(Debug, Default, Serialize)]
 struct SeverityCounts {
     critical: usize,
@@ -118,23 +103,19 @@ impl SeverityCounts {
     }
 }
 
-/// A finding flattened with the recon task context a reviewer needs, so the
-/// finding can be triaged without opening `queue.jsonl` to recover its lead.
+/// A finding with its task's lead and its review, so it can be triaged
+/// without cross-referencing the queue.
 #[derive(Debug, Serialize)]
 struct EnrichedFinding {
     #[serde(flatten)]
     finding: Finding,
-    /// The task's lead, present only when the originating task is still in the
-    /// queue (gapfill can re-queue, but a finding's task is normally present).
     #[serde(skip_serializing_if = "Option::is_none")]
     task: Option<TaskContext>,
-    /// The reviewer's verdict, present once validate has reviewed the finding.
     #[serde(skip_serializing_if = "Option::is_none")]
     review: Option<ReviewContext>,
 }
 
 impl EnrichedFinding {
-    /// The severity that ships: the reviewer's correction, else the hunter's.
     fn severity(&self) -> Severity {
         self.review
             .as_ref()
@@ -174,7 +155,6 @@ impl From<&Validation> for ReviewContext {
     }
 }
 
-/// The slice of a [`Task`] worth carrying alongside its findings.
 #[derive(Debug, Serialize)]
 struct TaskContext {
     hypothesis: String,
@@ -182,17 +162,14 @@ struct TaskContext {
     tags: Vec<String>,
 }
 
-/// Join hunter output and reviews into one document: findings enriched with
-/// their task's lead and review, plus gaps and a summary. Ordered for triage:
-/// likely false positives last, then most severe (effective severity) first,
-/// then the hunter's confidence. Pure so it is unit-testable without a
-/// [`StageCtx`].
+/// Ordered for triage: likely false positives last, then by effective
+/// severity, then by the hunter's confidence.
 fn aggregate(
     candidates: Vec<Finding>,
     gaps: Vec<GapMarker>,
-    tasks: Vec<Task>,
+    tasks: &[Task],
     duplicates: Vec<Duplicate>,
-    validations: Vec<Validation>,
+    validations: &[Validation],
 ) -> Report {
     let tasks_by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let reviews: HashMap<&str, &Validation> = validations
@@ -220,7 +197,7 @@ fn aggregate(
         by_verdict.bump(f.review.as_ref().map(|r| r.verdict));
     }
 
-    // Stable, so equal-rank findings keep candidates.jsonl order.
+    // Stable, so equal ranks keep candidates.jsonl order.
     findings.sort_by(|a, b| {
         a.is_likely_false_positive()
             .cmp(&b.is_likely_false_positive())
@@ -250,34 +227,23 @@ fn aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Priority, TaskOrigin};
+    use crate::domain::fixtures;
 
-    fn finding(id: &str, task_id: &str, sev: Severity, confidence: f64) -> Finding {
+    fn finding(id: &str, task_id: &str, severity: Severity, confidence: f64) -> Finding {
         Finding {
-            id: id.into(),
             task_id: task_id.into(),
-            title: id.into(),
-            attack_class: "c".into(),
-            severity: sev,
-            location: "a.rs:1".into(),
-            description: "d".into(),
+            severity,
             confidence,
-            poc_path: None,
+            ..fixtures::finding(id)
         }
     }
 
     fn task(id: &str, hypothesis: &str) -> Task {
         Task {
-            id: id.into(),
-            attack_class: "c".into(),
-            scope_hint: "s".into(),
-            scope_paths: Vec::new(),
             hypothesis: hypothesis.into(),
             targets: vec!["a.rs:1".into()],
-            suggested_skills: Vec::new(),
             tags: vec!["crypto".into()],
-            priority: Priority::default(),
-            origin: TaskOrigin::Recon,
+            ..fixtures::task(id)
         }
     }
 
@@ -288,7 +254,7 @@ mod tests {
             finding("high-weak", "T-1", Severity::High, 0.2),
             finding("high-strong", "T-1", Severity::High, 0.8),
         ];
-        let report = aggregate(candidates, vec![], vec![task("T-1", "h")], vec![], vec![]);
+        let report = aggregate(candidates, vec![], &[task("T-1", "h")], vec![], &[]);
         let order: Vec<&str> = report
             .findings
             .iter()
@@ -307,9 +273,9 @@ mod tests {
         let report = aggregate(
             candidates,
             vec![],
-            vec![task("T-1", "len unchecked")],
+            &[task("T-1", "len unchecked")],
             vec![],
-            vec![],
+            &[],
         );
         assert_eq!(report.summary.findings, 3);
         assert_eq!(report.summary.by_severity.high, 2);
@@ -341,9 +307,9 @@ mod tests {
         let report = aggregate(
             vec![finding("f1", "T-1", Severity::High, 0.5)],
             vec![],
-            vec![],
+            &[],
             vec![dup],
-            vec![],
+            &[],
         );
         assert_eq!(report.summary.duplicates, 1);
         assert_eq!(report.duplicates[0].duplicate_of, "f1");
@@ -352,12 +318,8 @@ mod tests {
 
     fn review(id: &str, verdict: Verdict, corrected: Option<Severity>) -> Validation {
         Validation {
-            finding_id: id.into(),
-            verdict,
-            evidence: "e".into(),
             corrected_severity: corrected,
-            impact: "i".into(),
-            recommendation: "r".into(),
+            ..fixtures::validation(id, verdict)
         }
     }
 
@@ -374,7 +336,7 @@ mod tests {
             review("cut", Verdict::Downgraded, Some(Severity::Info)),
             review("real", Verdict::Confirmed, None),
         ];
-        let report = aggregate(candidates, vec![], vec![], vec![], validations);
+        let report = aggregate(candidates, vec![], &[], vec![], &validations);
         let order: Vec<&str> = report
             .findings
             .iter()
@@ -382,7 +344,10 @@ mod tests {
             .collect();
         assert_eq!(order, ["real", "pending", "cut", "fp"]);
         let real = &report.findings[0];
-        assert_eq!(real.review.as_ref().unwrap().impact, "i");
+        assert_eq!(
+            real.review.as_ref().unwrap().impact,
+            "attacker crashes the node"
+        );
         let verdicts = report.summary.by_verdict.as_ref().unwrap();
         assert_eq!(
             (
@@ -403,9 +368,9 @@ mod tests {
         let report = aggregate(
             vec![finding("f1", "T-1", Severity::Low, 0.5)],
             vec![],
+            &[],
             vec![],
-            vec![],
-            vec![],
+            &[],
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(
@@ -419,9 +384,9 @@ mod tests {
         let report = aggregate(
             vec![finding("f1", "gone", Severity::Low, 0.5)],
             vec![],
+            &[],
             vec![],
-            vec![],
-            vec![],
+            &[],
         );
         let json = serde_json::to_string(&report).unwrap();
         assert!(

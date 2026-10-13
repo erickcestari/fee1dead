@@ -1,8 +1,5 @@
-//! Config-driven adapter: run any CLI described by a command template.
-//!
-//! This is the zero-code extension path. A `[providers.<name>]` block with
-//! `type = "exec"` names a `command` and an `args` template; the placeholders
-//! `{prompt}` and `{working_dir}` are substituted per request.
+//! Config-driven adapter (`type = "exec"`): any CLI described by a command and
+//! an argv template. It has no sessions and reads the answer from stdout.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -11,30 +8,23 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::process::Command;
 
-use super::{AgentRequest, AgentResult, AgentRunner};
-use crate::config::ExecOutput;
+use super::{AgentRequest, AgentResult, AgentRunner, ProviderError};
+use crate::config::{ExecConfig, ExecOutput};
 
 pub struct ExecRunner {
     name: String,
-    command: String,
-    args: Vec<String>,
-    output: ExecOutput,
+    cfg: ExecConfig,
 }
 
 impl ExecRunner {
-    pub fn new(name: String, command: String, args: Vec<String>, output: ExecOutput) -> Self {
-        Self {
-            name,
-            command,
-            args,
-            output,
-        }
+    pub fn new(name: String, cfg: ExecConfig) -> Self {
+        Self { name, cfg }
     }
 
-    /// Render the argv template against a request, substituting placeholders.
     fn render_args(&self, prompt: &str, working_dir: &Path) -> Vec<String> {
         let wd = working_dir.to_string_lossy();
-        self.args
+        self.cfg
+            .args
             .iter()
             .map(|a| a.replace("{prompt}", prompt).replace("{working_dir}", &wd))
             .collect()
@@ -48,43 +38,34 @@ impl AgentRunner for ExecRunner {
     }
 
     async fn run(&self, req: AgentRequest) -> Result<AgentResult> {
-        let args = self.render_args(&req.prompt, &req.working_dir);
-        let mut cmd = Command::new(&self.command);
-        cmd.args(&args)
+        let mut cmd = Command::new(&self.cfg.command);
+        cmd.args(self.render_args(&req.prompt, &req.working_dir))
             .current_dir(&req.working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         let output = tokio::time::timeout(req.timeout, cmd.output())
             .await
-            .with_context(|| format!("provider '{}' timed out", self.name))?
-            .with_context(|| format!("spawning provider '{}' ({})", self.name, self.command))?;
-
+            .map_err(|_| ProviderError::TimedOut { session_id: None })?
+            .with_context(|| format!("spawning provider '{}' ({})", self.name, self.cfg.command))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let exit_code = output.status.code().unwrap_or(-1);
 
-        // Fail fast on a misconfigured command: if it's declared to emit JSON,
-        // confirm it actually did. The parsed value itself isn't kept — stages
-        // pull structured data out of `stdout` themselves.
-        if let ExecOutput::Json = self.output {
+        if self.cfg.output == ExecOutput::Json {
             serde_json::from_str::<serde_json::Value>(stdout.trim())
                 .with_context(|| format!("provider '{}' did not emit valid JSON", self.name))?;
         }
-
-        if exit_code != 0 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
             bail!(
-                "provider '{}' exited with code {exit_code}: {}",
+                "provider '{}' exited with code {}: {}",
                 self.name,
-                stderr.trim()
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-
         Ok(AgentResult {
             stdout,
-            exit_code,
-            // Exec providers have no session concept; nothing to fork from.
             session_id: None,
         })
     }
@@ -93,22 +74,42 @@ impl AgentRunner for ExecRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{Effort, timed_out_session};
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn runner(command: &str, args: &[&str]) -> ExecRunner {
+        ExecRunner::new(
+            "test".into(),
+            ExecConfig {
+                command: command.into(),
+                args: args.iter().map(ToString::to_string).collect(),
+                output: ExecOutput::Text,
+            },
+        )
+    }
 
     #[test]
     fn substitutes_placeholders() {
-        let r = ExecRunner::new(
-            "codex".into(),
-            "codex".into(),
-            vec![
-                "exec".into(),
-                "--cd".into(),
-                "{working_dir}".into(),
-                "{prompt}".into(),
-            ],
-            ExecOutput::Text,
-        );
+        let r = runner("codex", &["exec", "--cd", "{working_dir}", "{prompt}"]);
         let args = r.render_args("find bugs", &PathBuf::from("/work/scratch/t1"));
         assert_eq!(args, vec!["exec", "--cd", "/work/scratch/t1", "find bugs"]);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_a_provider_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = AgentRequest::new(
+            "p".into(),
+            dir.path().to_path_buf(),
+            Duration::from_millis(200),
+            Effort::Low,
+        );
+        let err = runner("sleep", &["30"]).run(req).await.unwrap_err();
+        assert!(matches!(
+            err.downcast_ref(),
+            Some(ProviderError::TimedOut { .. })
+        ));
+        assert_eq!(timed_out_session(&err), None);
     }
 }

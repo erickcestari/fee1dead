@@ -1,55 +1,40 @@
-//! skip-reported stage: drop candidate findings already reported in the sink
-//! (e.g. filed as GitHub issues) *before* validate, so the run does not spend
-//! validation tokens re-reviewing findings a previous run already surfaced.
+//! skip-reported stage: drop candidates the sink already holds (e.g. filed as
+//! GitHub issues) *before* validate, so no review tokens go to findings a past
+//! run surfaced. Sinks that upsert by id report nothing, so it is a no-op there.
 //!
-//! It reads `candidates.jsonl`, removes the ones the sink says are already
-//! reported, and writes the reduced set back for validate/aggregate to consume.
-//! Sinks that upsert by id (sqlite/jsonl/http) report nothing existing, so this
-//! stage is a no-op for them and only bites for the github sink.
-//!
-//! How a candidate is matched to an already-reported finding:
-//!
-//! 1. Cheap algorithmic pass: token-set (Jaccard) similarity between the
-//!    candidate's signature (title + location + attack class) and every existing
-//!    one. A high score is a confident duplicate; a low score is confidently
-//!    distinct.
-//! 2. Only for the inconclusive middle band does a lightweight model (Haiku by
-//!    default) judge the single closest pair — so the expensive call runs just on
-//!    the genuinely ambiguous cases, not every candidate.
-//!
-//! The algorithm never *drops* a finding on its own for a middling score; it
-//! either decides confidently or escalates to the judge, which fails open (keep
-//! the finding): a stray duplicate issue is cheaper to close than a real finding
-//! silently swallowed before it is ever validated.
+//! A token-overlap score between signatures decides the confident cases; only
+//! the ambiguous middle band goes to a cheap model judge. The judge fails open
+//! (keep the finding): a stray duplicate issue is cheaper to close than a real
+//! finding swallowed before it was ever validated.
+
+use std::collections::HashSet;
 
 use anyhow::Result;
 use tracing::{info, warn};
 
 use super::StageCtx;
 use super::similarity::{jaccard, tokenize};
-use crate::artifacts::{extract_json_block, names};
+use crate::artifacts::names;
+use crate::config::Stage;
 use crate::domain::Finding;
+use crate::json_block;
 use crate::provider::{AgentRequest, Effort};
 use crate::store::{ExistingReport, build_sink};
 
-/// At or above this token-overlap, a pair is a confident duplicate.
+/// At or above this overlap, a pair is a confident duplicate.
 const DUP_HIGH: f64 = 0.6;
-/// Below this, a pair is confidently distinct; between the two is the ambiguous
-/// band handed to the model judge.
+/// Below this, confidently distinct; in between goes to the judge.
 const DUP_LOW: f64 = 0.2;
 
 const JUDGE_PROMPT: &str = include_str!("../../prompts/report-dedupe.md");
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
-    // The sink knows what has already been reported. Building it here is cheap
-    // (the github sink does no I/O at construction) and the report stage builds
-    // it again independently, keeping the stages decoupled.
+    // The report stage builds its own sink, keeping the stages decoupled.
     let existing = build_sink(&ctx.config.report)?.existing_reports()?;
     if existing.is_empty() {
-        info!("skip-reported: sink reports nothing already filed; nothing to prune");
+        info!("skip-reported: the sink holds nothing already filed");
         return Ok(());
     }
-
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     if candidates.is_empty() {
         return Ok(());
@@ -67,104 +52,75 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-/// The algorithmic verdict for a candidate against the closest existing finding.
+/// The algorithmic verdict against the closest existing report.
 #[derive(Debug, PartialEq)]
 enum Band {
     Duplicate,
     Distinct,
-    /// Inconclusive — escalate to the model judge against this candidate index.
+    /// Escalate to the judge against the existing report at this index.
     Uncertain(usize),
 }
 
-/// Keep only the candidates not already reported in `existing`. Ambiguous pairs
-/// are resolved by a lightweight model judge; the rest by the token score alone.
 async fn drop_reported(
     ctx: &StageCtx,
     candidates: Vec<Finding>,
     existing: &[ExistingReport],
 ) -> Result<Vec<Finding>> {
-    let existing_sigs: Vec<String> = existing.iter().map(signature_of_existing).collect();
-
+    let existing_tokens: Vec<HashSet<String>> = existing
+        .iter()
+        .map(|e| tokenize(&report_signature(e)))
+        .collect();
     let mut kept = Vec::new();
     for finding in candidates {
-        let sig = signature_of_finding(&finding);
-        match classify(&sig, &existing_sigs) {
-            Band::Distinct => kept.push(finding),
-            Band::Duplicate => {
-                info!(id = %finding.id, "pruning candidate already reported (algorithmic match)");
-            }
-            Band::Uncertain(idx) => {
-                if judge_is_duplicate(ctx, &finding, &existing[idx]).await? {
-                    info!(id = %finding.id, "pruning candidate already reported (model judge)");
-                } else {
-                    kept.push(finding);
-                }
-            }
+        let duplicate = match classify(&tokenize(&finding_signature(&finding)), &existing_tokens) {
+            Band::Distinct => false,
+            Band::Duplicate => true,
+            Band::Uncertain(i) => judge_is_duplicate(ctx, &finding, &existing[i]).await?,
+        };
+        if duplicate {
+            info!(id = %finding.id, "pruning candidate already reported");
+        } else {
+            kept.push(finding);
         }
     }
     Ok(kept)
 }
 
-/// Band a candidate's best algorithmic match falls into.
-fn classify(sig: &str, existing_sigs: &[String]) -> Band {
-    let tokens = tokenize(sig);
-    let (best_idx, best_score) = existing_sigs
+fn classify(tokens: &HashSet<String>, existing: &[HashSet<String>]) -> Band {
+    let (best, score) = existing
         .iter()
-        .map(|e| jaccard(&tokens, &tokenize(e)))
+        .map(|e| jaccard(tokens, e))
         .enumerate()
         .fold(
-            (0usize, 0.0f64),
-            |(bi, bs), (i, s)| {
-                if s > bs { (i, s) } else { (bi, bs) }
-            },
+            (0, 0.0),
+            |(bi, bs), (i, s)| if s > bs { (i, s) } else { (bi, bs) },
         );
-    if best_score >= DUP_HIGH {
+    if score >= DUP_HIGH {
         Band::Duplicate
-    } else if best_score < DUP_LOW {
+    } else if score < DUP_LOW {
         Band::Distinct
     } else {
-        Band::Uncertain(best_idx)
+        Band::Uncertain(best)
     }
 }
 
-/// Ask the lightweight judge whether a candidate restates an existing finding.
-/// Fails open (returns `false` → keep the candidate) on any judge error, so a
-/// flaky judge never silences a real finding before it is validated.
+/// Fails open: any judge error keeps the candidate.
 async fn judge_is_duplicate(
     ctx: &StageCtx,
     finding: &Finding,
-    candidate: &ExistingReport,
+    existing: &ExistingReport,
 ) -> Result<bool> {
     let prompt = JUDGE_PROMPT
-        .replace("{new_finding}", &signature_of_finding(finding))
+        .replace("{new_finding}", &finding_signature(finding))
         .replace(
             "{existing_finding}",
-            &format!("{}\n{}", candidate.title, candidate.text),
+            &format!("{}\n{}", existing.title, existing.text),
         );
-
-    // Judges run back to back; each needs its own dir so one judge can never
-    // read another's `{"duplicate": true}`.
-    let dir = ctx.scratch.for_agent(&format!("judge-{}", finding.id))?;
     let req = AgentRequest {
-        prompt,
-        system: None,
-        working_dir: dir.clone(),
-        output_dir: dir,
+        // It compares two texts; it reads no code.
         extra_dirs: Vec::new(),
-        allowed_tools: Vec::new(),
-        disallowed_tools: super::disabled_tools(),
-        timeout: std::time::Duration::from_secs(ctx.config.run.agent_timeout_secs),
-        resume: None,
-        cache_1h: false,
-        // A one-shot yes/no over two short texts: cheap model, shallow thinking.
-        effort: Effort::Low,
-        model: ctx.config.stage_model("skip-reported"),
-        stream_log_path: Some(
-            ctx.artifacts
-                .log_path(&format!("skip-reported-{}.jsonl", finding.id)),
-        ),
+        ..ctx.agent_request(Stage::SkipReported, &finding.id, prompt, Effort::Low)?
     };
-
     match ctx.runner.run(req).await {
         Ok(result) => Ok(parse_duplicate_verdict(&result.stdout)),
         Err(e) => {
@@ -174,66 +130,70 @@ async fn judge_is_duplicate(
     }
 }
 
-/// Parse the judge's `{"duplicate": bool}` reply. Anything unparseable is
-/// treated as "not a duplicate" so the candidate survives.
+/// `{"duplicate": bool}`; anything unparseable means "keep".
 fn parse_duplicate_verdict(stdout: &str) -> bool {
-    extract_json_block(stdout)
+    json_block::extract(stdout)
         .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-        .and_then(|v| v.get("duplicate").and_then(serde_json::Value::as_bool))
+        .and_then(|v| v["duplicate"].as_bool())
         .unwrap_or(false)
 }
 
-/// The comparison signature of a candidate: the fields that identify the
-/// underlying bug, not its prose.
-fn signature_of_finding(f: &Finding) -> String {
-    format!("{} {} {}", f.title, f.location, f.attack_class)
+/// The fields that identify a bug, not its prose. Scoring against a whole
+/// issue body would dilute every overlap below [`DUP_LOW`].
+fn signature(title: &str, location: &str, attack_class: &str) -> String {
+    format!("{title} {location} {attack_class}")
 }
 
-/// The signature of an already-reported finding: the same fields as
-/// [`signature_of_finding`]. Scoring a short signature against a whole issue
-/// body would dilute every overlap below [`DUP_LOW`], so nothing ever matched.
-fn signature_of_existing(e: &ExistingReport) -> String {
-    format!("{} {} {}", e.title, e.location, e.attack_class)
+fn finding_signature(f: &Finding) -> String {
+    signature(&f.title, &f.location, &f.attack_class)
+}
+
+fn report_signature(e: &ExistingReport) -> String {
+    signature(&e.title, &e.location, &e.attack_class)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sig(title: &str, loc: &str, class: &str) -> String {
-        format!("{title} {loc} {class}")
+    fn tokens(title: &str, location: &str, class: &str) -> HashSet<String> {
+        tokenize(&signature(title, location, class))
     }
 
     #[test]
     fn identical_signatures_are_duplicates() {
-        let existing = vec![sig(
+        let existing = [tokens(
             "Unbounded alloc",
             "src/net.rs:42",
             "resource exhaustion",
         )];
-        let s = sig("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
+        let s = tokens("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
         assert_eq!(classify(&s, &existing), Band::Duplicate);
     }
 
     #[test]
     fn unrelated_signatures_are_distinct() {
-        let existing = vec![sig("SQL injection in login", "src/auth.rs:10", "injection")];
-        let s = sig("Integer overflow in parser", "src/parse.rs:900", "overflow");
+        let existing = [tokens(
+            "SQL injection in login",
+            "src/auth.rs:10",
+            "injection",
+        )];
+        let s = tokens("Integer overflow in parser", "src/parse.rs:900", "overflow");
         assert_eq!(classify(&s, &existing), Band::Distinct);
+        assert_eq!(classify(&s, &[]), Band::Distinct);
     }
 
     #[test]
-    fn partial_overlap_is_uncertain_and_points_at_best_candidate() {
-        let existing = vec![
-            sig("Totally unrelated thing", "x/y.rs:1", "misc"),
-            // Shares the location and some words, but reframed: the ambiguous band.
-            sig(
+    fn partial_overlap_is_uncertain_and_points_at_the_closest() {
+        let existing = [
+            tokens("Totally unrelated thing", "x/y.rs:1", "misc"),
+            tokens(
                 "Missing bounds check before allocation",
                 "src/net.rs:42",
                 "dos",
             ),
         ];
-        let s = sig(
+        let s = tokens(
             "Unbounded allocation from length field",
             "src/net.rs:42",
             "resource exhaustion",
@@ -242,55 +202,39 @@ mod tests {
     }
 
     #[test]
-    fn empty_existing_keeps_everything_without_scoring() {
-        let s = sig("anything", "a.rs:1", "c");
-        // No existing signatures → best score is 0 → distinct.
-        assert_eq!(classify(&s, &[]), Band::Distinct);
-    }
-
-    #[test]
-    fn same_finding_filed_with_a_long_body_is_a_duplicate() {
-        let body = "## Description\n\n".to_string() + &"lots of prose ".repeat(40);
+    fn a_report_filed_with_a_long_body_still_matches() {
         let existing = ExistingReport {
             id: "old-T-0003-F01".into(),
             title: "Unbounded alloc".into(),
             location: "src/net.rs:42".into(),
             attack_class: "resource exhaustion".into(),
-            text: body,
+            text: "## Description\n\n".to_string() + &"lots of prose ".repeat(40),
         };
-        let s = sig("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
+        let s = tokens("Unbounded alloc", "src/net.rs:42", "resource exhaustion");
         assert_eq!(
-            classify(&s, &[signature_of_existing(&existing)]),
+            classify(&s, &[tokenize(&report_signature(&existing))]),
             Band::Duplicate
         );
     }
 
     #[test]
-    fn verdict_parses_duplicate_flag_and_fails_open() {
-        assert!(parse_duplicate_verdict("{\"duplicate\": true}"));
-        assert!(!parse_duplicate_verdict("{\"duplicate\": false}"));
-        // Garbage or missing field → not a duplicate (keep the candidate).
-        assert!(!parse_duplicate_verdict("not json"));
-        assert!(!parse_duplicate_verdict("{\"other\": 1}"));
+    fn signature_uses_identity_fields_only() {
+        let f = Finding {
+            title: "Bug".into(),
+            attack_class: "dos".into(),
+            description: "long prose that should not dominate the signature".into(),
+            ..crate::domain::fixtures::finding("F-1")
+        };
+        let s = finding_signature(&f);
+        assert!(s.contains("Bug") && s.contains("a.rs:1") && s.contains("dos"));
+        assert!(!s.contains("prose"));
     }
 
     #[test]
-    fn signature_uses_identity_fields_only() {
-        let f = Finding {
-            id: "F-1".into(),
-            task_id: "T".into(),
-            title: "Bug".into(),
-            attack_class: "dos".into(),
-            severity: crate::domain::Severity::High,
-            location: "a.rs:1".into(),
-            description: "long prose that should not dominate the signature".into(),
-            confidence: 0.5,
-            poc_path: None,
-        };
-        let s = signature_of_finding(&f);
-        assert!(s.contains("Bug"));
-        assert!(s.contains("a.rs:1"));
-        assert!(s.contains("dos"));
-        assert!(!s.contains("prose"));
+    fn verdict_parses_the_flag_and_fails_open() {
+        assert!(parse_duplicate_verdict("{\"duplicate\": true}"));
+        assert!(!parse_duplicate_verdict("{\"duplicate\": false}"));
+        assert!(!parse_duplicate_verdict("not json"));
+        assert!(!parse_duplicate_verdict("{\"other\": 1}"));
     }
 }

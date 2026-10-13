@@ -24,22 +24,31 @@ schema-validated findings. See `README.md` for the user-facing overview.
 
 - `src/provider/` — `AgentRunner` trait + `AgentRequest`/`AgentResult`. The only
   seam to any AI CLI. `claude_code.rs` and `opencode.rs` are the built-in
-  adapters (both stream events, tee them to the per-agent log, and read results
-  back through the shared final-output-file contract in `mod.rs`); **add any
-  other CLI via a `type = "exec"` config block, not Rust code** (`generic_exec.rs`,
-  `{prompt}`/`{working_dir}` placeholders). `mock.rs` is feature-gated. Fields an
-  adapter's CLI has no equivalent for (max turns, tool allow/deny lists) are
-  ignored, never emulated.
-- `src/pipeline/` — `mod.rs` sequences stages; one file per stage. All nine
-  are built. `feedback.rs` is a cross-run memory (no consumer repos): it writes
-  durable seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads
-  as leads (and consumes). `salvage.rs` gives an agent whose answer does not
-  parse, or that timed out, one repair turn in its own session. Add a stage: create the file, add to the `run_stage` match, and
-  to `KNOWN_STAGES` in `config.rs`.
-- `src/store/` — `ReportSink` trait + sqlite/jsonl/http sinks. New sinks
-  implement the trait and wire into `build_sink`.
-- `src/config.rs` — per-run TOML, **validated once at load** (`Config::validate`).
+  adapters: each folds its CLI's events through a `StreamObserver`, while
+  `stream.rs` owns the shared spawn/tee/timeout loop and `final_output.rs` the
+  answer-file contract; `error.rs` classifies quota vs throttle vs timeout.
+  **Add any other CLI via a `type = "exec"` config block, not Rust code**
+  (`generic_exec.rs`, `{prompt}`/`{working_dir}` placeholders). `mock.rs` is
+  feature-gated. Fields an adapter's CLI has no equivalent for (e.g. a tool
+  deny-list) are ignored, never emulated.
+- `src/pipeline/` — `mod.rs` sequences stages; one file per stage. Every stage
+  agent's request starts from `StageCtx::agent_request` (deny-list, timeout,
+  stage model, reference dir, and a `<stage>-<key>` scratch dir and transcript).
+  `prompt.rs` holds the prompt fragments several stages append. `feedback.rs`
+  is a cross-run memory (no consumer repos): it writes durable seed tasks to
+  `feedback-seeds.jsonl`, which the next run's recon reads as leads (and
+  consumes). `salvage.rs` gives an agent whose answer does not parse, or that
+  timed out, one repair turn in its own session. Add a stage: create the file,
+  add a variant to `config::Stage`, and the compiler points at the `run_stage`
+  match.
+- `src/store/` — `ReportSink` trait + sqlite/jsonl/http/github sinks. New sinks
+  implement the trait, get a `config::ReportConfig` variant, and wire into
+  `build_sink`.
+- `src/config/` — per-run TOML, **validated once at load** (`Config::validate`).
   This is the operator-input trust boundary; fail fast here, assume valid below.
+  Prefer types that make an invalid config unrepresentable (`Stage`,
+  `ReportConfig`) over runtime checks.
+- `src/json_block.rs` — pulls the JSON answer out of an agent's text.
 - `src/target.rs` — acquires the target repo before stages run: clones
   `[target].repo` at `ref` into `target_dir`, or asserts a mounted target is
   present, then runs `[target].prepare`. Called at the top of `Pipeline::run`.

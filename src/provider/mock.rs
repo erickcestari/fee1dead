@@ -1,7 +1,5 @@
-//! A deterministic runner for tests and offline end-to-end runs.
-//!
-//! It returns canned responses keyed by a substring match against the prompt,
-//! so a full pipeline can be exercised without any network or API cost.
+//! A deterministic runner for offline end-to-end runs: canned replies keyed by
+//! a substring of the prompt.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -11,26 +9,24 @@ use async_trait::async_trait;
 
 use super::{AgentRequest, AgentResult, AgentRunner};
 
-/// A canned reply. If `match_substr` is set, the reply is only used when the
-/// prompt contains that substring; otherwise it matches any prompt.
+/// A canned reply, used for prompts containing `match_substr` (any prompt
+/// when unset).
 #[derive(Debug, Clone)]
 pub struct CannedReply {
     pub match_substr: Option<String>,
     pub stdout: String,
-    /// Session id this reply reports, mimicking a real provider's envelope.
     pub session_id: Option<String>,
-    /// When set, builds the reply from the prompt instead of using `stdout`,
-    /// for stages whose reply must echo ids the harness assigned at run time.
+    /// Builds the reply from the prompt instead, for replies that must echo
+    /// ids the harness assigned at run time.
     pub render: Option<fn(&str) -> String>,
 }
 
 pub struct MockRunner {
     name: String,
     replies: Vec<CannedReply>,
-    /// Records every prompt seen, for assertions.
+    /// Every prompt seen.
     pub seen: Mutex<VecDeque<String>>,
-    /// Records the session id each request asked to fork from (None when not
-    /// forking), for assertions about session wiring.
+    /// The session each request forked from, if any.
     pub seen_resume: Mutex<Vec<Option<String>>>,
 }
 
@@ -68,7 +64,6 @@ impl AgentRunner for MockRunner {
         match reply {
             Some(r) => Ok(AgentResult {
                 stdout: r.render.map_or(r.stdout, |render| render(&req.prompt)),
-                exit_code: 0,
                 session_id: r.session_id,
             }),
             None => bail!("mock runner has no canned reply for prompt"),

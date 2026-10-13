@@ -1,5 +1,4 @@
-//! SQLite report sink. Findings are queryable as structured rows; the full
-//! payload is kept as JSON for fidelity.
+//! Findings as queryable rows, the full payload kept as JSON.
 
 use std::path::Path;
 
@@ -15,7 +14,8 @@ pub struct SqliteSink {
 impl SqliteSink {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening sqlite db {}", path.display()))?;
@@ -36,9 +36,11 @@ impl SqliteSink {
 impl ReportSink for SqliteSink {
     fn write(&mut self, record: &ReportRecord) -> Result<()> {
         let p = &record.payload;
-        let title = p.get("title").and_then(|v| v.as_str());
-        let severity = p.get("severity").and_then(|v| v.as_str());
-        let location = p.get("location").and_then(|v| v.as_str());
+        let (title, severity, location) = (
+            p["title"].as_str(),
+            p["severity"].as_str(),
+            p["location"].as_str(),
+        );
         self.conn.execute(
             "INSERT INTO findings (id, title, severity, location, payload)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -56,7 +58,7 @@ impl ReportSink for SqliteSink {
         let n: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM findings", [], |r| r.get(0))?;
-        Ok(n as usize)
+        Ok(usize::try_from(n)?)
     }
 }
 

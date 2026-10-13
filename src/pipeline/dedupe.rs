@@ -1,13 +1,9 @@
-//! Dedupe stage: collapse findings that share a root cause into a single
-//! record, so variant analysis stays a feature rather than a way to inflate the
-//! queue with duplicates.
+//! Dedupe stage: collapse findings that share a root cause into one record.
 //!
-//! Two findings share a root cause when they sit in the same file under the
-//! same attack class AND either cite the same location or restate the same
-//! title. File + class alone is too coarse: a finding inherits its hunter's
-//! attack class, so one hunter's distinct bugs in one file would all collapse.
-//! The highest-severity finding survives as the representative; the others go
-//! to `duplicates.jsonl` with the id they duplicate, never silently deleted.
+//! Same root cause means same file and attack class, AND the same location or
+//! a restated title. File and class alone are too coarse: a finding inherits
+//! its hunter's class, so one hunter's distinct bugs in a file would collapse.
+//! The most severe survives; the rest go to `duplicates.jsonl`, never deleted.
 
 use anyhow::Result;
 use tracing::info;
@@ -17,17 +13,16 @@ use super::similarity::{jaccard, tokenize};
 use crate::artifacts::names;
 use crate::domain::{Duplicate, Finding};
 
-/// Title token overlap at or above which two findings at different lines of the
-/// same file and class are the same bug restated.
+/// Title overlap at which two findings at different lines are one bug restated.
 const SAME_TITLE: f64 = 0.5;
 
-pub async fn run(ctx: &StageCtx) -> Result<()> {
+pub fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     let before = candidates.len();
     let (representatives, duplicates) = dedupe_findings(candidates);
     ctx.artifacts
         .write_jsonl(names::CANDIDATES, &representatives)?;
-    // Appended, not rewritten: dedupe may run more than once per run.
+    // Appended: dedupe may run more than once per run.
     for d in &duplicates {
         ctx.artifacts.append_jsonl(names::DUPLICATES, d)?;
     }
@@ -47,9 +42,8 @@ fn same_root_cause(a: &Finding, b: &Finding) -> bool {
             || jaccard(&tokenize(&a.title), &tokenize(&b.title)) >= SAME_TITLE)
 }
 
-/// Cluster findings by root cause and keep one representative per cluster
-/// (highest severity, first seen on ties) in first-occurrence order. Returns
-/// the representatives and every other cluster member as a [`Duplicate`].
+/// One representative per cluster (most severe, first seen on ties), in
+/// first-occurrence order, plus every other member as a [`Duplicate`].
 fn dedupe_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Duplicate>) {
     let mut clusters: Vec<Vec<Finding>> = Vec::new();
     for finding in findings {
@@ -85,19 +79,15 @@ fn dedupe_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Duplicate>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Severity;
+    use crate::domain::{Severity, fixtures};
 
     fn finding(id: &str, title: &str, location: &str, class: &str, sev: Severity) -> Finding {
         Finding {
-            id: id.into(),
-            task_id: "T".into(),
             title: title.into(),
+            location: location.into(),
             attack_class: class.into(),
             severity: sev,
-            location: location.into(),
-            description: "d".into(),
-            confidence: 0.5,
-            poc_path: None,
+            ..fixtures::finding(id)
         }
     }
 
@@ -136,7 +126,6 @@ mod tests {
 
     #[test]
     fn distinct_bugs_one_hunter_found_in_one_file_are_kept() {
-        // Same file and (inherited) class, different lines and titles.
         let input = vec![
             finding(
                 "a",
