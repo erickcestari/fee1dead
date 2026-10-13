@@ -1,10 +1,10 @@
-//! Token-overlap similarity between short finding texts (titles, signatures).
-//! Shared so dedupe and skip-reported measure "same bug" the same way.
+//! Token overlap between short finding texts, so dedupe and skip-reported
+//! measure "same bug" the same way.
 
 use std::collections::HashSet;
 
-/// Split text into a lowercased set of alphanumeric word tokens, ignoring
-/// tokens of two chars or fewer (line numbers, `rs`, `go`).
+/// Lowercased alphanumeric words, ignoring those of two chars or fewer
+/// (line numbers, `rs`, `go`).
 pub fn tokenize(s: &str) -> HashSet<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 2)
@@ -12,7 +12,7 @@ pub fn tokenize(s: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Jaccard overlap of two token sets: |A ∩ B| / |A ∪ B|, in [0,1].
+/// |A ∩ B| / |A ∪ B|, in [0,1].
 pub fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if a.is_empty() && b.is_empty() {
         return 0.0;

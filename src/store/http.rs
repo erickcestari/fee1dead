@@ -1,8 +1,5 @@
-//! HTTP report sink: POST each finding to an ingest API.
-//!
-//! One request per finding keeps the contract simple and lets the ingest side
-//! upsert on the finding id. The egress firewall must allow the ingest host
-//! (`[firewall].allow`).
+//! One POST per finding to an ingest API, which upserts on the id. The ingest
+//! host must be in `[firewall].allow`.
 
 use anyhow::{Context, Result, bail};
 
@@ -50,7 +47,7 @@ impl ReportSink for HttpSink {
     }
 
     fn count(&self) -> Result<usize> {
-        // The sink does not query the remote store; report what it sent.
+        // The remote store is not queried; this is what was sent.
         Ok(self.sent)
     }
 }

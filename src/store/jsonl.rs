@@ -1,5 +1,5 @@
-//! JSONL report sink: one finding payload per line. Simple, diffable, and easy
-//! to feed into other tools. Upserts are kept in memory and rewritten on flush.
+//! One finding payload per line. Upserts are kept in memory and the file is
+//! rewritten on each write.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -13,14 +13,15 @@ use super::{ReportRecord, ReportSink};
 
 pub struct JsonlSink {
     path: PathBuf,
-    /// id -> payload, kept ordered for stable output.
+    /// Ordered, for stable output.
     records: BTreeMap<String, Value>,
 }
 
 impl JsonlSink {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut records = BTreeMap::new();
         if path.exists() {
@@ -30,8 +31,9 @@ impl JsonlSink {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let v: Value = serde_json::from_str(&line)?;
-                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                let v: Value = serde_json::from_str(&line)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                if let Some(id) = v["id"].as_str() {
                     records.insert(id.to_string(), v);
                 }
             }

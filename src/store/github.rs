@@ -1,15 +1,10 @@
-//! GitHub issue report sink: file one issue per finding via the REST API.
+//! One GitHub issue per finding, via the REST API. The PAT comes from an env
+//! var so it never lands in config or logs.
 //!
-//! One issue per finding, titled by severity and finding title, bodied from the
-//! schema-validated payload. Auth is a GitHub PAT (fine-grained or classic) with
-//! `issues:write` on the target repo, read from an env var so the token never
-//! lands in config or logs.
-//!
-//! Re-runnable: the report stage can run more than once, so each issue body
-//! carries a hidden marker keyed by the finding id. Before the first write the
-//! sink lists its labeled issues once and skips findings whose marker is already
-//! there, so a second run does not duplicate issues. Listing beats a per-finding
-//! search: the search API allows only 30 requests a minute and indexes with lag.
+//! Re-runnable: each body carries a hidden marker keyed by the finding id, and
+//! before the first write the sink lists its labeled issues once and skips
+//! findings already filed. Listing beats a per-finding search, which allows
+//! only 30 requests a minute and indexes with lag.
 
 use std::collections::HashSet;
 
@@ -20,20 +15,17 @@ use super::{ExistingReport, ReportRecord, ReportSink};
 
 const API_ROOT: &str = "https://api.github.com";
 
-/// Label every fee1dead-filed issue carries, so listing our own issues never
-/// sweeps up unrelated ones in the repo.
+/// On every filed issue, so listing ours never sweeps up unrelated ones.
 const SINK_LABEL: &str = "fee1dead";
 
 pub struct GithubSink {
     api_root: String,
-    /// `owner/repo`.
+    /// `owner/name`.
     repo: String,
     token: String,
     agent: ureq::Agent,
-    /// Finding ids already filed as issues, loaded from the repo on the first
-    /// write and extended with each issue this sink creates.
+    /// Finding ids already filed, listed on the first write.
     filed: Option<HashSet<String>>,
-    /// Issues created by this sink (excludes ones that already existed).
     created: usize,
 }
 
@@ -53,7 +45,6 @@ impl GithubSink {
         }
     }
 
-    /// Common auth/version headers GitHub's REST API expects.
     fn request(&self, method: &str, url: &str) -> ureq::Request {
         self.agent
             .request(method, url)
@@ -63,7 +54,6 @@ impl GithubSink {
             .set("user-agent", "fee1dead")
     }
 
-    /// Ids of the findings already filed in the repo, listed on first use.
     fn filed(&mut self) -> Result<&mut HashSet<String>> {
         if self.filed.is_none() {
             let ids = self
@@ -116,13 +106,11 @@ impl ReportSink for GithubSink {
     }
 
     fn count(&self) -> Result<usize> {
-        // The sink does not re-query the repo; report the issues it created.
         Ok(self.created)
     }
 
     fn existing_reports(&self) -> Result<Vec<ExistingReport>> {
-        // Paginate our own labeled issues (open and closed) so the report stage
-        // can dedup new findings against everything already filed.
+        // Open and closed, so nothing already filed is filed again.
         let mut out = Vec::new();
         for page in 1..=MAX_ISSUE_PAGES {
             let resp = self
@@ -155,12 +143,10 @@ impl ReportSink for GithubSink {
     }
 }
 
-/// Cap on issue-list pages fetched for dedup, so a repo with a huge backlog
-/// cannot make the report stage page forever.
+/// So a huge backlog cannot make the sink page forever.
 const MAX_ISSUE_PAGES: u32 = 20;
 
-/// Recover the finding fields from an issue this sink filed (see
-/// [`issue_payload`] for the layout it parses back).
+/// Parse back the layout [`issue_payload`] writes.
 fn existing_report(issue_title: &str, body: &str) -> ExistingReport {
     // Issues edited in the web UI come back with CRLF line endings.
     let body = body.replace("\r\n", "\n");
@@ -192,7 +178,6 @@ fn section<'a>(body: &'a str, heading: &str) -> &'a str {
     rest[..end].trim()
 }
 
-/// Recover the finding id fee1dead stamped into an issue body, if present.
 fn marker_id(body: &str) -> Option<String> {
     let start = body.find("<!-- fee1dead-finding-id:")?;
     let rest = &body[start..];
@@ -201,14 +186,12 @@ fn marker_id(body: &str) -> Option<String> {
     Some(inner.trim().to_string())
 }
 
-/// Hidden HTML comment embedded in every issue body: the idempotency key that
-/// lets a re-run find the issue a finding already produced.
+/// The idempotency key hidden in every issue body.
 fn marker(id: &str) -> String {
     format!("<!-- fee1dead-finding-id: {id} -->")
 }
 
-/// Build the GitHub issue creation payload (title, body, labels) from a
-/// schema-validated finding. Pure so it is unit-testable without the API.
+/// The issue-creation payload (title, body, labels) for a finding.
 fn issue_payload(id: &str, finding: &Value) -> Value {
     let get = |k: &str| finding.get(k).and_then(Value::as_str).unwrap_or("");
     let severity = get("severity");
@@ -241,7 +224,7 @@ fn issue_payload(id: &str, finding: &Value) -> Value {
     if !severity.is_empty() {
         labels.push(format!("severity:{severity}"));
     }
-    // The reviewer could not settle it: flag it so nobody acts on it unverified.
+    // Flagged so nobody acts on an unsettled finding unverified.
     if get("verdict") == "needs_review" {
         labels.push("needs-review".to_string());
     }

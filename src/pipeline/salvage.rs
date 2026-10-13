@@ -1,13 +1,10 @@
-//! One repair turn for an agent whose answer the harness could not use.
+//! One repair turn for an agent whose answer was unusable. An agent that
+//! traced a bug for 30 minutes, then wrote malformed JSON or ran out of time,
+//! still has its analysis in its session; forking it with a narrow instruction
+//! recovers the answer for a fraction of a rerun.
 //!
-//! A hunter that traced a bug for 30 minutes and then wrote malformed JSON, or
-//! ran out of time before writing anything, still has its analysis in its
-//! session. Forking that session with a narrow instruction reuses the cached
-//! context and recovers the answer for a fraction of a rerun.
-//!
-//! The repair turn keeps the request's model and effort: prompt caches are
-//! per model, and changing effort mid-conversation invalidates the cached
-//! messages, which would re-bill the whole session at full input price.
+//! The repair keeps the request's model and effort: caches are per model, and
+//! changing effort mid-conversation would re-bill the session at full price.
 
 use std::time::Duration;
 
@@ -16,11 +13,9 @@ use tracing::warn;
 
 use crate::provider::{AgentRequest, AgentResult, AgentRunner, ResumeSession, timed_out_session};
 
-/// Wall-clock cap on the repair turn. It only rewrites or finishes an answer
-/// from context the agent already has, so it needs minutes, not a full run.
+/// It only rewrites an answer from context the agent already has.
 const REPAIR_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Why the first answer was unusable, which decides the repair instruction.
 enum Problem {
     Unparseable(String),
     TimedOut,
@@ -45,10 +40,9 @@ impl Problem {
     }
 }
 
-/// Run `req` and parse its answer with `parse`. If the answer does not parse,
-/// or the agent timed out, fork its session once with a repair instruction and
-/// parse that answer instead. Errors other than a timeout, and a first run
-/// that reported no session, are returned as they are.
+/// Run `req` and `parse` its answer. An unparseable answer or a timeout gets
+/// one repair turn in a fork of the agent's own session; any other error, or
+/// a run that reported no session, is returned as is.
 pub(super) async fn run_parsed<T>(
     runner: &dyn AgentRunner,
     req: AgentRequest,
@@ -137,29 +131,24 @@ mod tests {
     fn answer(stdout: &str, session: Option<&str>) -> Result<AgentResult> {
         Ok(AgentResult {
             stdout: stdout.into(),
-            exit_code: 0,
             session_id: session.map(Into::into),
         })
     }
 
     fn req() -> AgentRequest {
         AgentRequest {
-            prompt: "hunt".into(),
-            system: None,
-            working_dir: PathBuf::from("/work/scratch/T-1"),
-            output_dir: PathBuf::from("/work/scratch/T-1"),
-            extra_dirs: Vec::new(),
-            allowed_tools: Vec::new(),
-            disallowed_tools: Vec::new(),
-            timeout: Duration::from_secs(1800),
             resume: Some(ResumeSession {
                 session_id: "recon".into(),
                 project_dir: PathBuf::from("/work/target"),
             }),
-            cache_1h: false,
-            effort: Effort::Xhigh,
             model: Some("m".into()),
             stream_log_path: Some(PathBuf::from("/work/out/logs/hunt-T-1.jsonl")),
+            ..AgentRequest::new(
+                "hunt".into(),
+                PathBuf::from("/work/scratch/T-1"),
+                Duration::from_secs(1800),
+                Effort::Xhigh,
+            )
         }
     }
 
@@ -182,13 +171,13 @@ mod tests {
         let seen = runner.seen.lock().unwrap();
         let repair = &seen[1];
         let resume = repair.resume.as_ref().unwrap();
-        // It forks the hunter's own session, where that session lives.
+        // The hunter's own session, where it lives.
         assert_eq!(resume.session_id, "hunter-s");
         assert_eq!(resume.project_dir, PathBuf::from("/work/target"));
         assert!(repair.prompt.contains("not a number"));
         // Same model and effort, so the cached session is reused.
         assert_eq!(repair.model.as_deref(), Some("m"));
-        assert!(matches!(repair.effort, Effort::Xhigh));
+        assert_eq!(repair.effort, Effort::Xhigh);
         assert_eq!(repair.timeout, REPAIR_TIMEOUT);
         assert_eq!(
             repair.stream_log_path.as_deref(),
