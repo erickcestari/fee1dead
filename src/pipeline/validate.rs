@@ -1,7 +1,8 @@
 //! Validate stage: independent reviewers re-read the code and tag every
 //! candidate, in parallel batches grouped by file. Nothing is deleted: a
 //! real-but-unproven bug is `needs_review`, not dropped. Having traced each
-//! bug, the reviewer also writes its impact and recommendation for the report.
+//! bug, the reviewer also writes its impact and recommendation for the report,
+//! and wishes for what the sandbox lacked to settle one.
 //!
 //! Batches bound a reviewer's load: one agent over a whole run outlasts its
 //! timeout. Incremental, so `--resume` reviews only failed batches' findings.
@@ -17,10 +18,11 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::salvage::run_parsed;
+use super::wishlist::{self, RawWish};
 use super::{StageCtx, prompt};
 use crate::artifacts::names;
 use crate::config::Stage;
-use crate::domain::{Finding, Severity, Validation, Verdict};
+use crate::domain::{Finding, Severity, Validation, Verdict, Wish};
 use crate::json_block;
 use crate::provider::{AgentRequest, Effort};
 
@@ -42,6 +44,8 @@ struct RawReview {
     impact: String,
     #[serde(default)]
     recommendation: String,
+    #[serde(default)]
+    wish: Option<RawWish>,
 }
 
 pub async fn run(ctx: &StageCtx) -> Result<()> {
@@ -82,11 +86,15 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     }
 
     let mut counts: HashMap<Verdict, usize> = HashMap::new();
-    let (mut failed, mut unreviewed) = (0, 0);
+    let (mut failed, mut unreviewed, mut wishes) = (0, 0, 0);
     while let Some(done) = running.join_next().await {
         let (batch, out) = done.context("review task panicked")?;
         match out {
-            Ok(reviews) => {
+            Ok(mut reviews) => {
+                for wish in review_wishes(&batch, &mut reviews) {
+                    ctx.artifacts.append_jsonl(names::WISHLIST, &wish)?;
+                    wishes += 1;
+                }
                 for v in reconcile(&batch, reviews) {
                     *counts.entry(v.verdict).or_default() += 1;
                     ctx.artifacts.append_jsonl(names::VALIDATED, &v)?;
@@ -111,6 +119,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         downgraded = count(Verdict::Downgraded),
         likely_fp = count(Verdict::LikelyFalsePositive),
         needs_review = count(Verdict::NeedsReview),
+        wishes,
         "review complete"
     );
     if failed > 0 {
@@ -127,6 +136,7 @@ fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
     let cfg = &ctx.config;
     let prompt = PROMPT
         .replace("{target_dir}", &cfg.run.target_dir.to_string_lossy())
+        .replace("{wish_kinds}", wishlist::KINDS)
         .replace("{findings_json}", &review_input(batch))
         + &prompt::reference_note(cfg)
         + prompt::skills_directive(cfg);
@@ -187,6 +197,22 @@ fn review_input(batch: &[Finding]) -> String {
         })
         .collect();
     serde_json::to_string_pretty(&items).expect("a json array always serializes")
+}
+
+/// Take the reviewers' wishes, each tied to the finding it would settle. A
+/// review of a finding outside the batch is ignored, as in [`reconcile`].
+fn review_wishes(batch: &[Finding], reviews: &mut [RawReview]) -> Vec<Wish> {
+    let tasks: HashMap<&str, &str> = batch
+        .iter()
+        .map(|f| (f.id.as_str(), f.task_id.as_str()))
+        .collect();
+    reviews
+        .iter_mut()
+        .filter_map(|r| {
+            let task_id = tasks.get(r.finding_id.as_str())?;
+            r.wish.take()?.into_wish(task_id, Some(&r.finding_id))
+        })
+        .collect()
 }
 
 /// Pair each finding with its review. One the reviewer omitted is kept as
@@ -250,6 +276,7 @@ mod tests {
             corrected_severity: None,
             impact: "attacker drains the channel".into(),
             recommendation: "check the bound".into(),
+            wish: None,
         }
     }
 
@@ -311,6 +338,30 @@ mod tests {
         assert_eq!(v[0].impact, "attacker drains the channel");
         assert_eq!(v[1].corrected_severity, None);
         assert!(v[2].impact.is_empty() && v[2].recommendation.is_empty());
+    }
+
+    #[test]
+    fn a_wish_is_tied_to_the_finding_it_would_settle() {
+        let batch = vec![Finding {
+            task_id: "T-0004".into(),
+            ..finding("F-1")
+        }];
+        let wish = || serde_json::from_str(r#"{"kind": "source", "need": "the codec"}"#).ok();
+        let mut reviews = vec![
+            RawReview {
+                wish: wish(),
+                ..review("F-1", Verdict::NeedsReview)
+            },
+            RawReview {
+                wish: wish(),
+                ..review("not-in-batch", Verdict::NeedsReview)
+            },
+        ];
+        let wishes = review_wishes(&batch, &mut reviews);
+        assert_eq!(wishes.len(), 1);
+        assert_eq!(wishes[0].task_id, "T-0004");
+        assert_eq!(wishes[0].finding_id.as_deref(), Some("F-1"));
+        assert_eq!(reconcile(&batch, reviews)[0].verdict, Verdict::NeedsReview);
     }
 
     #[test]

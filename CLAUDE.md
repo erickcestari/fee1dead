@@ -34,13 +34,15 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - `src/pipeline/` — `mod.rs` sequences stages; one file per stage. Every stage
   agent's request starts from `StageCtx::agent_request` (deny-list, timeout,
   stage model, reference dir, and a `<stage>-<key>` scratch dir and transcript).
-  `prompt.rs` holds the prompt fragments several stages append. `feedback.rs`
-  is a cross-run memory (no consumer repos): it writes durable seed tasks to
-  `feedback-seeds.jsonl`, which the next run's recon reads as leads (and
-  consumes). `salvage.rs` gives an agent whose answer does not parse, or that
-  timed out, one repair turn in its own session. Add a stage: create the file,
-  add a variant to `config::Stage`, and the compiler points at the `run_stage`
-  match.
+  `prompt.rs` holds the prompt fragments several stages append.
+  `wishlist.rs` owns the wish hunters and reviewers emit for what the sandbox
+  lacks (`wishlist.jsonl`), the agents' channel back to the operator.
+  `feedback.rs` is a cross-run memory (no consumer repos): it writes durable
+  seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
+  leads (and consumes). `salvage.rs` gives an agent whose answer does not
+  parse, or that timed out, one repair turn in its own session. Add a stage:
+  create the file, add a variant to `config::Stage`, and the compiler points at
+  the `run_stage` match.
 - `src/store/` — `ReportSink` trait + sqlite/jsonl/http/github sinks. New sinks
   implement the trait, get a `config::ReportConfig` variant, and wire into
   `build_sink`.
@@ -53,15 +55,17 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `[target].repo` at `ref` into `target_dir`, or asserts a mounted target is
   present, then runs `[target].prepare`. Called at the top of `Pipeline::run`.
 - `src/domain.rs` — the inter-stage data contract (`Task`, `Finding`,
-  `Validation`, `GapMarker`, `Severity`). Change here ripples to artifacts.
+  `Validation`, `GapMarker`, `Wish`, `Severity`). Change here ripples to
+  artifacts.
 - `src/artifacts.rs` — JSON/JSONL stage IO. **Stages communicate ONLY through
   artifacts** in `out_dir` (`queue.jsonl`, `candidates.jsonl`, `gaps.jsonl`,
-  `duplicates.jsonl`, `validated.jsonl`, `findings.json`, `hunted.jsonl`,
-  `recon.json`, `run-id.txt`, plus the `logs/` and `pocs/` dirs), never by
-  calling each other. Keep it that way: it is what makes stages decoupled and
-  runs resumable. `aggregate.rs` joins the hunters' raw output into the single
-  reviewable `findings.json` with no agent call, and is also exposed as the
-  `fee1dead aggregate` subcommand for compiling a partial run after the fact.
+  `duplicates.jsonl`, `wishlist.jsonl`, `validated.jsonl`, `findings.json`,
+  `hunted.jsonl`, `recon.json`, `run-id.txt`, plus the `logs/` and `pocs/`
+  dirs), never by calling each other. Keep it that way: it is what makes stages
+  decoupled and runs resumable. `aggregate.rs` joins the hunters' raw output
+  into the single reviewable `findings.json` with no agent call, and is also
+  exposed as the `fee1dead aggregate` subcommand for compiling a partial run
+  after the fact.
 - `prompts/`, `schema/finding.schema.json` — embedded into the binary via
   `include_str!`; editing them changes the build.
 - Skills are routed per task, not per stage: recon emits `suggested_skills` on

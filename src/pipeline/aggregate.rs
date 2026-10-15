@@ -1,6 +1,6 @@
 //! Aggregate stage: join the hunters' raw output, each finding's task lead
-//! and review, the gaps, and the collapsed duplicates into one reviewable
-//! `findings.json`. Pure file IO with no agent call, so it completes even
+//! and review, the gaps, the collapsed duplicates, and the wishlist into one
+//! reviewable `findings.json`. Pure file IO with no agent call, so it completes even
 //! when a run spent its whole budget hunting; `fee1dead aggregate` runs it
 //! standalone on a partial run.
 
@@ -12,7 +12,7 @@ use tracing::info;
 
 use super::StageCtx;
 use crate::artifacts::{Artifacts, names};
-use crate::domain::{Duplicate, Finding, GapMarker, Severity, Task, Validation, Verdict};
+use crate::domain::{Duplicate, Finding, GapMarker, Severity, Task, Validation, Verdict, Wish};
 
 pub fn run(ctx: &StageCtx) -> Result<()> {
     write_report(&ctx.artifacts)
@@ -20,19 +20,21 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
 
 /// Needs only [`Artifacts`], so it runs standalone against a partial run.
 pub fn write_report(artifacts: &Artifacts) -> Result<()> {
-    let candidates: Vec<Finding> = artifacts.read_jsonl(names::CANDIDATES)?;
-    let gaps: Vec<GapMarker> = artifacts.read_jsonl(names::GAPS)?;
-    let tasks: Vec<Task> = artifacts.read_jsonl(names::QUEUE)?;
-    let duplicates: Vec<Duplicate> = artifacts.read_jsonl(names::DUPLICATES)?;
-    let validations: Vec<Validation> = artifacts.read_jsonl(names::VALIDATED)?;
-
-    let report = aggregate(candidates, gaps, &tasks, duplicates, &validations);
+    let report = aggregate(Inputs {
+        candidates: artifacts.read_jsonl(names::CANDIDATES)?,
+        gaps: artifacts.read_jsonl(names::GAPS)?,
+        tasks: artifacts.read_jsonl(names::QUEUE)?,
+        duplicates: artifacts.read_jsonl(names::DUPLICATES)?,
+        validations: artifacts.read_jsonl(names::VALIDATED)?,
+        wishes: artifacts.read_jsonl(names::WISHLIST)?,
+    });
     let json = serde_json::to_string_pretty(&report)?;
     artifacts.write_text(names::REPORT_JSON, &json)?;
 
     info!(
         findings = report.summary.findings,
         gaps = report.summary.gaps,
+        wishes = report.summary.wishes,
         file = names::REPORT_JSON,
         "aggregate complete"
     );
@@ -45,6 +47,8 @@ struct Report {
     findings: Vec<EnrichedFinding>,
     gaps: Vec<GapMarker>,
     duplicates: Vec<Duplicate>,
+    /// Grouped by kind, so each lever's wishes can be granted together.
+    wishes: Vec<Wish>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +56,7 @@ struct Summary {
     findings: usize,
     gaps: usize,
     duplicates: usize,
+    wishes: usize,
     /// By effective severity: the reviewer's correction where it made one.
     by_severity: SeverityCounts,
     /// Present once validate has run.
@@ -162,15 +167,28 @@ struct TaskContext {
     tags: Vec<String>,
 }
 
-/// Ordered for triage: likely false positives last, then by effective
-/// severity, then by the hunter's confidence.
-fn aggregate(
+/// The run's artifacts, as read from `out_dir`.
+#[derive(Default)]
+struct Inputs {
     candidates: Vec<Finding>,
     gaps: Vec<GapMarker>,
-    tasks: &[Task],
+    tasks: Vec<Task>,
     duplicates: Vec<Duplicate>,
-    validations: &[Validation],
-) -> Report {
+    validations: Vec<Validation>,
+    wishes: Vec<Wish>,
+}
+
+/// Ordered for triage: likely false positives last, then by effective
+/// severity, then by the hunter's confidence.
+fn aggregate(inputs: Inputs) -> Report {
+    let Inputs {
+        candidates,
+        gaps,
+        tasks,
+        duplicates,
+        validations,
+        mut wishes,
+    } = inputs;
     let tasks_by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let reviews: HashMap<&str, &Validation> = validations
         .iter()
@@ -209,25 +227,29 @@ fn aggregate(
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
+    // Stable, so each kind keeps wishlist.jsonl order.
+    wishes.sort_by_key(|w| w.kind);
 
     Report {
         summary: Summary {
             findings: findings.len(),
             gaps: gaps.len(),
             duplicates: duplicates.len(),
+            wishes: wishes.len(),
             by_severity,
             by_verdict: (!validations.is_empty()).then_some(by_verdict),
         },
         findings,
         gaps,
         duplicates,
+        wishes,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::fixtures;
+    use crate::domain::{WishKind, fixtures};
 
     fn finding(id: &str, task_id: &str, severity: Severity, confidence: f64) -> Finding {
         Finding {
@@ -254,7 +276,11 @@ mod tests {
             finding("high-weak", "T-1", Severity::High, 0.2),
             finding("high-strong", "T-1", Severity::High, 0.8),
         ];
-        let report = aggregate(candidates, vec![], &[task("T-1", "h")], vec![], &[]);
+        let report = aggregate(Inputs {
+            candidates,
+            tasks: vec![task("T-1", "h")],
+            ..Inputs::default()
+        });
         let order: Vec<&str> = report
             .findings
             .iter()
@@ -270,13 +296,11 @@ mod tests {
             finding("f2", "T-1", Severity::High, 0.5),
             finding("f3", "T-2", Severity::Critical, 0.5),
         ];
-        let report = aggregate(
+        let report = aggregate(Inputs {
             candidates,
-            vec![],
-            &[task("T-1", "len unchecked")],
-            vec![],
-            &[],
-        );
+            tasks: vec![task("T-1", "len unchecked")],
+            ..Inputs::default()
+        });
         assert_eq!(report.summary.findings, 3);
         assert_eq!(report.summary.by_severity.high, 2);
         assert_eq!(report.summary.by_severity.critical, 1);
@@ -304,13 +328,11 @@ mod tests {
             duplicate_of: "f1".into(),
             finding: finding("f2", "T-1", Severity::Low, 0.5),
         };
-        let report = aggregate(
-            vec![finding("f1", "T-1", Severity::High, 0.5)],
-            vec![],
-            &[],
-            vec![dup],
-            &[],
-        );
+        let report = aggregate(Inputs {
+            candidates: vec![finding("f1", "T-1", Severity::High, 0.5)],
+            duplicates: vec![dup],
+            ..Inputs::default()
+        });
         assert_eq!(report.summary.duplicates, 1);
         assert_eq!(report.duplicates[0].duplicate_of, "f1");
         assert_eq!(report.findings.len(), 1, "duplicates are not findings");
@@ -336,7 +358,11 @@ mod tests {
             review("cut", Verdict::Downgraded, Some(Severity::Info)),
             review("real", Verdict::Confirmed, None),
         ];
-        let report = aggregate(candidates, vec![], &[], vec![], &validations);
+        let report = aggregate(Inputs {
+            candidates,
+            validations,
+            ..Inputs::default()
+        });
         let order: Vec<&str> = report
             .findings
             .iter()
@@ -364,14 +390,36 @@ mod tests {
     }
 
     #[test]
-    fn before_validate_there_is_no_verdict_summary() {
-        let report = aggregate(
-            vec![finding("f1", "T-1", Severity::Low, 0.5)],
-            vec![],
-            &[],
-            vec![],
-            &[],
+    fn wishes_are_grouped_by_kind_and_counted() {
+        let wish = |need: &str, kind| Wish {
+            task_id: "T-1".into(),
+            finding_id: None,
+            kind,
+            need: need.into(),
+            unblocks: String::new(),
+        };
+        let report = aggregate(Inputs {
+            wishes: vec![
+                wish("a FreeBSD VM", WishKind::Environment),
+                wish("proxy.golang.org", WishKind::Network),
+                wish("a regtest bitcoind", WishKind::Environment),
+            ],
+            ..Inputs::default()
+        });
+        let needs: Vec<&str> = report.wishes.iter().map(|w| w.need.as_str()).collect();
+        assert_eq!(
+            needs,
+            ["proxy.golang.org", "a FreeBSD VM", "a regtest bitcoind"]
         );
+        assert_eq!(report.summary.wishes, 3);
+    }
+
+    #[test]
+    fn before_validate_there_is_no_verdict_summary() {
+        let report = aggregate(Inputs {
+            candidates: vec![finding("f1", "T-1", Severity::Low, 0.5)],
+            ..Inputs::default()
+        });
         let json = serde_json::to_string(&report).unwrap();
         assert!(
             !json.contains("by_verdict") && !json.contains("\"review\""),
@@ -381,13 +429,10 @@ mod tests {
 
     #[test]
     fn missing_task_context_is_omitted_from_json() {
-        let report = aggregate(
-            vec![finding("f1", "gone", Severity::Low, 0.5)],
-            vec![],
-            &[],
-            vec![],
-            &[],
-        );
+        let report = aggregate(Inputs {
+            candidates: vec![finding("f1", "gone", Severity::Low, 0.5)],
+            ..Inputs::default()
+        });
         let json = serde_json::to_string(&report).unwrap();
         assert!(
             !json.contains("\"task\""),

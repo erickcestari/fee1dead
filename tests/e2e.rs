@@ -374,3 +374,47 @@ async fn a_malformed_hunter_answer_is_repaired_not_discarded() {
         "the repair forks the hunter's own session"
     );
 }
+
+fn confirm_all_wishing(prompt: &str) -> String {
+    let mut reviews: Vec<Value> = serde_json::from_str(&confirm_all(prompt)).unwrap();
+    reviews[0]["wish"] =
+        json!({"kind": "toolchain", "need": "a Rust toolchain", "unblocks": "running the PoC"});
+    serde_json::to_string(&reviews).unwrap()
+}
+
+/// Hunters and reviewers write to one wishlist, which findings.json lists.
+#[tokio::test]
+async fn wishes_reach_the_wishlist_and_the_report() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "validate", "aggregate""#);
+    let mut replies = replies();
+    for reply in &mut replies {
+        match reply.match_substr.as_deref() {
+            Some("You are a Hunter") => {
+                reply.stdout = reply.stdout.replace(
+                    r#""gaps": ["#,
+                    r#""wishes": [{"kind": "environment", "need": "a FreeBSD VM", "unblocks": "the PoC end to end"}, {"kind": "network"}],
+  "gaps": ["#,
+                );
+            }
+            Some("You are the Reviewer") => reply.render = Some(confirm_all_wishing),
+            _ => {}
+        }
+    }
+    run_with(cfg, Arc::new(MockRunner::new(replies)))
+        .await
+        .unwrap();
+
+    let wishes: Vec<Value> = read_jsonl(&out.join("wishlist.jsonl"));
+    assert_eq!(wishes.len(), 2, "the wish naming no need is dropped");
+    assert_eq!(wishes[0]["task_id"], "T-0001");
+    assert_eq!(wishes[0]["need"], "a FreeBSD VM");
+    assert!(wishes[0].get("finding_id").is_none());
+    let finding_id = wishes[1]["finding_id"].as_str().unwrap();
+    assert!(finding_id.ends_with("-T-0001-F01"), "got {finding_id}");
+
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("findings.json")).unwrap()).unwrap();
+    assert_eq!(report["summary"]["wishes"], 2);
+    assert_eq!(report["wishes"][0]["kind"], "toolchain");
+}

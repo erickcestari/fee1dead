@@ -207,6 +207,45 @@ impl GapMarker {
     }
 }
 
+/// Something an agent needed but the sandbox lacks, recorded so the agent
+/// carries on instead of stalling. The agents' channel back to the operator,
+/// who grants wishes between runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Wish {
+    pub task_id: String,
+    /// Set when a reviewer needed it to settle this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    pub kind: WishKind,
+    /// What was missing, concretely ("a FreeBSD VM", "proxy.golang.org").
+    pub need: String,
+    /// The check it would let the agent run.
+    #[serde(default)]
+    pub unblocks: String,
+}
+
+/// The lever that grants a wish. Declared in grant-cost order, so the derived
+/// `Ord` lists the cheap ones first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WishKind {
+    /// A host the egress firewall blocks: `[firewall].allow`.
+    Network,
+    /// Code the checkout lacks (a dependency, submodule, or spec):
+    /// `[target].prepare` or `[reference]`.
+    Source,
+    /// A compiler, tool, or package missing from the image.
+    Toolchain,
+    /// Config files, fixtures, or credentials.
+    Data,
+    /// What the container cannot be: another OS, a VM, hardware, a live service.
+    Environment,
+    /// Also any kind an agent made up, so one odd label never voids its answer.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -285,6 +324,17 @@ mod tests {
             wire(serde_json::json!(Verdict::NeedsReview)),
             "needs_review"
         );
+        assert_eq!(
+            wire(serde_json::json!(WishKind::Environment)),
+            "environment"
+        );
+    }
+
+    #[test]
+    fn an_unknown_wish_kind_reads_as_other() {
+        let kind = |s: &str| serde_json::from_str::<WishKind>(s).unwrap();
+        assert_eq!(kind("\"network\""), WishKind::Network);
+        assert_eq!(kind("\"a vm please\""), WishKind::Other);
     }
 
     #[test]

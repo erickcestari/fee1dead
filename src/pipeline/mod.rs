@@ -14,6 +14,7 @@ mod salvage;
 mod similarity;
 mod skip_reported;
 mod validate;
+mod wishlist;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

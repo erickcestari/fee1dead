@@ -68,6 +68,10 @@ Architectural context:
   outgoing leg settles the incoming leg before it expires). Loss often comes
   from the victim failing to recognize, learn, or act; anything the node signed
   or sent but never recorded is a lead in itself.
+- If a check needs something this sandbox lacks (a blocked host, a dependency's
+  source, a tool, another OS or a VM, a running service), do not work around it
+  or retry: add a wish and carry on from the code. The operator grants wishes
+  between runs, so a wish is how a blocked check gets done next time.
 {poc_rule}
 
 ## Workflow
@@ -102,6 +106,9 @@ and no prose around it. Shape:
   ],
   "gaps": [
     {"area": "file or function touched but not fully covered", "attack_class": "the bug class worth a follow-up pass there", "reason": "why it was left uncovered"}
+  ],
+  "wishes": [
+    {"kind": "network|source|toolchain|data|environment|other", "need": "what was missing, concretely", "unblocks": "the check it would let you run"}
   ]
 }
 ```
@@ -111,4 +118,6 @@ real and reachable (latent or guarded means low). Each gap becomes a follow-up
 hunter whose only brief is your `area`, `attack_class`, and `reason`. Emit up to
 5, one per area you traced far enough to name a specific bug class worth a
 dedicated pass, whether or not you could confirm it. Do not pad with areas you
-only glanced at or with pattern matches. Empty arrays are a valid result.
+only glanced at or with pattern matches. Wish only for what blocked a check you
+attempted; most hunters need none. `kind` is {wish_kinds}. Empty arrays are a
+valid result.

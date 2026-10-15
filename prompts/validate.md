@@ -34,6 +34,11 @@ severity.
   blocked you. It is filed, marked for a human to verify, so use it only when
   none of the other three can be defended from the code.
 
+When a verdict was blocked by something this sandbox lacks (a dependency's
+source, a tool, a host the firewall blocks, another OS or a VM), do not work
+around it: add a `wish` to that finding's review. The operator grants wishes
+between runs, so the next review can settle it.
+
 Dismiss only on code you read. A protocol or spec guarantee (the victim "can"
 claim that output, the peer "must" reject that message) says what the code
 should do, not what it does. Calling a deviation benign is a dismissal too.
@@ -75,6 +80,9 @@ one object per finding above. A finding you leave out is filed unreviewed as
 - `impact` (what an attacker concretely gains) and `recommendation` (the
   specific fix) are required for every verdict except `likely_false_positive`,
   which is not reported and leaves both out.
+- `wish` is optional on any verdict and absent on most: `need` is what was
+  missing, `unblocks` the check it would let you run, and `kind` is
+  {wish_kinds}.
 
 Illustrative shape (ids and content are examples):
 
@@ -83,6 +91,6 @@ Illustrative shape (ids and content are examples):
   {"finding_id": "T-0001-F01", "verdict": "confirmed", "evidence": "The peer-supplied length at wire/decode.go:88 reaches make() at wire/decode.go:97 with no upper bound, and handleMessage calls decode on every inbound frame.", "impact": "Any connected peer can make the node allocate gigabytes with one small message and crash it out of memory.", "recommendation": "Reject lengths above MaxMsgSize in decode before allocating, as the sibling decoder at wire/msg.go:40 already does."},
   {"finding_id": "T-0002-F01", "verdict": "downgraded", "corrected_severity": "low", "evidence": "The missing check is real, but its only caller is the admin RPC at rpc/admin.go:210, which requires the admin macaroon.", "impact": "An operator who already holds admin rights can crash their own node with a malformed request.", "recommendation": "Validate the request's channel point in AdminCloseChannel before dereferencing it."},
   {"finding_id": "T-0003-F01", "verdict": "likely_false_positive", "evidence": "parse.rs:88 checks the length against MAX_FRAME before the allocation the finding cites, so an oversized frame is rejected first."},
-  {"finding_id": "T-0004-F01", "verdict": "needs_review", "evidence": "inconclusive: the length reaches decode() unbounded only if the vendored codec skips its own cap, and that codec's source is not in the repository.", "impact": "If the codec does not cap the length, a remote peer can exhaust the node's memory with one message.", "recommendation": "Confirm the codec enforces a maximum length; if it does not, bound the length in decode()."}
+  {"finding_id": "T-0004-F01", "verdict": "needs_review", "evidence": "inconclusive: the length reaches decode() unbounded only if the vendored codec skips its own cap, and that codec's source is not in the repository.", "impact": "If the codec does not cap the length, a remote peer can exhaust the node's memory with one message.", "recommendation": "Confirm the codec enforces a maximum length; if it does not, bound the length in decode().", "wish": {"kind": "source", "need": "the codec module's source; the Go module cache is empty", "unblocks": "whether the codec caps the length before decode() sees it"}}
 ]
 ```

@@ -19,6 +19,8 @@ pub mod names {
     pub const GAPS: &str = "gaps.jsonl";
     /// Findings Dedupe collapsed, each with the id it duplicates.
     pub const DUPLICATES: &str = "duplicates.jsonl";
+    /// What agents needed but the sandbox lacks, for the operator to grant.
+    pub const WISHLIST: &str = "wishlist.jsonl";
     pub const VALIDATED: &str = "validated.jsonl";
     /// The one reviewable JSON document Aggregate compiles (not JSONL).
     pub const REPORT_JSON: &str = "findings.json";
@@ -45,6 +47,7 @@ pub mod names {
         CANDIDATES,
         GAPS,
         DUPLICATES,
+        WISHLIST,
         VALIDATED,
         REPORT_JSON,
         FINDINGS_JSONL,

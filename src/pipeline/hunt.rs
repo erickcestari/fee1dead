@@ -1,5 +1,5 @@
 //! Hunt stage: one hunter per queued task, concurrently, each in its own
-//! scratch dir, emitting candidate findings and gap markers.
+//! scratch dir, emitting candidate findings, gap markers, and wishes.
 //!
 //! Incremental: tasks already in `hunted.jsonl` are skipped and results are
 //! appended, so a gapfill re-queue or `--resume` only hunts what is new.
@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::salvage::run_parsed;
+use super::wishlist::{self, RawWish};
 use super::{StageCtx, prompt};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
@@ -40,6 +41,8 @@ struct HunterOutput {
     findings: Vec<RawFinding>,
     #[serde(default)]
     gaps: Vec<RawGap>,
+    #[serde(default)]
+    wishes: Vec<RawWish>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +158,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         failed = tally.failed,
         skipped,
         findings = tally.findings,
+        wishes = tally.wishes,
         "hunt complete"
     );
     if tally.limit_failures > 0 {
@@ -243,6 +247,7 @@ impl HuntPrompt {
             .replace("{poc_intro}", self.poc.intro)
             .replace("{poc_rule}", self.poc.rule)
             .replace("{poc_step}", self.poc.step)
+            .replace("{wish_kinds}", wishlist::KINDS)
             // After poc_intro, which may embed it.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &self.architecture)
@@ -336,10 +341,12 @@ struct Tally {
     failed: usize,
     limit_failures: usize,
     findings: usize,
+    wishes: usize,
 }
 
-/// Persist one hunter's findings (PoCs copied out of scratch) and gaps, then
-/// its ledger entry. A failed hunter is not marked, so the next pass retries it.
+/// Persist one hunter's findings (PoCs copied out of scratch), gaps, and
+/// wishes, then its ledger entry. A failed hunter is not marked, so the next
+/// pass retries it.
 fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally) -> Result<()> {
     let Finished {
         task,
@@ -387,6 +394,14 @@ fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally
             reason: g.reason,
         };
         artifacts.append_jsonl(names::GAPS, &marker)?;
+    }
+    for wish in output
+        .wishes
+        .into_iter()
+        .filter_map(|w| w.into_wish(&task.id, None))
+    {
+        artifacts.append_jsonl(names::WISHLIST, &wish)?;
+        tally.wishes += 1;
     }
     artifacts.append_jsonl(names::HUNTED, &task.id)
 }

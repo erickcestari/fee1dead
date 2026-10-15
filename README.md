@@ -14,22 +14,22 @@ per-task scratch space, and validates/persists results.
 | Stage      | Status   | What it does |
 |------------|----------|--------------|
 | Recon      | built    | Reads the repo top-down, emits a structured threat model (`recon.json`) and seeds the hunt queue from its `hunt_tasks`. Past runs' feedback seeds reach it as leads, which it admits or drops by the same bar as its own tasks. |
-| Hunt       | built    | One hunter per task (attack class + scope + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (toggle `run.fork_hunters`) so they inherit its codebase context; cold hunters load `recon.json` instead. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Spawn order is priority first, so unvetted gapfill tasks never jump ahead of recon's high-priority ones. Each hunter's output is saved as soon as it finishes; a hunter whose answer does not parse, or that times out, gets one repair turn in its own session. The same repair applies to recon and validate. Emits candidate findings + gap markers; PoCs are copied to `out_dir/pocs/<finding id>/`. |
+| Hunt       | built    | One hunter per task (attack class + scope + a falsifiable hypothesis and concrete `targets` to start from), run concurrently, each in its own scratch dir. Hunters **fork from recon's session** (toggle `run.fork_hunters`) so they inherit its codebase context; cold hunters load `recon.json` instead. **Incremental:** skips already-hunted tasks, so re-queues get a fresh pass. Spawn order is priority first, so unvetted gapfill tasks never jump ahead of recon's high-priority ones. Each hunter's output is saved as soon as it finishes; a hunter whose answer does not parse, or that times out, gets one repair turn in its own session. The same repair applies to recon and validate. Emits candidate findings, gap markers, and [wishes](#wishlist); PoCs are copied to `out_dir/pocs/<finding id>/`. |
 | Validate   | built    | Independent reviewers re-read the code and **tag every finding** (`fp-check` skill), in parallel batches of up to 8 findings grouped by file: `confirmed` / `downgraded` (with corrected severity) / `likely_false_positive` / `needs_review` (inconclusive, or skipped by the reviewer). Each reviewer also writes the finding's `impact` and `recommendation`. **Never drops** a finding: a real-but-unproven bug is surfaced as `needs_review`, not discarded. Incremental, so `--resume` reviews only what a failed batch left. |
 | Gapfill    | built    | Re-queues areas hunters flagged as under-covered (`origin = gapfill`), deduped against the existing queue. |
 | Dedupe     | built    | Collapses findings sharing a root cause (same file and attack class, and the same line or a similar title); the highest-severity finding survives, the rest go to `duplicates.jsonl`. |
 | Skip-reported | built | Prunes candidates already reported in the sink (e.g. filed as GitHub issues) **before validate**, so no validation tokens are spent re-reviewing them. A token-overlap (Jaccard) score decides the confident cases; only the ambiguous middle band is escalated to a lightweight judge model (`stages.models.skip-reported`, default `claude-haiku-4-5` on claude-code), which fails open so a real finding is never silently dropped. No-op unless the sink tracks external state (github). |
-| Aggregate  | built    | Joins the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`) and each finding's recon task lead into one reviewable `findings.json`, with each finding's review (verdict, evidence, impact, recommendation) once validate has run, ordered by effective severity then confidence with likely false positives last, and the findings Dedupe collapsed listed separately. **No agent call**, so it always completes. The default config runs it last; run it standalone on a partial run with `fee1dead aggregate`. |
+| Aggregate  | built    | Joins the hunters' raw output (`candidates.jsonl` + `gaps.jsonl`) and each finding's recon task lead into one reviewable `findings.json`, with each finding's review (verdict, evidence, impact, recommendation) once validate has run, ordered by effective severity then confidence with likely false positives last, and the findings Dedupe collapsed and the [wishlist](#wishlist) listed separately. **No agent call**, so it always completes. The default config runs it last; run it standalone on a partial run with `fee1dead aggregate`. |
 | Feedback   | built    | Cross-run memory: distils confirmed findings (hunt variants) and unresolved gaps into durable seed tasks in `feedback-seeds.jsonl`. The next run's recon reads them as leads and queues the ones that pass its admission bar, so each run starts smarter. |
 | Report     | built    | Builds a `schema/finding.schema.json` record for every reportable finding (all but `likely_false_positive`) from the finding and its review, then persists via the configured sink. **No agent call.** Each record carries its `verdict`; the github sink labels `needs_review` issues `needs-review`. |
 
 Stages communicate only through artifacts in `out_dir` (`queue.jsonl`,
-`candidates.jsonl`, `gaps.jsonl`, `duplicates.jsonl`, `validated.jsonl`,
-`findings.json`, `hunted.jsonl`, `recon.json`, `run-id.txt`), so they are
-decoupled and runs are resumable. A recon-led run clears those per-run artifacts
-at startup; `feedback-seeds.jsonl` is the one durable artifact and survives,
-carrying learning between runs. **Reuse the same `out_dir` (mount) across runs to
-keep the feedback memory.**
+`candidates.jsonl`, `gaps.jsonl`, `duplicates.jsonl`, `wishlist.jsonl`,
+`validated.jsonl`, `findings.json`, `hunted.jsonl`, `recon.json`,
+`run-id.txt`), so they are decoupled and runs are resumable. A recon-led run
+clears those per-run artifacts at startup; `feedback-seeds.jsonl` is the one
+durable artifact and survives, carrying learning between runs. **Reuse the same
+`out_dir` (mount) across runs to keep the feedback memory.**
 
 Finding ids are `<run id>-<task id>-F<nn>`, so a finding never shares an id with
 another run's (sinks like github and a reused sqlite db key on it).
@@ -57,6 +57,26 @@ the result (falling back to the stream's final event if the agent didn't write
 it) and mirrors it next to the transcript as `out_dir/logs/<stage>-<label>.output.json`,
 so each agent's answer is visible in the out dir without reaching into its scratch
 dir. The `logs/` directory is cleared at the start of a recon-led run.
+
+### Wishlist
+
+When a hunter or reviewer needs something the sandbox lacks (a blocked host, a
+dependency's source, a compiler, a VM), it records a wish in
+`wishlist.jsonl` and carries on from the code instead of stalling. Each wish
+names the `need`, the check it `unblocks`, its task (and finding, for a
+reviewer's), and a `kind` that maps to the lever that grants it:
+
+| `kind` | Grant it with |
+|--------|---------------|
+| `network` | `[firewall].allow` |
+| `source` | `[target].prepare` (e.g. `go mod download`) or `[reference]` |
+| `toolchain` | the image (`docker/Dockerfile`) |
+| `data` | a mounted file or `[target].prepare` |
+| `environment` | infrastructure outside the container (another OS, a VM, a live service) |
+| `other` | read the `need` |
+
+`findings.json` lists the run's wishes grouped by kind. Grant them and re-run.
+The file is per-run and is cleared at the start of a recon-led run.
 
 ## Architecture
 
