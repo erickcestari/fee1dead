@@ -3,10 +3,10 @@
 //! partial run stays readable.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -168,12 +168,15 @@ impl Artifacts {
         (!line.is_empty()).then_some(line)
     }
 
-    /// Copy a file or tree into `out_dir/rel`. Symlinks are skipped: an
-    /// agent-written link could point anywhere.
+    /// Copy the text files of a file or tree into `out_dir/rel`, failing when
+    /// there are none. Binaries are build output, not source worth keeping;
+    /// symlinks are skipped since an agent-written link could point anywhere.
     pub fn import(&self, rel: &Path, src: &Path) -> Result<()> {
         let dest = self.out_dir.join(rel);
-        copy_tree(src, &dest)
-            .with_context(|| format!("copying {} to {}", src.display(), dest.display()))
+        let copied = copy_tree(src, &dest)
+            .with_context(|| format!("copying {} to {}", src.display(), dest.display()))?;
+        ensure!(copied > 0, "no text files in {}", src.display());
+        Ok(())
     }
 }
 
@@ -184,21 +187,31 @@ fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
     }
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> io::Result<()> {
+/// Returns the number of files copied. Directories are created only on the
+/// way to a copied file, so a tree of binaries leaves nothing behind.
+fn copy_tree(src: &Path, dest: &Path) -> io::Result<usize> {
     let meta = std::fs::symlink_metadata(src)?;
+    let mut copied = 0;
     if meta.is_dir() {
-        std::fs::create_dir_all(dest)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+            copied += copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
         }
-    } else if meta.is_file() {
+    } else if meta.is_file() && !is_binary(src)? {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(src, dest)?;
+        copied = 1;
     }
-    Ok(())
+    Ok(copied)
+}
+
+/// Git's heuristic: a NUL byte in the first 8000 bytes.
+fn is_binary(path: &Path) -> io::Result<bool> {
+    let mut head = Vec::with_capacity(8000);
+    File::open(path)?.take(8000).read_to_end(&mut head)?;
+    Ok(head.contains(&0))
 }
 
 #[cfg(test)]
@@ -261,12 +274,15 @@ mod tests {
     }
 
     #[test]
-    fn import_copies_a_tree_and_skips_symlinks() {
+    fn import_copies_a_trees_text_and_skips_binaries_and_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("poc");
         std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(src.join("bin")).unwrap();
         std::fs::write(src.join("main.go"), "package main").unwrap();
         std::fs::write(src.join("sub").join("x.txt"), "x").unwrap();
+        std::fs::write(src.join("poc"), b"\x7fELF\x02\x01\x01\0").unwrap();
+        std::fs::write(src.join("bin").join("poc.test"), b"\x7fELF\0").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", src.join("leak")).unwrap();
 
         let art = Artifacts::new(dir.path().join("out")).unwrap();
@@ -277,6 +293,21 @@ mod tests {
             "package main"
         );
         assert!(out.join("sub/x.txt").exists());
+        assert!(!out.join("poc").exists());
+        assert!(!out.join("bin").exists());
         assert!(!out.join("leak").exists());
+    }
+
+    #[test]
+    fn import_of_only_binaries_fails_and_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("poc");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("poc"), b"\x7fELF\0").unwrap();
+
+        let art = Artifacts::new(dir.path().join("out")).unwrap();
+        let err = art.import(Path::new("pocs/F-1/poc"), &src).unwrap_err();
+        assert!(err.to_string().contains("no text files"), "{err}");
+        assert!(!art.path("pocs").exists());
     }
 }
