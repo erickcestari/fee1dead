@@ -31,6 +31,9 @@ enum Command {
     Check,
     /// Print the firewall allow-list, one host per line, for init-firewall.sh.
     FirewallHosts,
+    /// Acquire the target and run its `[target].setup` script; the container
+    /// entrypoint runs this as root before the firewall comes up.
+    Setup,
     /// Compile a finished or partial run into findings.json, with no agent.
     Aggregate {
         /// Read artifacts here instead of `run.out_dir`, e.g. the host's
@@ -75,6 +78,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Setup => fee1dead::target::run_setup(&cfg),
         Command::Aggregate { out_dir } => {
             pipeline::aggregate_dir(out_dir.unwrap_or(cfg.run.out_dir))
         }

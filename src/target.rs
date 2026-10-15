@@ -1,7 +1,8 @@
 //! Acquire the target (and the optional reference) before any stage runs:
 //! clone or update it when a repo is configured, else expect it mounted.
-//! Clones run behind the egress firewall, so every git host, submodules'
-//! included, must be in `[firewall].allow`.
+//! The pipeline does this behind the egress firewall, so every git host,
+//! submodules' included, must be in `[firewall].allow`, even when
+//! `[target].setup` already cloned it with open egress.
 
 use std::path::Path;
 use std::process::Command;
@@ -13,19 +14,46 @@ use crate::config::Config;
 
 /// Make `run.target_dir` hold the code to hunt, then run `[target].prepare`.
 pub fn ensure_target(cfg: &Config) -> Result<()> {
-    let dir = &cfg.run.target_dir;
-    match &cfg.target.repo {
-        Some(repo) => clone_or_update(repo, dir, cfg.target.git_ref.as_deref(), "target")?,
-        None => ensure!(
-            dir.exists(),
-            "run.target_dir {} does not exist and no [target].repo is configured",
-            dir.display()
-        ),
-    }
+    acquire_target(cfg)?;
     for command in &cfg.target.prepare {
-        run_prepare(command, dir);
+        run_prepare(command, &cfg.run.target_dir);
     }
     Ok(())
+}
+
+/// Run `[target].setup` in the acquired target. The container calls it as
+/// root before the firewall comes up, so the script has open egress; a no-op
+/// without a script, so the target is then cloned behind the firewall as before.
+pub fn run_setup(cfg: &Config) -> Result<()> {
+    let Some(script) = &cfg.target.setup else {
+        info!("no [target].setup script");
+        return Ok(());
+    };
+    acquire_target(cfg)?;
+    ensure_reference(cfg)?;
+    info!("running [target].setup");
+    let status = Command::new("bash")
+        .args(["-euo", "pipefail", "-c", script])
+        .current_dir(&cfg.run.target_dir)
+        .status()
+        .context("starting bash for [target].setup")?;
+    ensure!(status.success(), "[target].setup failed ({status})");
+    Ok(())
+}
+
+fn acquire_target(cfg: &Config) -> Result<()> {
+    let dir = &cfg.run.target_dir;
+    match &cfg.target.repo {
+        Some(repo) => clone_or_update(repo, dir, cfg.target.git_ref.as_deref(), "target"),
+        None => {
+            ensure!(
+                dir.exists(),
+                "run.target_dir {} does not exist and no [target].repo is configured",
+                dir.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 pub fn ensure_reference(cfg: &Config) -> Result<()> {
@@ -129,6 +157,11 @@ mod tests {
     use super::*;
 
     fn config(target_dir: &Path, prepare: &[&str]) -> Config {
+        config_with(target_dir, &format!("prepare = {prepare:?}"))
+    }
+
+    /// A config whose `[target]` table holds `target_extra`.
+    fn config_with(target_dir: &Path, target_extra: &str) -> Config {
         toml::from_str(&format!(
             r#"
 [run]
@@ -136,7 +169,7 @@ target_dir = {target:?}
 scratch_root = "/tmp/s"
 out_dir = "/tmp/o"
 [target]
-prepare = {prepare:?}
+{target_extra}
 [provider]
 default = "c"
 [providers.c]
@@ -159,6 +192,22 @@ enabled = ["recon"]
         let dir = tempfile::tempdir().unwrap();
         ensure_target(&config(dir.path(), &["exit 3", "touch prepared"])).unwrap();
         assert!(dir.path().join("prepared").exists());
+    }
+
+    #[test]
+    fn setup_runs_in_the_target_and_stops_at_the_first_failing_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_with(dir.path(), "setup = \"touch built\\nfalse\\ntouch after\"");
+        let err = run_setup(&cfg).unwrap_err();
+        assert!(err.to_string().contains("[target].setup failed"), "{err}");
+        assert!(dir.path().join("built").exists());
+        assert!(!dir.path().join("after").exists());
+    }
+
+    #[test]
+    fn setup_without_a_script_does_not_touch_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        run_setup(&config(&dir.path().join("absent"), &[])).unwrap();
     }
 
     #[test]

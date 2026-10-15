@@ -69,9 +69,9 @@ reviewer's), and a `kind` that maps to the lever that grants it:
 | `kind` | Grant it with |
 |--------|---------------|
 | `network` | `[firewall].allow` |
-| `source` | `[target].prepare` (e.g. `go mod download`) or `[reference]` |
-| `toolchain` | the image (`docker/Dockerfile`) |
-| `data` | a mounted file or `[target].prepare` |
+| `source` | `[target].setup` (e.g. `go mod download`) or `[reference]` |
+| `toolchain` | `[target].setup`, or the image (`docker/Dockerfile`) |
+| `data` | `[target].setup` or a mounted file |
 | `environment` | infrastructure outside the container (another OS, a VM, a live service) |
 | `other` | read the `need` |
 
@@ -195,8 +195,8 @@ just shell                        # interactive shell in the image
 ### Target the repo by clone (instead of mounting)
 
 Set `[target]` in `config/harness.toml` and the harness clones the repo into
-`target_dir` at startup. The git host must be in `[firewall].allow` (the clone
-runs after the firewall is up).
+`target_dir` at startup. The git host must be in `[firewall].allow` (the
+pipeline clones or fetches after the firewall is up).
 
 ```toml
 [target]
@@ -212,6 +212,39 @@ key fails `fee1dead check` instead of being ignored.
 
 Then `just run-clone` (no local target mount needed). With `[target]` unset, the
 harness expects `target_dir` to already contain the code (the mounted case).
+
+### Set up the target's environment
+
+`[target].setup` is a bash script the container runs as root before the
+firewall comes up, with open egress, to make the image fit the target: install
+toolchains, fetch dependencies, build the code. The target is checked out first
+(cloned, for `[target].repo`), and the script runs in `target_dir` under
+`bash -euo pipefail`, so a failing line stops the run before any tokens are
+spent.
+
+```toml
+[target]
+setup = '''
+apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+go mod download
+go build ./...
+'''
+```
+
+`HOME` is the agent's, and the entrypoint hands every file the script created
+under `/work` and `/home/agent` to the agent user afterwards, so caches it filled
+(e.g. `GOCACHE`) stay writable to the agents. Install binaries onto the default
+`PATH` (e.g. `/usr/local/bin`). A mounted target is read-only, so build out of
+tree. Setup runs on every container start before `run`, and the pipeline still
+fetches a cloned target behind the firewall, so its git host stays in
+`[firewall].allow`.
+
+| | `setup` | `prepare` |
+|-|---------|-----------|
+| Runs as | root | agent |
+| Egress | open (before the firewall) | `[firewall].allow` only |
+| On failure | stops the run | warns, continues |
+| Runs | in the container, before `run` | every pipeline run, also outside Docker |
 
 ### Reference spec / known-good implementation
 

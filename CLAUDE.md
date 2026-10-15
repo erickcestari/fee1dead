@@ -54,6 +54,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - `src/target.rs` — acquires the target repo before stages run: clones
   `[target].repo` at `ref` into `target_dir`, or asserts a mounted target is
   present, then runs `[target].prepare`. Called at the top of `Pipeline::run`.
+  `run_setup` (the `setup` subcommand) runs `[target].setup`; the container
+  entrypoint calls it as root before the firewall.
 - `src/domain.rs` — the inter-stage data contract (`Task`, `Finding`,
   `Validation`, `GapMarker`, `Wish`, `Severity`). Change here ripples to
   artifacts.

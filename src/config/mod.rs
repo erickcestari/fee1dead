@@ -84,15 +84,20 @@ fn enabled() -> bool {
     true
 }
 
-/// Clone the target into `run.target_dir` instead of expecting it mounted
-/// there. The git host must be in `[firewall].allow`.
+/// Where the target comes from and how its environment is readied. Without
+/// `repo`, the target is expected mounted at `run.target_dir`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TargetConfig {
+    /// Cloned into `run.target_dir`; the git host must be in `[firewall].allow`.
     pub repo: Option<String>,
     /// Branch, tag, or commit; defaults to the repo's default branch.
     #[serde(rename = "ref")]
     pub git_ref: Option<String>,
+    /// A bash script the container runs as root before the firewall comes up,
+    /// in the checked-out target, to install toolchains or build it. A failure
+    /// stops the run, since agents would otherwise hunt a half-built target.
+    pub setup: Option<String>,
     /// Shell commands run once in the target before any stage, e.g. to warm a
     /// package cache while the network is reachable. A failure only warns.
     pub prepare: Vec<String>,
@@ -305,6 +310,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
         assert!(cfg.target.prepare.is_empty());
+        assert!(cfg.target.setup.is_none());
         assert!(cfg.reference.active_dir().is_none());
     }
 
@@ -377,12 +383,16 @@ enabled = ["recon", "hunt", "validate", "report"]
     }
 
     #[test]
-    fn target_prepare_parses() {
+    fn target_prepare_and_setup_parse() {
         let cfg = load(&format!(
-            "{VALID}\n[target]\nprepare = [\"go mod download\"]\n"
+            "{VALID}\n[target]\nprepare = [\"go mod download\"]\nsetup = '''\napt-get install -y jq\ngo build ./...\n'''\n"
         ))
         .unwrap();
         assert_eq!(cfg.target.prepare, vec!["go mod download"]);
+        assert_eq!(
+            cfg.target.setup.as_deref(),
+            Some("apt-get install -y jq\ngo build ./...\n")
+        );
     }
 
     #[test]

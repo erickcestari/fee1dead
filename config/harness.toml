@@ -52,6 +52,18 @@ use_skills = true
 # prepare = ["go mod download"]        # Go     (also: "go build ./..." to warm GOCACHE)
 # prepare = ["cargo fetch"]            # Rust
 # prepare = ["npm ci --ignore-scripts"] # Node
+# A bash script (`-euo pipefail`) the container runs as root in target_dir
+# BEFORE the firewall comes up, so it has open egress and needs no allow-list
+# entries: install toolchains, fetch dependencies, build the target. A failing
+# line stops the run. HOME is the agent's, and whatever it creates under /work
+# and /home/agent is handed to the agent afterwards; install binaries onto the
+# default PATH (e.g. /usr/local/bin). A mounted target is read-only, so build
+# out of tree. Runs on every container start, before `run` only.
+# setup = '''
+# apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
+# go mod download
+# go build ./...
+# '''
 
 # Optional: clone a reference repository — a spec or known-good implementation —
 # and expose it to the recon, hunt, and validate agents as ground truth (it is
