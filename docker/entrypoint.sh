@@ -10,7 +10,11 @@ export FEE1DEAD_CONFIG="${FEE1DEAD_CONFIG:-/opt/fee1dead/config/harness.toml}"
 # the target. Only before `run`, since it can take minutes.
 if [[ "${1:-}" == "run" ]]; then
   started="$(mktemp)"
-  HOME=/home/agent /usr/local/bin/fee1dead setup --config "$FEE1DEAD_CONFIG"
+  # /work/target is owned by agent, so root's git (and go's VCS stamping)
+  # rejects it as dubious ownership. Nothing in the fresh container is untrusted yet.
+  HOME=/home/agent \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
+    /usr/local/bin/fee1dead setup --config "$FEE1DEAD_CONFIG"
   # Hand what setup created as root (the clone, build output, caches) back to
   # the agent so it stays writable. ctime catches extracted archives too, and
   # -xdev leaves bind mounts alone.
