@@ -6,17 +6,20 @@
 //! a real finding lost.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::StageCtx;
-use super::similarity::{jaccard, tokenize};
+use super::similarity::{finding_signature, jaccard, report_signature, tokenize};
 use crate::artifacts::names;
 use crate::config::Stage;
 use crate::domain::Finding;
 use crate::json_block;
-use crate::provider::{AgentRequest, Effort};
+use crate::provider::{AgentRequest, AgentResult, Effort};
 use crate::store::{ExistingReport, build_sink};
 
 /// At or above this overlap, a pair is a confident duplicate.
@@ -68,13 +71,32 @@ async fn drop_reported(
         .iter()
         .map(|e| tokenize(&report_signature(e)))
         .collect();
+    let mut duplicate = vec![false; candidates.len()];
+    let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
+    let mut judging = JoinSet::new();
+    for (i, finding) in candidates.iter().enumerate() {
+        match classify(&tokenize(&finding_signature(finding)), &existing_tokens) {
+            Band::Distinct => {}
+            Band::Duplicate => duplicate[i] = true,
+            Band::Uncertain(closest) => {
+                let req = judge_request(ctx, finding, &existing[closest])?;
+                let runner = Arc::clone(&ctx.runner);
+                let slots = Arc::clone(&slots);
+                let id = finding.id.clone();
+                judging.spawn(async move {
+                    let _slot = slots.acquire_owned().await.expect("never closed");
+                    (i, judge_verdict(&id, runner.run(req).await))
+                });
+            }
+        }
+    }
+    while let Some(done) = judging.join_next().await {
+        let (i, verdict) = done.context("dedup judge panicked")?;
+        duplicate[i] = verdict;
+    }
+
     let mut kept = Vec::new();
-    for finding in candidates {
-        let duplicate = match classify(&tokenize(&finding_signature(&finding)), &existing_tokens) {
-            Band::Distinct => false,
-            Band::Duplicate => true,
-            Band::Uncertain(i) => judge_is_duplicate(ctx, &finding, &existing[i]).await?,
-        };
+    for (finding, duplicate) in candidates.into_iter().zip(duplicate) {
         if duplicate {
             info!(id = %finding.id, "pruning candidate already reported");
         } else {
@@ -102,28 +124,31 @@ fn classify(tokens: &HashSet<String>, existing: &[HashSet<String>]) -> Band {
     }
 }
 
-/// Fails open: any judge error keeps the candidate.
-async fn judge_is_duplicate(
+fn judge_request(
     ctx: &StageCtx,
     finding: &Finding,
     existing: &ExistingReport,
-) -> Result<bool> {
+) -> Result<AgentRequest> {
     let prompt = JUDGE_PROMPT
         .replace("{new_finding}", &finding_signature(finding))
         .replace(
             "{existing_finding}",
             &format!("{}\n{}", existing.title, existing.text),
         );
-    let req = AgentRequest {
+    Ok(AgentRequest {
         // It compares two texts; it reads no code.
         extra_dirs: Vec::new(),
         ..ctx.agent_request(Stage::SkipReported, &finding.id, prompt, Effort::Low)?
-    };
-    match ctx.runner.run(req).await {
-        Ok(result) => Ok(parse_duplicate_verdict(&result.stdout)),
+    })
+}
+
+/// Fails open: any judge error keeps the candidate.
+fn judge_verdict(id: &str, out: Result<AgentResult>) -> bool {
+    match out {
+        Ok(result) => parse_duplicate_verdict(&result.stdout),
         Err(e) => {
-            warn!(id = %finding.id, error = %e, "dedup judge failed; keeping candidate");
-            Ok(false)
+            warn!(id, error = %e, "dedup judge failed; keeping candidate");
+            false
         }
     }
 }
@@ -136,26 +161,102 @@ fn parse_duplicate_verdict(stdout: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The fields that identify a bug, not its prose. Scoring against a whole
-/// issue body would dilute every overlap below [`DUP_LOW`].
-fn signature(title: &str, location: &str, attack_class: &str) -> String {
-    format!("{title} {location} {attack_class}")
-}
-
-fn finding_signature(f: &Finding) -> String {
-    signature(&f.title, &f.location, &f.attack_class)
-}
-
-fn report_signature(e: &ExistingReport) -> String {
-    signature(&e.title, &e.location, &e.attack_class)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::similarity::signature;
 
     fn tokens(title: &str, location: &str, class: &str) -> HashSet<String> {
         tokenize(&signature(title, location, class))
+    }
+
+    #[tokio::test]
+    async fn concurrent_verdicts_land_on_their_own_candidates() {
+        use crate::artifacts::Artifacts;
+        use crate::provider::{CannedReply, MockRunner};
+        use crate::scratch::ScratchRoot;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = toml::from_str(
+            r#"
+[run]
+target_dir = "/t"
+scratch_root = "/s"
+out_dir = "/o"
+concurrency = 2
+[provider]
+default = "c"
+[providers.c]
+type = "claude-code"
+[firewall]
+allow = ["x"]
+[report]
+sink = "jsonl"
+path = "/o/f.jsonl"
+[stages]
+enabled = ["skip-reported"]
+"#,
+        )
+        .unwrap();
+        let reply = |match_substr: Option<&str>, stdout: &str| CannedReply {
+            match_substr: match_substr.map(Into::into),
+            stdout: stdout.into(),
+            session_id: None,
+            render: None,
+        };
+        let ctx = StageCtx {
+            config,
+            artifacts: Artifacts::new(dir.path().join("out")).unwrap(),
+            scratch: ScratchRoot::new(dir.path().join("scratch")).unwrap(),
+            runner: Arc::new(MockRunner::new(vec![
+                reply(Some("Unbounded allocation"), "{\"duplicate\": true}"),
+                reply(None, "{\"duplicate\": false}"),
+            ])),
+        };
+        let existing = [ExistingReport {
+            id: "old".into(),
+            title: "Missing bounds check before allocation".into(),
+            location: "src/net.rs:42".into(),
+            attack_class: "dos".into(),
+            text: String::new(),
+        }];
+        let candidate = |id: &str, title: &str, location: &str, class: &str| Finding {
+            title: title.into(),
+            location: location.into(),
+            attack_class: class.into(),
+            ..crate::domain::fixtures::finding(id)
+        };
+        let candidates = vec![
+            // Uncertain, judged a duplicate.
+            candidate(
+                "a",
+                "Unbounded allocation from length field",
+                "src/net.rs:42",
+                "resource exhaustion",
+            ),
+            candidate(
+                "b",
+                "Integer overflow in parser",
+                "src/parse.rs:900",
+                "overflow",
+            ),
+            candidate(
+                "c",
+                "Missing bounds check before allocation",
+                "src/net.rs:42",
+                "dos",
+            ),
+            // Uncertain, judged new.
+            candidate(
+                "d",
+                "Missing length check before copy",
+                "src/net.rs:42",
+                "memory",
+            ),
+        ];
+        let kept = drop_reported(&ctx, candidates, &existing).await.unwrap();
+        let ids: Vec<&str> = kept.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["b", "d"]);
     }
 
     #[test]
@@ -213,19 +314,6 @@ mod tests {
             classify(&s, &[tokenize(&report_signature(&existing))]),
             Band::Duplicate
         );
-    }
-
-    #[test]
-    fn signature_uses_identity_fields_only() {
-        let f = Finding {
-            title: "Bug".into(),
-            attack_class: "dos".into(),
-            description: "long prose that should not dominate the signature".into(),
-            ..crate::domain::fixtures::finding("F-1")
-        };
-        let s = finding_signature(&f);
-        assert!(s.contains("Bug") && s.contains("a.rs:1") && s.contains("dos"));
-        assert!(!s.contains("prose"));
     }
 
     #[test]

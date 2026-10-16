@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::salvage::run_parsed;
+use super::similarity::{jaccard, report_signature, tokenize};
 use super::wishlist::{self, RawWish};
 use super::{StageCtx, prompt};
 use crate::artifacts::{Artifacts, names};
@@ -24,8 +25,17 @@ use crate::config::Stage;
 use crate::domain::{Finding, GapMarker, Severity, Task, default_confidence};
 use crate::json_block;
 use crate::provider::{Effort, ResumeSession, is_usage_limited};
+use crate::store::{ExistingReport, build_sink};
 
 const PROMPT: &str = include_str!("../../prompts/hunt.md");
+
+/// Filed reports each hunter sees. On lnd, the report a re-found bug
+/// duplicated ranked in the top 30 for 67 of 80, for ~1k prompt tokens.
+const FILED_SHOWN: usize = 30;
+
+const FILED_INTRO: &str = "Already filed, so do not report these again or a variant with the \
+     same root cause and fix. A different defect in the same code is still new; spend your \
+     effort there:";
 
 /// What a forked hunter gets instead of recon's report, which is already in
 /// its session. Recon's pass is shallow, so it is steered back at the code.
@@ -76,7 +86,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .read_line(names::RUN_ID)
         .context("the run has no id")?;
     let recon_session = recon_session(ctx);
-    let prompt = HuntPrompt::new(ctx, recon_session.is_some());
+    let prompt = HuntPrompt::new(ctx, recon_session.is_some(), filed_reports(ctx));
 
     let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
@@ -204,6 +214,69 @@ fn recon_session(ctx: &StageCtx) -> Option<String> {
     Some(session)
 }
 
+/// Reports the sink already holds, so hunters skip known bugs instead of
+/// re-finding them for skip-reported to prune. Hunting goes on without them
+/// when the sink cannot list.
+fn filed_reports(ctx: &StageCtx) -> Vec<FiledReport> {
+    match build_sink(&ctx.config.report).and_then(|sink| sink.existing_reports()) {
+        Ok(existing) => existing.iter().map(FiledReport::new).collect(),
+        Err(e) => {
+            warn!(
+                error = format!("{e:#}"),
+                "cannot list filed reports; hunters will not see them"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// A filed report as a hunter sees it, with the tokens it is ranked by.
+struct FiledReport {
+    line: String,
+    tokens: HashSet<String>,
+}
+
+impl FiledReport {
+    fn new(e: &ExistingReport) -> Self {
+        let line = if e.location.is_empty() {
+            format!("- {}", e.title)
+        } else {
+            format!("- {} (`{}`)", e.title, e.location)
+        };
+        Self {
+            line,
+            tokens: tokenize(&report_signature(e)),
+        }
+    }
+}
+
+/// The filed reports closest to `task`, most similar first; empty when none
+/// overlap it.
+fn filed_block(task: &Task, filed: &[FiledReport]) -> String {
+    let task_tokens = tokenize(&format!(
+        "{} {} {} {}",
+        task.attack_class,
+        task.hypothesis,
+        scope_line(task),
+        task.targets.join(" ")
+    ));
+    let mut ranked: Vec<(f64, &str)> = filed
+        .iter()
+        .map(|r| (jaccard(&task_tokens, &r.tokens), r.line.as_str()))
+        .filter(|&(score, _)| score > 0.0)
+        .collect();
+    if ranked.is_empty() {
+        return String::new();
+    }
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let lines: Vec<&str> = ranked
+        .into_iter()
+        .take(FILED_SHOWN)
+        .map(|(_, line)| line)
+        .collect();
+    format!("{FILED_INTRO}\n{}\n\n", lines.join("\n"))
+}
+
 /// The run-wide parts of a hunter prompt.
 struct HuntPrompt {
     target_dir: String,
@@ -212,10 +285,11 @@ struct HuntPrompt {
     poc: PocText,
     use_skills: bool,
     suffix: String,
+    filed: Vec<FiledReport>,
 }
 
 impl HuntPrompt {
-    fn new(ctx: &StageCtx, forked: bool) -> Self {
+    fn new(ctx: &StageCtx, forked: bool, filed: Vec<FiledReport>) -> Self {
         let architecture = if forked {
             FORKED_CONTEXT.to_string()
         } else {
@@ -229,6 +303,7 @@ impl HuntPrompt {
             poc: PocText::new(ctx.config.run.require_poc),
             use_skills: ctx.config.run.use_skills,
             suffix: prompt::reference_note(&ctx.config) + prompt::skills_directive(&ctx.config),
+            filed,
         }
     }
 
@@ -247,6 +322,8 @@ impl HuntPrompt {
             // After poc_intro, which may embed it.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &self.architecture)
+            // Last, so no placeholder in a filed title is ever substituted.
+            .replace("{filed}", &filed_block(task, &self.filed))
             + &self.suffix
     }
 }
@@ -519,6 +596,72 @@ mod tests {
         assert_eq!(scope_line(&t), "src/a.rs");
         t.scope_paths = vec!["lnwallet/".into(), "htlcswitch/".into()];
         assert_eq!(scope_line(&t), "lnwallet/, htlcswitch/");
+    }
+
+    fn filed(title: &str, location: &str) -> FiledReport {
+        FiledReport::new(&ExistingReport {
+            id: String::new(),
+            title: title.into(),
+            location: location.into(),
+            attack_class: String::new(),
+            text: String::new(),
+        })
+    }
+
+    #[test]
+    fn filed_block_ranks_the_closest_first_and_drops_unrelated() {
+        let t = Task {
+            attack_class: "htlc-dust-overflow".into(),
+            hypothesis: "dust sum overflows in lnwallet".into(),
+            ..fixtures::task("T-0001")
+        };
+        let block = filed_block(
+            &t,
+            &[
+                filed("Gossip timestamp skew", "discovery/gossiper.go:10"),
+                filed("Dust limit check", "lnwallet/channel.go:5"),
+                filed("HTLC dust overflow in lnwallet", "lnwallet/channel.go:9"),
+            ],
+        );
+        let closest = block.find("- HTLC dust overflow in lnwallet (`lnwallet/channel.go:9`)");
+        let next = block.find("- Dust limit check");
+        assert!(closest.unwrap() < next.unwrap(), "{block}");
+        assert!(!block.contains("Gossip"));
+        assert!(filed_block(&t, &[filed("Gossip timestamp skew", "")]).is_empty());
+    }
+
+    #[test]
+    fn filed_block_is_capped() {
+        let t = Task {
+            hypothesis: "dust".into(),
+            ..fixtures::task("T-0001")
+        };
+        let many: Vec<FiledReport> = (0..FILED_SHOWN + 5)
+            .map(|i| filed(&format!("dust bug {i}"), ""))
+            .collect();
+        let block = filed_block(&t, &many);
+        assert_eq!(
+            block.lines().filter(|l| l.starts_with("- ")).count(),
+            FILED_SHOWN
+        );
+    }
+
+    #[test]
+    fn render_fills_the_filed_placeholder_with_or_without_reports() {
+        let mut p = HuntPrompt {
+            target_dir: "/t".into(),
+            architecture: String::new(),
+            poc: PocText::new(false),
+            use_skills: false,
+            suffix: String::new(),
+            filed: Vec::new(),
+        };
+        let t = task("dust overflow", &[], &[]);
+        assert!(!p.render(&t, Path::new("/s")).contains("{filed}"));
+        p.filed = vec![filed("Dust overflow", "a.go:1")];
+        let rendered = p.render(&t, Path::new("/s"));
+        assert!(rendered.contains("- Dust overflow (`a.go:1`)"));
+        assert!(!rendered.contains("{filed}"));
     }
 
     #[test]
