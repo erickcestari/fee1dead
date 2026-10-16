@@ -63,8 +63,7 @@ pub struct AgentRequest {
     pub timeout: Duration,
     /// Fork this prior session, inheriting its context.
     pub resume: Option<ResumeSession>,
-    /// Extend the prompt cache TTL from 5m to 1h. Only worth its write premium
-    /// for a session others fork from after the 5m window.
+    /// 1h prompt-cache TTL instead of 5m, for a session forked after 5m.
     pub cache_1h: bool,
     pub effort: Effort,
     /// Overrides the provider's configured model.
@@ -108,13 +107,11 @@ pub struct ResumeSession {
     pub project_dir: PathBuf,
 }
 
-/// Cost and token usage are not here: they are in the final event of the
-/// stream log, so a run is profiled from the logs.
+/// Cost and usage live in the stream log's final event, not here.
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     /// The agent's final answer.
     pub stdout: String,
-    /// Lets a later run fork this conversation.
     pub session_id: Option<String>,
 }
 

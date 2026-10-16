@@ -1,11 +1,9 @@
 //! Validate stage: independent reviewers re-read the code and tag every
-//! candidate, in parallel batches grouped by file. Nothing is deleted: a
-//! real-but-unproven bug is `needs_review`, not dropped. Having traced each
-//! bug, the reviewer also writes its impact and recommendation for the report,
-//! and wishes for what the sandbox lacked to settle one.
+//! candidate, writing its impact and recommendation. Nothing is dropped: an
+//! unproven bug is `needs_review`.
 //!
-//! Batches bound a reviewer's load: one agent over a whole run outlasts its
-//! timeout. Incremental, so `--resume` reviews only failed batches' findings.
+//! Batches by file keep each reviewer within its timeout. Incremental, so
+//! `--resume` reviews only what failed batches left.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -142,7 +140,6 @@ fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
         + prompt::skills_directive(cfg);
     Ok(AgentRequest {
         working_dir: cfg.run.target_dir.clone(),
-        // Re-tracing a specific claim is careful but bounded, not discovery.
         ..ctx.agent_request(Stage::Validate, &batch[0].id, prompt, Effort::High)?
     })
 }

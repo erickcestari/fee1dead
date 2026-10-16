@@ -1,10 +1,6 @@
-//! One GitHub issue per finding, via the REST API. The PAT comes from an env
-//! var so it never lands in config or logs.
-//!
-//! Re-runnable: each body carries a hidden marker keyed by the finding id, and
-//! before the first write the sink lists its labeled issues once and skips
-//! findings already filed. Listing beats a per-finding search, which allows
-//! only 30 requests a minute and indexes with lag.
+//! One GitHub issue per finding. Re-runnable: each body hides a marker with
+//! the finding id, and the first write lists the labeled issues once to skip
+//! those already filed (search is rate limited to 30/min and lags).
 
 use std::collections::HashSet;
 
@@ -257,7 +253,6 @@ mod tests {
         let body = p["body"].as_str().unwrap();
         assert!(body.contains("## Impact"));
         assert!(body.contains("attacker crashes the node"));
-        // The idempotency marker must be present and id-keyed.
         assert!(body.contains(&marker("F-1")));
     }
 
@@ -299,13 +294,11 @@ mod tests {
 
     #[test]
     fn marker_id_round_trips_from_body() {
-        // The id stamped into a body must be recoverable for dedup.
         let body = issue_payload("F-42", &finding())["body"]
             .as_str()
             .unwrap()
             .to_string();
         assert_eq!(marker_id(&body).as_deref(), Some("F-42"));
-        // A body without a marker yields nothing.
         assert_eq!(marker_id("just some issue text"), None);
     }
 
@@ -386,8 +379,7 @@ mod tests {
             sink.write(&record(id)).unwrap();
         }
         assert_eq!(sink.count().unwrap(), 2);
-        // One listing, no per-finding search (rate limited to 30/min), and
-        // only the unfiled ids are created, once each.
+        // One listing, then only the unfiled ids are created, once each.
         assert_eq!(
             *seen.lock().unwrap(),
             [

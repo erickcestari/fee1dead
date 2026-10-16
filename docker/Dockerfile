@@ -1,23 +1,14 @@
-# fee1dead vulnerability discovery harness.
-#
-# Two stages:
-#   1. builder  — compiles the Rust orchestrator.
-#   2. runtime  — Node + Claude Code CLI + Go + Python/uv toolchains + the Trail
-#                 of Bits skills + the orchestrator binary, plus firewall
-#                 tooling. The agent runs
-#                 unrestricted INSIDE the container; the only real restriction
-#                 is default-deny egress enforced by docker/init-firewall.sh.
+# fee1dead image. The agent runs unrestricted inside; the only real
+# restriction is the default-deny egress firewall (docker/init-firewall.sh).
 
 # ---- builder ----------------------------------------------------------------
 FROM rust:1-bookworm AS builder
 WORKDIR /src
-# Cache deps first.
+# Build deps against a dummy crate so they cache across source changes.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && cargo build --release || true
-# Real sources. `touch` after COPY so cargo doesn't mistake the freshly copied
-# files (which may carry older mtimes) for the cached dummy build and skip
-# recompiling the crate.
+# Copied files may be older than the dummy build; touch them so cargo rebuilds.
 COPY src ./src
 COPY prompts ./prompts
 COPY schema ./schema
@@ -27,7 +18,6 @@ RUN find src -name '*.rs' -exec touch {} + && \
 # ---- runtime ----------------------------------------------------------------
 FROM node:22-bookworm-slim AS runtime
 
-# System packages: firewall tooling + minimal build/PoC toolchain + utils.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq gosu \
       iptables ipset iproute2 dnsutils \
@@ -36,32 +26,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
 
-# uv (fast Python package manager); several Trail of Bits skills invoke `uv run`.
+# Several Trail of Bits skills invoke `uv run`.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-# Claude Code CLI (the default provider). Pinned for reproducible builds;
-# override with --build-arg CLAUDE_CODE_VERSION=... if needed.
 ARG CLAUDE_CODE_VERSION=2.1.280
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
-# opencode CLI (the alternative provider: [providers.opencode] / type = "opencode").
-# Unused unless provider.default selects it; pinned like the CLI above.
 ARG OPENCODE_VERSION=1.18.11
 RUN npm install -g opencode-ai@${OPENCODE_VERSION}
 
-# rtk (https://github.com/rtk-ai/rtk): a CLI proxy that filters/compresses common
-# dev-command output (git, cargo, test runners, ...) to cut agent token usage.
-# The binary is installed system-wide here; `rtk init -g` wires it into the
-# agent's Claude Code config below (after the agent user exists).
+# rtk compresses dev-command output to cut agent tokens; wired in below.
 ARG RTK_VERSION=v0.43.0
 RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \
       | env RTK_INSTALL_DIR=/usr/local/bin RTK_VERSION=${RTK_VERSION} sh
 
-# Go toolchain, so hunters can compile and run PoCs against Go targets (e.g. lnd).
-# Keep this AHEAD of the `go` directive of every target you hunt: when the target
-# needs a newer toolchain than this one, `go` would otherwise try to fetch it
-# from the module proxy on first use — a ~70MB download that every hunter pays
-# for, through the egress firewall, mid-run.
+# Keep GO_VERSION at or above every target's `go` directive.
 ARG GO_VERSION=1.26.5
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
@@ -71,11 +50,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     esac && \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz" -o /tmp/go.tgz && \
     tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
-# GOTOOLCHAIN=local pins `go` to the toolchain above instead of silently
-# downloading the one named in the target's go.mod. A target that needs newer
-# then fails loudly, once, in `[target].prepare` — rather than leaving every
-# hunter to rediscover it as an unexplained network error. Raise GO_VERSION when
-# that happens.
+# GOTOOLCHAIN=local: a target needing a newer Go fails loudly instead of
+# every hunter downloading a toolchain through the firewall.
 ENV PATH="/usr/local/go/bin:/home/agent/go/bin:${PATH}" \
     GOPATH="/home/agent/go" \
     GOMODCACHE="/home/agent/go/pkg/mod" \
@@ -83,9 +59,8 @@ ENV PATH="/usr/local/go/bin:/home/agent/go/bin:${PATH}" \
     GOTOOLCHAIN="local" \
     GOFLAGS="-mod=mod"
 
-# Non-root user the agent runs as. Built with the host's uid/gid (passed by the
-# justfile) so files written to the mounted /work/out are owned by you on the
-# host. `-o` allows reusing an id already taken by the base image's `node` user.
+# The host's uid/gid, so files in the mounted /work/out are yours. `-o`: the
+# base image's `node` user may already hold the id.
 ARG HOST_UID=1000
 ARG HOST_GID=1000
 RUN groupadd -o -g ${HOST_GID} agent && \
@@ -93,22 +68,9 @@ RUN groupadd -o -g ${HOST_GID} agent && \
     mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build && \
     chown -R agent:agent /home/agent
 
-# The Trail of Bits skills (vendored in the repo as a plugin marketplace:
-# skills/plugins/<plugin>/skills/<skill>/SKILL.md). A bare symlink to
-# ~/.claude/plugins does NOT register anything, so `claude` never exposes the
-# skills and agents fall back to grepping the filesystem for SKILL.md. Instead,
-# register each skill as a personal skill (~/.claude/skills/<skill>), the
-# location `claude` auto-discovers, so they're invokable by name (fp-check,
-# spec-to-code-compliance, …). One plugin may ship several skills.
-#
-# Register ONLY the skills the pipeline actually routes to: validate names
-# fp-check, and the recon hunt allow-list (prompts/recon.md) names the rest.
-# Recon itself uses none: every read it makes is re-billed to each forked
-# hunter. Every registered skill adds its name+description to each agent's
-# system preamble, so keeping this list tight cuts per-spawn tokens and stops
-# recon suggesting skills that don't apply.
-# The full vendored suite stays in /opt/skills for reference; widen the list here
-# when you widen the recon allow-list.
+# Register the pipeline's skills as personal skills so `claude` exposes them by
+# name. Only these: each one adds to every agent's system prompt. Keep the list
+# in sync with the allow-list in prompts/recon.md (plus fp-check for validate).
 COPY skills /opt/skills
 RUN mkdir -p /home/agent/.claude/skills && \
     for skill in \
@@ -127,25 +89,19 @@ RUN mkdir -p /home/agent/.claude/skills && \
     done && \
     chown -R agent:agent /home/agent/.claude
 
-# Register rtk with Claude Code for the agent: installs the PreToolUse auto-rewrite
-# hook + RTK.md into /home/agent/.claude so Bash commands are transparently proxied
-# through rtk. Run as `agent` (with HOME set) so the config lands in the right home.
+# Installs rtk's Bash rewrite hook into the agent's Claude Code config.
 RUN gosu agent env HOME=/home/agent rtk init -g --auto-patch && \
     chown -R agent:agent /home/agent/.claude
 
-# Orchestrator binary, prompts/schema (embedded in the binary but kept for ref),
-# default config, and entry scripts.
 COPY --from=builder /usr/local/bin/fee1dead /usr/local/bin/fee1dead
 COPY config /opt/fee1dead/config
 COPY docker/init-firewall.sh /usr/local/bin/init-firewall.sh
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh /usr/local/bin/entrypoint.sh
 
-# Work tree: mount target repo at /work/target; outputs land in /work/out.
 RUN mkdir -p /work/target /work/scratch /work/out && chown -R agent:agent /work
 WORKDIR /work
 
-# Entry point runs the firewall as root, then drops to `agent` to run the
-# harness. Requires `--cap-add=NET_ADMIN` at `docker run`.
+# Needs `--cap-add=NET_ADMIN` for the firewall.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["run", "--config", "/opt/fee1dead/config/harness.toml"]

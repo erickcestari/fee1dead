@@ -1,122 +1,68 @@
-# fee1dead harness — per-run configuration.
-# Paths are container paths; mount your target repo at run.target_dir.
+# fee1dead per-run config. Paths are container paths.
 
 [run]
 target_dir   = "/work/target"
 scratch_root = "/work/scratch"
 out_dir      = "/work/out"
-# Max agents running at once: hunters, and validate's review batches.
-concurrency  =10
-# Per-agent wall-clock timeout.
+# Max agents running at once (hunters, review batches).
+concurrency  = 10
 agent_timeout_secs = 1800
-# Delay between launching consecutive hunters, in milliseconds. Each forked
-# hunter replays recon's (large) session as its first request; releasing the
-# whole concurrency batch at once fires that burst simultaneously and the API
-# rejects it with server-side rate limiting. Staggering spreads the first
-# requests out. Set to 0 to disable.
+# Delay between hunter launches. Forked hunters all replay recon's session as
+# their first request; a simultaneous burst gets rate limited. 0 disables.
 hunter_stagger_ms = 750
-# Fork each hunter from the recon agent's session so it inherits recon's
-# codebase context instead of re-injecting the architecture doc into every
-# hunter prompt. Supported by the claude-code and opencode providers. Forks share
-# recon's history as a cached prefix (cache-read rates) when hunters start
-# within the cache window. Set false to opt out.
-#
-# Now that recon orients shallow, the shared prefix is mostly
-# the threat model + orient output rather than deep file reads, so forking's edge
-# over cold hunters (which read only their per-task targets) is an empirical call.
-# A/B both on your target: each agent's stream log records its cost/usage, so
-# compare total cost vs confirmed findings from the logs dir.
+# Fork hunters from recon's session (a cached prefix) instead of handing each
+# one recon.json. Whether it pays off is target-dependent: compare cost vs
+# confirmed findings in out_dir/logs.
 fork_hunters = true
-# Whether hunters write, compile, and run proof-of-concept code to confirm
-# findings. This is the most token-hungry part of hunting, so it is off by
-# default: hunters substantiate by close reading instead (cheaper, but weaker
-# confirmation). Set true to have hunters produce runnable PoCs at higher cost.
+# Hunters compile and run PoCs. Off by default: it is the most token-hungry
+# part of hunting.
 require_poc = false
-# Whether agents may use the vendored Trail of Bits skills. On by default. Set
-# false to tell every stage to ignore the skills and rely on its own analysis
-# (recon then emits no suggested_skills) — useful to isolate the skills' effect
-# on token cost and bug yield, or for a target the skills don't fit.
+# Let agents use the vendored Trail of Bits skills.
 use_skills = true
 
-# Optional: clone the target into run.target_dir at startup instead of mounting
-# it. The git host MUST be in [firewall].allow (the clone runs after the
-# firewall comes up). Omit this section to use a mounted target_dir.
+# Clone the target instead of mounting it. The git host must be in
+# [firewall].allow. Omit to use a mounted target_dir.
 # [target]
 # repo = "https://github.com/org/name.git"
-# ref  = "main"        # branch, tag, or commit SHA; defaults to the default branch
-# Shell commands run once in target_dir after checkout, before any stage. Use
-# them to warm the toolchain's package cache while the run still has the network:
-# agents cannot read dependency source or build a PoC out of an empty cache, and
-# paying for it here costs one download instead of one per agent. A failure warns
-# and the run continues. Any registry these reach must be in [firewall].allow.
-# prepare = ["go mod download"]        # Go     (also: "go build ./..." to warm GOCACHE)
-# prepare = ["cargo fetch"]            # Rust
-# prepare = ["npm ci --ignore-scripts"] # Node
-# A bash script (`-euxo pipefail`) the container runs as root in target_dir
-# BEFORE the firewall comes up, so it has open egress and needs no allow-list
-# entries: install toolchains, fetch dependencies, build the target. A failing
-# line stops the run. HOME is the agent's, and whatever it creates under /work
-# and /home/agent is handed to the agent afterwards; install binaries onto the
-# default PATH (e.g. /usr/local/bin). A mounted target is read-only, so build
-# out of tree. Runs on every container start, before `run` only.
+# ref  = "main"
+# Run in target_dir before any stage, behind the firewall. A failure warns.
+# prepare = ["go mod download"]
+# Bash script run as root before the firewall, with open egress. A failing
+# line stops the run. See README "Set up the target's environment".
 # setup = '''
 # apt-get update && apt-get install -y --no-install-recommends protobuf-compiler
 # go mod download
 # go build ./...
 # '''
 
-# Optional: clone a reference repository — a spec or known-good implementation —
-# and expose it to the recon, hunt, and validate agents as ground truth (it is
-# added to their readable dirs and pointed to in their prompts). Useful for
-# spec-to-code compliance, e.g. the BOLT specs for a Lightning implementation.
-# The git host MUST be in [firewall].allow. Omit this section to disable.
+# A spec or known-good implementation the agents treat as ground truth. The
+# git host must be in [firewall].allow.
 # [reference]
 # repo = "https://github.com/lightning/bolts.git"
-# ref  = "master"          # branch, tag, or commit SHA; defaults to the default branch
-# dir  = "/work/reference" # where to clone it (a path the agents can read)
+# ref  = "master"
+# dir  = "/work/reference"
 
 [provider]
-# Which [providers.*] block below to use. Switch CLI by changing this one line:
-# "claude-code" or "opencode" (both built-in adapters). Any other CLI is added
-# via type = "exec" (zero code).
+# A [providers.*] block below.
 default = "claude-code"
 
 [providers.claude-code]
 type       = "claude-code"
 model      = "claude-opus-5"
-# The container is the security boundary, so the agent runs unrestricted.
 extra_args = ["--dangerously-skip-permissions"]
-# Optional: stop starting agents once the account's weekly usage reaches this
-# percentage, so a run cannot eat the whole weekly limit. Agents already running
-# finish (their tokens are spent), so leave headroom. Subscription auth only:
-# API-key auth reports no weekly usage, so the cap never trips.
+# Stop starting agents at this weekly usage %. Subscription auth only.
 # max_weekly_usage_pct = 80
 
-# The opencode CLI (https://opencode.ai). Set provider.default = "opencode" to
-# use it. Auth like opencode itself does (e.g. ANTHROPIC_API_KEY / OPENAI_API_KEY
-# in the environment, or a mounted ~/.local/share/opencode/auth.json), and add
-# models.dev plus your model provider's API host to [firewall].allow below.
 [providers.opencode]
 type    = "opencode"
-# opencode's provider/model form — a bare model id is rejected at config load.
-# `opencode models` lists what your auth can reach.
+# provider/model form; `opencode models` lists them.
 model   = "anthropic/claude-opus-5"
-# Optional: a configured opencode agent (`--agent`) to run as.
-# agent = "build"
-# Optional: provider-specific reasoning effort (`--variant`), e.g. high | max |
-# minimal. Left unset, opencode uses the model's default.
+# agent   = "build"
 # variant = "high"
-# Auto-approve tool permissions (`--auto`). On by default: the container is the
-# security boundary, and the agent must be able to write its answer file.
 auto    = true
-# Any extra flags to pass through verbatim.
 extra_args = []
-# Ignored by this adapter (opencode has no equivalent): per-tool allow/deny
-# lists. run.fork_hunters IS
-# supported (opencode sessions fork).
 
-# Example: add any other CLI with no Rust changes. {prompt} and {working_dir}
-# are substituted per task.
+# Any other CLI, no Rust needed.
 # [providers.codex]
 # type    = "exec"
 # command = "codex"
@@ -124,64 +70,40 @@ extra_args = []
 # output  = "json"
 
 [firewall]
-# Default-deny egress; only these hosts are reachable (see docker/init-firewall.sh).
-# Add the package registries your target's PoC toolchain needs.
+# Default-deny egress; only these hosts are reachable.
 allow = [
   "api.anthropic.com",
   "registry.npmjs.org",
-  # Required by the opencode provider: the models.dev catalogue (opencode fails
-  # to resolve any model without it), its own endpoints, and the npm registry it
-  # pulls provider SDK packages from. Also add your model provider's API host
-  # (api.anthropic.com above, api.moonshot.ai for moonshotai/*, ...).
-  # "models.dev",
-  # "opencode.ai",
   "static.crates.io",
   "index.crates.io",
-  # Add your git host here when using [target].repo, e.g.:
+  # opencode also needs:
+  # "models.dev",
+  # "opencode.ai",
+  # [target].repo / [reference] / github sink:
   # "github.com",
   # "codeload.github.com",
+  # "api.github.com",
 ]
 
 [report]
 sink = "sqlite"            # sqlite | jsonl | http | github
 path = "/work/out/findings.db"
-# For the http sink instead:
 # sink      = "http"
 # url       = "https://ingest.example.com/findings"
-# token_env = "INGEST_TOKEN"   # bearer token read from this env var
-# To open one GitHub issue per finding instead:
+# token_env = "INGEST_TOKEN"
 # sink      = "github"
-# repo      = "owner/name"     # issues are filed here
-# token_env = "GITHUB_PAT"     # PAT env var (issues:write); defaults to GITHUB_PAT
-# The github sink needs api.github.com in [firewall].allow.
-# Before filing, new findings are deduped against issues already filed: a
-# token-overlap score decides the clear cases, and only ambiguous pairs go to a
-# lightweight judge model (the skip-reported model under [stages.models]).
+# repo      = "owner/name"
+# token_env = "GITHUB_PAT"
 
-# Cross-run feedback memory (see [stages] "feedback").
 [feedback]
-# Cap on seeds carried between runs, so the memory stays bounded.
 max_seeds = 200
 
 [stages]
-# Stages run in the listed order; a stage name may repeat. To exploit gapfill,
-# run hunt again after it, as below.
-# skip-reported drops candidates already reported in the sink (e.g. filed as
-# GitHub issues) BEFORE validate, so no validation tokens are spent re-reviewing
-# findings a past run already surfaced. It is a no-op unless report.sink tracks
-# external state (the github sink), so it is safe to leave in the list.
-# feedback distils this run into feedback-seeds.jsonl, which the next run's
-# recon reads as leads. Keep the same out_dir to retain that memory across runs.
-# aggregate runs last so findings.json carries every verdict; it needs no agent,
-# so it completes even after a failed stage.
+# Run in order; a stage may repeat (hunt again after gapfill).
 enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "validate", "report", "feedback", "aggregate"]
 
-# Optional per-stage model, in the provider's own id form; unset stages use the
-# provider's `model`. Keys: recon, hunt, validate, skip-reported. Forked hunters
-# reuse recon's prompt cache only on the same model (caches are per model), so
-# keep hunt and recon on one model unless a measurement says otherwise. The
-# skip-reported judge answers yes/no over two short texts; on claude-code it
-# defaults to claude-haiku-4-5.
+# Per-stage model; unset stages use the provider's model. Keep hunt and recon
+# on one model so forks reuse recon's cache.
 # [stages.models]
 # validate      = "claude-opus-5"
 # skip-reported = "claude-haiku-4-5"

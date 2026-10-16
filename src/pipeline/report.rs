@@ -1,9 +1,6 @@
-//! Report stage: build a schema-checked record for every reportable finding
-//! and persist it through the configured sink. No agent call: the reviewer
-//! already wrote each finding's impact and recommendation.
-//!
-//! Every verdict but `likely_false_positive` is reported, each record carrying
-//! its verdict so a `needs_review` one never passes for a confirmed bug.
+//! Report stage: persist a schema-checked record for every finding but
+//! `likely_false_positive` through the sink. Each carries its verdict, so a
+//! `needs_review` one never passes for confirmed. No agent call.
 
 use std::collections::HashMap;
 

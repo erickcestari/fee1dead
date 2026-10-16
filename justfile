@@ -1,21 +1,16 @@
 # fee1dead task runner. Run `just` to list recipes.
 
-# Load secrets from .env (e.g. ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)
-# into the recipe environment; the docker `-e` flags then forward them in.
-# Optional: recipes still run if .env is absent.
+# Optional .env with ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN.
 set dotenv-load := true
 
-# Container image tag.
 image := "fee1dead"
-# Host path of the repository to hunt against (mounted read-only at /work/target).
+# Mounted read-only at /work/target.
 target := justfile_directory() / "target-repo"
-# Host path for findings + artifacts (mounted at /work/out).
+# Mounted at /work/out.
 out := justfile_directory() / "out"
-# Harness config (mounted read-only so edits need no rebuild).
+# Mounted, so edits need no rebuild.
 config := justfile_directory() / "config" / "harness.toml"
-# Auth forwarded into the container. `-e VAR` (no value) forwards the host value
-# only if set, so set EITHER for API-key auth or CLAUDE_CODE_OAUTH_TOKEN for
-# Pro/Max OAuth (from `claude setup-token`).
+# `-e VAR` forwards only what is set.
 auth := "-e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN"
 
 # List available recipes.
@@ -38,21 +33,17 @@ check:
 
 # --- docker ------------------------------------------------------------------
 
-# Mounts for the opencode provider: credentials + sessions, and the model
-# catalogue / provider SDKs it downloads. Harmless (empty) with claude-code.
+# opencode's credentials and cache; empty with claude-code.
 opencode_mounts := '-v "$HOME/.local/share/opencode":/home/agent/.local/share/opencode -v "$HOME/.cache/opencode":/home/agent/.cache/opencode'
 
-# Build the harness image. Bakes in the host uid/gid so files written to the
-# mounted out/ are owned by you, not by an in-container user.
+# Build the image with the host uid/gid, so out/ stays yours.
 image:
     docker build -t {{image}} \
       --build-arg HOST_UID="$(id -u)" \
       --build-arg HOST_GID="$(id -g)" \
       -f docker/Dockerfile .
 
-# Run the full pipeline in the container against `target`.
-# Usage: just run                       (uses ./target-repo)
-#        just run target=/path/to/repo
+# Run the pipeline against `target` (default ./target-repo).
 run: image
     @test -d "{{target}}" || (echo "target repo not found: {{target}}  (set with 'just run target=/path')" && exit 1)
     @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
@@ -76,9 +67,7 @@ run-clone: image
       {{opencode_mounts}} \
       {{image}}
 
-# Continue the last run in `out` after a usage limit or crash: skips recon and
-# hunts the tasks not yet processed. Mounts `target` when it exists (else the
-# config's [target].repo is cloned again).
+# Continue the last run in `out`, skipping recon. Mounts `target` if present.
 resume: image
     @mkdir -p "{{out}}" "$HOME/.local/share/opencode" "$HOME/.cache/opencode"
     docker run --rm \

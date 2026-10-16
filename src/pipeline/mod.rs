@@ -27,14 +27,10 @@ use crate::config::{Config, Stage};
 use crate::provider::{AgentRequest, AgentRunner, Effort, RetryOnRateLimit, build_runner};
 use crate::scratch::ScratchRoot;
 
-/// Tools removed from every stage agent:
-/// - `Task*`/`Workflow`: the harness owns parallelism; sub-agents only add cost.
-/// - `AskUserQuestion`: agents run unattended, so a question stalls to timeout.
-/// - the rest are irrelevant to reading code. Each schema sits in the cached
-///   prefix re-read every turn, so dropping them cuts cost across the run.
-///
-/// A deny-list because only `--disallowedTools` removes a tool from context;
-/// add any new irrelevant CLI tool here.
+/// Tools removed from every stage agent: the harness owns parallelism, agents
+/// run unattended, and the rest don't help read code. Every schema is re-read
+/// each turn, so each one dropped cuts cost. A deny-list because only
+/// `--disallowedTools` removes a tool from context.
 const DISABLED_TOOLS: &[&str] = &[
     "Task",
     "TaskCreate",
@@ -70,9 +66,7 @@ pub struct StageCtx {
 }
 
 impl StageCtx {
-    /// A request for one stage agent, running cold in its own scratch dir.
-    /// Scratch dir and transcript are both named `<stage>-<key>`, so no two
-    /// agents share either.
+    /// A cold run in the agent's own `<stage>-<key>` scratch dir and transcript.
     fn agent_request(
         &self,
         stage: Stage,

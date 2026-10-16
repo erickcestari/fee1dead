@@ -1,6 +1,5 @@
-//! opencode adapter: `opencode run --format json`. opencode has no tool deny
-//! list, and its effort knob (`--variant`) is provider-specific, so it comes
-//! from config rather than [`super::Effort`].
+//! opencode adapter: `opencode run --format json`. No tool deny-list, and its
+//! effort (`--variant`) is provider-specific, so it comes from config.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;

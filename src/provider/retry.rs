@@ -1,6 +1,5 @@
-//! Retry on transient throttling. The CLIs already retry a 429 briefly, so one
-//! that reaches the harness outlasted those: back off for longer. A quota is
-//! passed straight through, since retrying it before it resets only bounces.
+//! Retry on transient throttling. A 429 that reaches the harness outlasted the
+//! CLI's own retries, so back off for longer. A quota is passed through.
 
 use std::sync::Arc;
 use std::time::Duration;

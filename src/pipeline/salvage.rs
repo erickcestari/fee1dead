@@ -1,10 +1,8 @@
-//! One repair turn for an agent whose answer was unusable. An agent that
-//! traced a bug for 30 minutes, then wrote malformed JSON or ran out of time,
-//! still has its analysis in its session; forking it with a narrow instruction
+//! One repair turn for an agent whose answer was malformed or timed out. Its
+//! analysis is still in its session, so a fork with a narrow instruction
 //! recovers the answer for a fraction of a rerun.
 //!
-//! The repair keeps the request's model and effort: caches are per model, and
-//! changing effort mid-conversation would re-bill the session at full price.
+//! The repair keeps model and effort: changing either re-bills the session.
 
 use std::time::Duration;
 

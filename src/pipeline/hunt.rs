@@ -80,8 +80,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
     let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
-    // Set by the first hunter to hit a usage limit: every later one would
-    // bounce off it, so spawning stops. Unspawned tasks stay unhunted for `--resume`.
+    // Set on the first usage limit: later hunters would only bounce, so
+    // spawning stops and `--resume` picks up the rest.
     let limited = Arc::new(AtomicBool::new(false));
     let total = tasks.len();
     let mut running = JoinSet::new();
@@ -110,12 +110,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 }
             }
         };
-        // Open-ended multi-hop tracing, and not fork-amplified: xhigh earns its keep.
         let mut req = ctx.agent_request(Stage::Hunt, &task.id, String::new(), Effort::Xhigh)?;
         let scratch_dir = req.working_dir.clone();
         req.prompt = prompt.render(&task, &scratch_dir);
-        // A forked hunter runs in recon's dir and writes PoCs to its scratch
-        // dir by absolute path.
         req.resume = recon_session.clone().map(|session_id| ResumeSession {
             session_id,
             project_dir: ctx.config.run.target_dir.clone(),
@@ -186,8 +183,7 @@ fn pending_tasks(artifacts: &Artifacts) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
-/// Spawn order is value order, since concurrency and a usage limit can cut
-/// the tail: recon's priority first, then origin. Stable on queue order.
+/// Most valuable first, since a usage limit can cut the tail. Stable.
 fn spawn_order(tasks: &mut [Task]) {
     tasks.sort_by_key(|t| (t.priority.hunt_rank(), t.origin.hunt_rank()));
 }

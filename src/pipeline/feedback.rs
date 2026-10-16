@@ -1,10 +1,6 @@
-//! Feedback stage: distil this run into durable seed tasks for the next run
-//! against the same target:
-//!   - bugs review judged real -> hunt their *variants* nearby;
-//!   - unresolved gaps         -> cover the area a hunter skipped.
-//!
-//! The next run's recon reads the seeds as leads and consumes the file. The
-//! list is deduped and capped at `feedback.max_seeds`, newest first.
+//! Feedback stage: distil this run into seed tasks for the next one: variant
+//! hunts around real bugs, and the gaps hunters left. The next recon reads
+//! them as leads. Deduped and capped at `feedback.max_seeds`, newest first.
 
 use std::collections::{HashMap, HashSet};
 

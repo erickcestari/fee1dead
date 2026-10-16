@@ -31,8 +31,7 @@ enum Command {
     Check,
     /// Print the firewall allow-list, one host per line, for init-firewall.sh.
     FirewallHosts,
-    /// Acquire the target and run its `[target].setup` script; the container
-    /// entrypoint runs this as root before the firewall comes up.
+    /// Acquire the target and run `[target].setup` (as root, before the firewall).
     Setup,
     /// Compile a finished or partial run into findings.json, with no agent.
     Aggregate {

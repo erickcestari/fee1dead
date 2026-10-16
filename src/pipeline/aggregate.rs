@@ -1,8 +1,6 @@
-//! Aggregate stage: join the hunters' raw output, each finding's task lead
-//! and review, the gaps, the collapsed duplicates, and the wishlist into one
-//! reviewable `findings.json`. Pure file IO with no agent call, so it completes even
-//! when a run spent its whole budget hunting; `fee1dead aggregate` runs it
-//! standalone on a partial run.
+//! Aggregate stage: join findings, their task leads and reviews, gaps,
+//! duplicates, and wishes into one reviewable `findings.json`. No agent call,
+//! so it completes even after a run spent its budget.
 
 use std::collections::HashMap;
 
@@ -167,7 +165,6 @@ struct TaskContext {
     tags: Vec<String>,
 }
 
-/// The run's artifacts, as read from `out_dir`.
 #[derive(Default)]
 struct Inputs {
     candidates: Vec<Finding>,

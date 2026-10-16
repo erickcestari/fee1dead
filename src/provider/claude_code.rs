@@ -14,12 +14,8 @@ use super::stream::{StreamObserver, run_streaming};
 use super::{AgentRequest, AgentResult, AgentRunner, ProviderError};
 use crate::config::ClaudeCodeConfig;
 
-/// Applied to every run. Each keeps the cached system-prompt prefix stable
-/// across targets and runs:
-/// - CLAUDE_MDS: a `CLAUDE.md` in the untrusted target would be loaded into
-///   context (a prompt-injection channel) and vary the prefix per target.
-/// - GIT_INSTRUCTIONS: the agents never commit to the target.
-/// - AUTO_MEMORY: the harness has its own cross-run memory.
+/// Keep the cached system-prompt prefix stable across targets. A target's
+/// `CLAUDE.md` is also a prompt-injection channel.
 const BASE_ENV: &[(&str, &str)] = &[
     ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
     ("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS", "1"),
@@ -61,8 +57,7 @@ fn build_invocation(
         "--verbose".to_string(),
         "--add-dir".to_string(),
         req.working_dir.to_string_lossy().into_owned(),
-        // Forks run in other dirs than recon; moving the per-machine sections
-        // (cwd, env, git status) out of the system prompt lets them share its cache.
+        // Forks run in other dirs than recon; this lets them share its cache.
         "--exclude-dynamic-system-prompt-sections".to_string(),
     ];
     let mut add_dir = |dir: &PathBuf| {

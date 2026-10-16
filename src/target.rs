@@ -1,8 +1,7 @@
-//! Acquire the target (and the optional reference) before any stage runs:
-//! clone or update it when a repo is configured, else expect it mounted.
-//! The pipeline does this behind the egress firewall, so every git host,
-//! submodules' included, must be in `[firewall].allow`, even when
-//! `[target].setup` already cloned it with open egress.
+//! Acquire the target and optional reference before any stage: clone or
+//! update a configured repo, else expect it mounted. The pipeline fetches
+//! behind the firewall, so every git host (submodules too) must be allowed,
+//! even when `[target].setup` already cloned it.
 
 use std::path::Path;
 use std::process::Command;
@@ -22,8 +21,7 @@ pub fn ensure_target(cfg: &Config) -> Result<()> {
 }
 
 /// Run `[target].setup` in the acquired target. The container calls it as
-/// root before the firewall comes up, so the script has open egress; a no-op
-/// without a script, so the target is then cloned behind the firewall as before.
+/// root before the firewall comes up, so the script has open egress.
 pub fn run_setup(cfg: &Config) -> Result<()> {
     let Some(script) = &cfg.target.setup else {
         info!("no [target].setup script");

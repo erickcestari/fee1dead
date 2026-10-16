@@ -9,8 +9,7 @@ pub enum ProviderError {
     /// Transient backend throttling (429 / overloaded); retried after a backoff.
     #[error("rate limited: {0}")]
     RateLimited(String),
-    /// The agent was killed at its timeout. `session_id`, when the stream got
-    /// that far, lets a stage resume it to salvage the work done so far.
+    /// Killed at its timeout. `session_id` lets a stage resume it for salvage.
     #[error("agent timed out")]
     TimedOut { session_id: Option<String> },
 }

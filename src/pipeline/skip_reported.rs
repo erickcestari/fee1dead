@@ -1,11 +1,9 @@
-//! skip-reported stage: drop candidates the sink already holds (e.g. filed as
-//! GitHub issues) *before* validate, so no review tokens go to findings a past
-//! run surfaced. Sinks that upsert by id report nothing, so it is a no-op there.
+//! skip-reported stage: drop candidates the sink already holds before
+//! validate spends tokens on them. A no-op for sinks that upsert by id.
 //!
-//! A token-overlap score between signatures decides the confident cases; only
-//! the ambiguous middle band goes to a cheap model judge. The judge fails open
-//! (keep the finding): a stray duplicate issue is cheaper to close than a real
-//! finding swallowed before it was ever validated.
+//! Token overlap decides the clear cases; only the ambiguous band goes to a
+//! cheap judge, which fails open: a duplicate issue is cheaper to close than
+//! a real finding lost.
 
 use std::collections::HashSet;
 

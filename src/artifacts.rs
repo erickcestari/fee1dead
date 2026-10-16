@@ -32,8 +32,7 @@ pub mod names {
     pub const SEEDS: &str = "feedback-seeds.jsonl";
     /// Recon's session id, for hunters to fork. One line of text.
     pub const RECON_SESSION: &str = "recon-session.txt";
-    /// Prefixed to every finding id, since task ids repeat every run and would
-    /// collide in a sink that outlives a run. One line of text.
+    /// Prefixed to finding ids, which would otherwise repeat across runs.
     pub const RUN_ID: &str = "run-id.txt";
     /// Per-agent event-stream transcripts.
     pub const LOGS: &str = "logs";

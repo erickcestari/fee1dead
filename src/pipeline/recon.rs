@@ -1,10 +1,8 @@
-//! Recon stage: one agent builds the threat model every hunter forks from.
-//! Its whole answer is a JSON threat model, persisted verbatim as
-//! `recon.json`; the harness only parses `hunt_tasks` out of it, into the queue.
+//! Recon stage: one agent writes the threat model (`recon.json`) every hunter
+//! forks from; its `hunt_tasks` become the queue.
 //!
-//! Feedback seeds from past runs enter as leads, not tasks: a seed is only a
-//! hypothesis and the code may have changed, so it passes recon's admission
-//! bar like anything recon derives. Recon then consumes the seed file.
+//! Feedback seeds enter as leads, not tasks: the code may have changed, so
+//! each must pass recon's admission bar. Recon then consumes the seed file.
 
 use std::path::Path;
 
@@ -22,8 +20,7 @@ use crate::provider::{AgentRequest, Effort};
 
 const PROMPT: &str = include_str!("../../prompts/recon.md");
 
-/// LOC boundaries of the prompt's size tiers, pre-computed so the caps are
-/// deterministic and the agent spends no turns measuring.
+/// Size tiers, computed here so the agent spends no turns measuring.
 const MEDIUM_LOC: u64 = 10_000;
 const LARGE_LOC: u64 = 100_000;
 
@@ -113,7 +110,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         "recon assembled hunt queue"
     );
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
-    // Every lead was judged against the code; the ones that passed are queued.
     ctx.artifacts.write_jsonl::<Task>(names::SEEDS, &[])?;
     Ok(())
 }
