@@ -52,7 +52,7 @@ use_skills = true
 # prepare = ["go mod download"]        # Go     (also: "go build ./..." to warm GOCACHE)
 # prepare = ["cargo fetch"]            # Rust
 # prepare = ["npm ci --ignore-scripts"] # Node
-# A bash script (`-euo pipefail`) the container runs as root in target_dir
+# A bash script (`-euxo pipefail`) the container runs as root in target_dir
 # BEFORE the firewall comes up, so it has open egress and needs no allow-list
 # entries: install toolchains, fetch dependencies, build the target. A failing
 # line stops the run. HOME is the agent's, and whatever it creates under /work

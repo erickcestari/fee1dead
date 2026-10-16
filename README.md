@@ -219,7 +219,7 @@ harness expects `target_dir` to already contain the code (the mounted case).
 firewall comes up, with open egress, to make the image fit the target: install
 toolchains, fetch dependencies, build the code. The target is checked out first
 (cloned, for `[target].repo`), and the script runs in `target_dir` under
-`bash -euo pipefail`, so a failing line stops the run before any tokens are
+`bash -euxo pipefail`, so each command is echoed and a failing line stops the run before any tokens are
 spent.
 
 ```toml

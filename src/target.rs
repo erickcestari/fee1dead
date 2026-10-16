@@ -32,12 +32,15 @@ pub fn run_setup(cfg: &Config) -> Result<()> {
     acquire_target(cfg)?;
     ensure_reference(cfg)?;
     info!("running [target].setup");
+    let started = std::time::Instant::now();
+    // xtrace: builds are silent for minutes, so show which command is running.
     let status = Command::new("bash")
-        .args(["-euo", "pipefail", "-c", script])
+        .args(["-euxo", "pipefail", "-c", script])
         .current_dir(&cfg.run.target_dir)
         .status()
         .context("starting bash for [target].setup")?;
     ensure!(status.success(), "[target].setup failed ({status})");
+    info!(secs = started.elapsed().as_secs(), "[target].setup done");
     Ok(())
 }
 
