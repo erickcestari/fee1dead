@@ -56,7 +56,6 @@ impl HuntTask {
             suggested_skills: self.suggested_skills,
             priority: self.priority,
             origin: TaskOrigin::Recon,
-            ..Task::default()
         }
     }
 }

@@ -252,7 +252,6 @@ impl From<&Validation> for ReviewContext {
 struct TaskContext {
     hypothesis: String,
     targets: Vec<String>,
-    tags: Vec<String>,
 }
 
 #[derive(Default)]
@@ -292,7 +291,6 @@ fn aggregate(inputs: Inputs) -> Report {
             task: tasks_by_id.get(f.task_id.as_str()).map(|t| TaskContext {
                 hypothesis: t.hypothesis.clone(),
                 targets: t.targets.clone(),
-                tags: t.tags.clone(),
             }),
             review: reviews.get(f.id.as_str()).map(|v| ReviewContext::from(*v)),
             finding: f,
@@ -358,7 +356,6 @@ mod tests {
         Task {
             hypothesis: hypothesis.into(),
             targets: vec!["a.rs:1".into()],
-            tags: vec!["crypto".into()],
             ..fixtures::task(id)
         }
     }

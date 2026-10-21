@@ -24,9 +24,6 @@ pub struct Task {
     pub targets: Vec<String>,
     #[serde(default)]
     pub suggested_skills: Vec<String>,
-    /// Risk tags (e.g. "crypto", "funds"), so a run can be sliced by area.
-    #[serde(default)]
-    pub tags: Vec<String>,
     #[serde(default)]
     pub priority: Priority,
     #[serde(default)]
@@ -380,12 +377,13 @@ mod tests {
 
     #[test]
     fn older_artifacts_load_with_defaults() {
-        let t: Task =
-            serde_json::from_str("{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\"}")
-                .unwrap();
+        // `tags` is a dropped field, still present in older queues.
+        let t: Task = serde_json::from_str(
+            "{\"id\":\"T-1\",\"attack_class\":\"c\",\"scope_hint\":\"s\",\"tags\":[\"crypto\"]}",
+        )
+        .unwrap();
         assert_eq!(t.origin, TaskOrigin::Recon);
         assert_eq!(t.priority, Priority::Medium);
-        assert!(t.tags.is_empty());
         let f: Finding = serde_json::from_str(
             "{\"id\":\"F-1\",\"task_id\":\"T\",\"title\":\"t\",\"attack_class\":\"c\",\"severity\":\"low\",\"location\":\"a.rs:1\",\"description\":\"d\"}",
         )
