@@ -203,6 +203,10 @@ fn issue_payload(id: &str, finding: &Value) -> Value {
         }
     };
     section("Location", &format!("`{}`", get("location")));
+    // Its own section: the Location text is parsed back by `existing_report`.
+    if !get("commit").is_empty() {
+        section("Commit", &format!("`{}`", get("commit")));
+    }
     section("Attack class", get("attack_class"));
     section("Description", get("description"));
     section("Attack scenario", get("attack_scenario"));
@@ -240,6 +244,7 @@ mod tests {
             "attack_class": "resource exhaustion",
             "severity": "high",
             "location": "src/net.rs:42",
+            "commit": "abc123",
             "description": "length is added without a bounds check",
             "attack_scenario": "1. Mallory sends a frame with a huge length.",
             "impact": "attacker crashes the node",
@@ -256,6 +261,7 @@ mod tests {
         assert!(body.contains("## Impact"));
         assert!(body.contains("attacker crashes the node"));
         assert!(body.contains("## Attack scenario\n\n1. Mallory sends"));
+        assert!(body.contains("## Commit\n\n`abc123`"));
         assert!(body.contains(&marker("F-1")));
     }
 

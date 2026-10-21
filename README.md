@@ -36,6 +36,9 @@ times out, gets one repair turn in its own session.
 - `fee1dead aggregate --out-dir ./out` compiles `findings.json` from a partial
   run without any agent.
 - Finding ids are `<run id>-<task id>-F<nn>`, unique across runs.
+- `run-meta.json` records the target and reference commits, the fee1dead
+  commit, and each stage's model and effort. Reports and issues carry the
+  target commit, since `file:line` is ambiguous without it.
 
 Each agent's raw event stream is teed live to `out_dir/logs/<stage>-<label>.jsonl`,
 so it survives a timeout, and its answer lands beside it as

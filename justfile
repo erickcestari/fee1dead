@@ -36,11 +36,13 @@ check:
 # opencode's credentials and cache; empty with claude-code.
 opencode_mounts := '-v "$HOME/.local/share/opencode":/home/agent/.local/share/opencode -v "$HOME/.cache/opencode":/home/agent/.cache/opencode'
 
-# Build the image with the host uid/gid, so out/ stays yours.
+# Build the image with the host uid/gid, so out/ stays yours. The dirty check
+# covers the same inputs as build.rs.
 image:
     docker build -t {{image}} \
       --build-arg HOST_UID="$(id -u)" \
       --build-arg HOST_GID="$(id -g)" \
+      --build-arg FEE1DEAD_SHA="$(git rev-parse HEAD)$(git diff --quiet HEAD -- src prompts schema Cargo.toml Cargo.lock || echo -dirty)" \
       -f docker/Dockerfile .
 
 # Run the pipeline against `target` (default ./target-repo).

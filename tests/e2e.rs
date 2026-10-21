@@ -190,6 +190,20 @@ async fn full_pipeline_reports_one_finding() {
     );
     let run_id = std::fs::read_to_string(out.join("run-id.txt")).unwrap();
     assert_eq!(payloads[0]["id"], format!("{}-T-0001-F01", run_id.trim()));
+
+    let meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("run-meta.json")).unwrap()).unwrap();
+    assert_eq!(meta["run_id"], run_id.trim());
+    let stages: Vec<&str> = meta["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["stage"].as_str().unwrap())
+        .collect();
+    assert_eq!(stages, ["recon", "hunt", "validate"]);
+    // The mock target is no git checkout, so there is no commit to pin.
+    assert!(meta["target"]["commit"].is_null());
+    assert!(payloads[0].get("commit").is_none());
 }
 
 /// Run 1 writes seeds; run 2's recon sees them as leads and consumes them.
@@ -519,5 +533,9 @@ async fn wishes_reach_the_wishlist_and_the_report() {
     let report: Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("findings.json")).unwrap()).unwrap();
     assert_eq!(report["summary"]["wishes"], 2);
+    assert!(
+        report["run"]["run_id"].is_string(),
+        "findings.json carries the run meta"
+    );
     assert_eq!(report["wishes"][0]["kind"], "toolchain");
 }

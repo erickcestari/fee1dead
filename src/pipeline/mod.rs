@@ -10,6 +10,7 @@ mod loc;
 mod prompt;
 mod recon;
 mod report;
+mod run_meta;
 mod salvage;
 mod similarity;
 mod skip_reported;
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::artifacts::{Artifacts, names};
 use crate::config::{Config, Stage};
@@ -154,6 +155,14 @@ impl Pipeline {
         }
         if !ctx.artifacts.exists(names::RUN_ID) {
             ctx.artifacts.write_text(names::RUN_ID, &new_run_id())?;
+        }
+        // Bookkeeping: a failure to record the run must not stop it.
+        if let Err(e) = run_meta::record(ctx, resume) {
+            warn!(
+                error = format!("{e:#}"),
+                "could not write {}",
+                names::RUN_META
+            );
         }
 
         let names: Vec<&str> = stages.iter().map(|s| s.name()).collect();

@@ -1,6 +1,7 @@
 //! Report stage: persist a schema-checked record for every finding but
 //! `likely_false_positive` through the sink. Each carries its verdict, so a
-//! `needs_review` one never passes for confirmed. No agent call.
+//! `needs_review` one never passes for confirmed, and the target commit its
+//! `location` refers to. No agent call.
 
 use std::collections::HashMap;
 
@@ -9,7 +10,7 @@ use jsonschema::JSONSchema;
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-use super::StageCtx;
+use super::{StageCtx, run_meta};
 use crate::artifacts::names;
 use crate::config::ReportConfig;
 use crate::domain::{Finding, Validation};
@@ -25,7 +26,17 @@ const RECOMMENDATION_NOT_ASSESSED: &str = "Not assessed by the reviewer.";
 pub fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
     let validations: Vec<Validation> = ctx.artifacts.read_jsonl(names::VALIDATED)?;
-    let records = report_records(&candidates, &validations);
+    let commit = run_meta::read(&ctx.artifacts)
+        .inspect_err(|e| {
+            warn!(
+                error = format!("{e:#}"),
+                "run meta unreadable; reporting without commits"
+            )
+        })
+        .ok()
+        .flatten()
+        .and_then(|meta| meta.target.commit);
+    let records = report_records(&candidates, &validations, commit.as_deref());
     let schema = compile_schema()?;
 
     let mut sink = build_sink(&ctx.config.report)?;
@@ -72,8 +83,13 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
 }
 
 /// One record per reportable finding, at its effective severity, with the
-/// reviewer's verdict, evidence, impact, and recommendation.
-fn report_records(candidates: &[Finding], validations: &[Validation]) -> Vec<ReportRecord> {
+/// reviewer's verdict, evidence, impact, and recommendation, and the target
+/// `commit` when known.
+fn report_records(
+    candidates: &[Finding],
+    validations: &[Validation],
+    commit: Option<&str>,
+) -> Vec<ReportRecord> {
     let by_id: HashMap<&str, &Finding> = candidates.iter().map(|f| (f.id.as_str(), f)).collect();
     validations
         .iter()
@@ -94,6 +110,9 @@ fn report_records(candidates: &[Finding], validations: &[Validation]) -> Vec<Rep
             });
             if !f.attack_scenario.is_empty() {
                 payload["attack_scenario"] = json!(f.attack_scenario);
+            }
+            if let Some(commit) = commit {
+                payload["commit"] = json!(commit);
             }
             if let Some(poc) = &f.poc_path {
                 payload["poc_path"] = json!(poc);
@@ -156,7 +175,7 @@ mod tests {
             validation("F-3", Verdict::LikelyFalsePositive),
             validation("F-4", Verdict::NeedsReview),
         ];
-        let records = report_records(&candidates, &validations);
+        let records = report_records(&candidates, &validations, Some("abc123"));
         let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["F-1", "F-2", "F-4"]);
         let p = |i: usize| &records[i].payload;
@@ -164,6 +183,7 @@ mod tests {
         assert_eq!(p(0)["impact"], "attacker crashes the node");
         assert_eq!(p(1)["severity"], "low");
         assert_eq!(p(2)["verdict"], "needs_review");
+        assert!(records.iter().all(|r| r.payload["commit"] == "abc123"));
         assert_eq!(p(2)["poc_path"], "pocs/F-4/poc.go");
         assert_eq!(p(2)["attack_scenario"], "1. Mallory sends a frame.");
         assert!(p(0).get("poc_path").is_none() && p(0).get("attack_scenario").is_none());
@@ -182,12 +202,13 @@ mod tests {
             recommendation: "  ".into(),
             ..validation("F-1", Verdict::NeedsReview)
         };
-        let records = report_records(&[finding("F-1")], &[skipped]);
+        let records = report_records(&[finding("F-1")], &[skipped], None);
         assert_eq!(records[0].payload["impact"], IMPACT_NOT_ASSESSED);
         assert_eq!(
             records[0].payload["recommendation"],
             RECOMMENDATION_NOT_ASSESSED
         );
+        assert!(records[0].payload.get("commit").is_none());
         assert!(schema_errors(&compile_schema().unwrap(), &records[0].payload).is_empty());
     }
 

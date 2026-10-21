@@ -9,9 +9,12 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && cargo build --release || true
 # Copied files may be older than the dummy build; touch them so cargo rebuilds.
+COPY build.rs ./
 COPY src ./src
 COPY prompts ./prompts
 COPY schema ./schema
+# The commit run-meta.json records; .git is not in the build context.
+ARG FEE1DEAD_SHA=unknown
 RUN find src -name '*.rs' -exec touch {} + && \
     cargo build --release && cp target/release/fee1dead /usr/local/bin/fee1dead
 

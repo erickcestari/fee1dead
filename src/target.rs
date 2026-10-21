@@ -125,10 +125,16 @@ fn clone_or_update(repo: &str, dir: &Path, git_ref: Option<&str>, label: &str) -
             "--recursive",
         ])?;
     }
-    if let Ok(head) = git(&["-C", dir_str, "rev-parse", "HEAD"]) {
-        info!(label, head = head.trim(), "checked out");
+    if let Some(head) = head_commit(dir) {
+        info!(label, head, "checked out");
     }
     Ok(())
+}
+
+/// The commit checked out in `dir`; `None` when it is not a git checkout.
+pub fn head_commit(dir: &Path) -> Option<String> {
+    let head = git(&["-C", dir.to_str()?, "rev-parse", "HEAD"]).ok()?;
+    Some(head.trim().to_string())
 }
 
 fn is_empty_dir(dir: &Path) -> Result<bool> {
@@ -242,10 +248,7 @@ enabled = ["recon"]
     }
 
     fn head(repo: &Path) -> String {
-        git(&["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string()
+        head_commit(repo).unwrap()
     }
 
     #[test]
@@ -269,6 +272,13 @@ enabled = ["recon"]
             std::fs::read_to_string(clone.join("a.txt")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn a_repo_without_commits_has_no_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(&["init", "-q", tmp.path().to_str().unwrap()]).unwrap();
+        assert_eq!(head_commit(tmp.path()), None);
     }
 
     #[test]

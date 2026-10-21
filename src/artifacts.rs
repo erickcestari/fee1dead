@@ -34,6 +34,8 @@ pub mod names {
     pub const RECON_SESSION: &str = "recon-session.txt";
     /// Prefixed to finding ids, which would otherwise repeat across runs.
     pub const RUN_ID: &str = "run-id.txt";
+    /// The commits audited and the harness, models, and efforts used.
+    pub const RUN_META: &str = "run-meta.json";
     /// Per-agent event-stream transcripts.
     pub const LOGS: &str = "logs";
     /// PoCs copied out of the hunters' scratch dirs, which die with the container.
@@ -53,6 +55,7 @@ pub mod names {
         HUNTED,
         RECON_SESSION,
         RUN_ID,
+        RUN_META,
     ];
     pub(super) const PER_RUN_DIRS: &[&str] = &[LOGS, POCS];
 }

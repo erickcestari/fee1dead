@@ -60,6 +60,7 @@ jobs:
           docker build -t fee1dead:local \
             --build-arg HOST_UID="$(id -u)" \
             --build-arg HOST_GID="$(id -g)" \
+            --build-arg FEE1DEAD_SHA="${{ steps.sha.outputs.sha }}" \
             -f docker/Dockerfile .
           docker save fee1dead:local -o /tmp/fee1dead-image.tar
 

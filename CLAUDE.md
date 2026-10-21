@@ -62,7 +62,7 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - `src/artifacts.rs` — JSON/JSONL stage IO. **Stages communicate ONLY through
   artifacts** in `out_dir` (`queue.jsonl`, `candidates.jsonl`, `gaps.jsonl`,
   `duplicates.jsonl`, `wishlist.jsonl`, `validated.jsonl`, `findings.json`,
-  `hunted.jsonl`, `recon.json`, `run-id.txt`, plus the `logs/` and `pocs/`
+  `hunted.jsonl`, `recon.json`, `run-id.txt`, `run-meta.json`, plus the `logs/` and `pocs/`
   dirs), never by calling each other. Keep it that way: it is what makes stages
   decoupled and runs resumable. `aggregate.rs` joins the hunters' raw output
   into the single reviewable `findings.json` with no agent call, and is also

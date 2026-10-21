@@ -1,14 +1,16 @@
 //! Aggregate stage: join findings, their task leads and reviews, gaps,
-//! duplicates, and wishes into one reviewable `findings.json`. No agent call,
-//! so it completes even after a run spent its budget.
+//! duplicates, and wishes into one reviewable `findings.json`, with what the
+//! run audited. No agent call, so it completes even after a run spent its
+//! budget.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::Serialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::StageCtx;
+use super::run_meta::{self, RunMeta};
 use crate::artifacts::{Artifacts, names};
 use crate::domain::{Duplicate, Finding, GapMarker, Severity, Task, Validation, Verdict, Wish};
 
@@ -25,6 +27,10 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
         duplicates: artifacts.read_jsonl(names::DUPLICATES)?,
         validations: artifacts.read_jsonl(names::VALIDATED)?,
         wishes: artifacts.read_jsonl(names::WISHLIST)?,
+        run: run_meta::read(artifacts)
+            .inspect_err(|e| warn!(error = format!("{e:#}"), "run meta unreadable; omitted"))
+            .ok()
+            .flatten(),
     });
     let json = serde_json::to_string_pretty(&report)?;
     artifacts.write_text(names::REPORT_JSON, &json)?;
@@ -41,6 +47,9 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
 
 #[derive(Debug, Serialize)]
 struct Report {
+    /// Absent for a run that predates `run-meta.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<RunMeta>,
     summary: Summary,
     findings: Vec<EnrichedFinding>,
     gaps: Vec<GapMarker>,
@@ -173,6 +182,7 @@ struct Inputs {
     duplicates: Vec<Duplicate>,
     validations: Vec<Validation>,
     wishes: Vec<Wish>,
+    run: Option<RunMeta>,
 }
 
 /// Ordered for triage: likely false positives last, then by effective
@@ -185,6 +195,7 @@ fn aggregate(inputs: Inputs) -> Report {
         duplicates,
         validations,
         mut wishes,
+        run,
     } = inputs;
     let tasks_by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let reviews: HashMap<&str, &Validation> = validations
@@ -228,6 +239,7 @@ fn aggregate(inputs: Inputs) -> Report {
     wishes.sort_by_key(|w| w.kind);
 
     Report {
+        run,
         summary: Summary {
             findings: findings.len(),
             gaps: gaps.len(),

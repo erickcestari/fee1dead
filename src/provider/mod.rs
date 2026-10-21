@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ProviderConfig;
 
@@ -29,7 +30,8 @@ pub use opencode::OpenCodeRunner;
 pub use retry::RetryOnRateLimit;
 
 /// Reasoning effort for one run. Providers without an effort knob ignore it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Effort {
     Low,
     Medium,
