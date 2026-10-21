@@ -88,6 +88,10 @@ pub struct Finding {
     /// `path/to/file.rs:120`.
     pub location: String,
     pub description: String,
+    /// How an attacker runs the exploit: the actors, the steps, and what the
+    /// attack needs and risks. Empty when the hunter gave none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attack_scenario: String,
     /// The hunter's confidence in [0,1]. A hard-to-reach bug gets a low score
     /// rather than being dropped, so review decides what to surface.
     #[serde(default = "default_confidence")]
@@ -268,6 +272,7 @@ pub(crate) mod fixtures {
             severity: Severity::High,
             location: "a.rs:1".into(),
             description: "d".into(),
+            attack_scenario: String::new(),
             confidence: default_confidence(),
             poc_path: None,
         }
@@ -360,7 +365,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(f.confidence, 0.5);
-        assert!(!serde_json::to_string(&f).unwrap().contains("poc_path"));
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(!json.contains("poc_path") && !json.contains("attack_scenario"));
     }
 
     #[test]

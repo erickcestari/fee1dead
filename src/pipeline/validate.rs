@@ -190,6 +190,7 @@ fn review_input(batch: &[Finding]) -> String {
                 "severity": f.severity,
                 "location": f.location,
                 "description": f.description,
+                "attack_scenario": f.attack_scenario,
             })
         })
         .collect();

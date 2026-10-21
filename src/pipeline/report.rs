@@ -92,6 +92,9 @@ fn report_records(candidates: &[Finding], validations: &[Validation]) -> Vec<Rep
                 "recommendation": or_not_assessed(&v.recommendation, RECOMMENDATION_NOT_ASSESSED),
                 "evidence": v.evidence,
             });
+            if !f.attack_scenario.is_empty() {
+                payload["attack_scenario"] = json!(f.attack_scenario);
+            }
             if let Some(poc) = &f.poc_path {
                 payload["poc_path"] = json!(poc);
             }
@@ -139,6 +142,7 @@ mod tests {
             finding("F-2"),
             finding("F-3"),
             Finding {
+                attack_scenario: "1. Mallory sends a frame.".into(),
                 poc_path: Some("pocs/F-4/poc.go".into()),
                 ..finding("F-4")
             },
@@ -161,7 +165,8 @@ mod tests {
         assert_eq!(p(1)["severity"], "low");
         assert_eq!(p(2)["verdict"], "needs_review");
         assert_eq!(p(2)["poc_path"], "pocs/F-4/poc.go");
-        assert!(p(0).get("poc_path").is_none());
+        assert_eq!(p(2)["attack_scenario"], "1. Mallory sends a frame.");
+        assert!(p(0).get("poc_path").is_none() && p(0).get("attack_scenario").is_none());
         let schema = compile_schema().unwrap();
         assert!(
             records

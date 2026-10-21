@@ -61,6 +61,8 @@ struct RawFinding {
     severity: Severity,
     location: String,
     description: String,
+    #[serde(default)]
+    attack_scenario: String,
     #[serde(default = "default_confidence")]
     confidence: f64,
     #[serde(default)]
@@ -453,6 +455,7 @@ fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally
             severity: rf.severity,
             location: rf.location,
             description: rf.description,
+            attack_scenario: rf.attack_scenario,
             confidence: rf.confidence,
             poc_path,
         };

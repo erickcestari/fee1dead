@@ -205,6 +205,7 @@ fn issue_payload(id: &str, finding: &Value) -> Value {
     section("Location", &format!("`{}`", get("location")));
     section("Attack class", get("attack_class"));
     section("Description", get("description"));
+    section("Attack scenario", get("attack_scenario"));
     section("Impact", get("impact"));
     section("Recommendation", get("recommendation"));
     section("Evidence", get("evidence"));
@@ -240,6 +241,7 @@ mod tests {
             "severity": "high",
             "location": "src/net.rs:42",
             "description": "length is added without a bounds check",
+            "attack_scenario": "1. Mallory sends a frame with a huge length.",
             "impact": "attacker crashes the node",
             "recommendation": "validate length before alloc",
             "evidence": "trace confirms attacker control"
@@ -253,6 +255,7 @@ mod tests {
         let body = p["body"].as_str().unwrap();
         assert!(body.contains("## Impact"));
         assert!(body.contains("attacker crashes the node"));
+        assert!(body.contains("## Attack scenario\n\n1. Mallory sends"));
         assert!(body.contains(&marker("F-1")));
     }
 

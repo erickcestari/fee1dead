@@ -1,5 +1,5 @@
 <style>
-No preamble, no restating the task. Your final answer is only the JSON object specified under Output. Write its human-read string fields (`title`, `description`) as clear, complete sentences from which a reviewer who never saw the code can follow the data flow, not keyword fragments, arrow chains, or symbol shorthand. Everywhere else, spend the fewest tokens that stay correct.
+No preamble, no restating the task. Your final answer is only the JSON object specified under Output. Write its human-read string fields (`title`, `description`, `attack_scenario`) as clear, complete sentences from which a reviewer who never saw the code can follow the data flow, not keyword fragments, arrow chains, or symbol shorthand. Everywhere else, spend the fewest tokens that stay correct.
 </style>
 
 <role>
@@ -101,6 +101,7 @@ and no prose around it. Shape:
       "confidence": 0.0,
       "location": "path/to/file.ext:LINE",
       "description": "the bug, the data flow from source to sink, the reachability, and the impact, marking any step assumed rather than read",
+      "attack_scenario": "the exploit as the attacker runs it: actors, numbered steps, then what it needs and risks",
       "poc_path": "relative/path/in/scratch"
     }
   ],
@@ -112,6 +113,16 @@ and no prose around it. Shape:
   ]
 }
 ```
+
+`attack_scenario` is how an attacker exploits the bug, written so a maintainer
+can replay the attack without the code open. Name the actors and their roles
+(e.g. Mallory the attacker, Alice the victim, Bob an honest peer), then give
+numbered steps from setup to the attacker's gain, each saying what the attacker
+does and how the target responds. Close with a short paragraph on what the
+attack needs (access, defaults, and conditions that must hold, e.g. a channel to
+the victim and a fee spike), what it costs or risks the attacker, and close
+variants (the attacker playing several roles, an honest party triggering it by
+accident).
 
 `poc_path` is optional. `confidence` is in [0,1]: how sure you are the bug is
 real and reachable (latent or guarded means low). Each gap becomes a follow-up

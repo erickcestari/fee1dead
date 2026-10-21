@@ -47,7 +47,8 @@ fn replies() -> Vec<CannedReply> {
   "findings": [
     {"title": "unchecked add overflows length", "severity": "high", "confidence": 0.8,
      "location": "src/parse.rs:42",
-     "description": "attacker-controlled length added without bounds check"}
+     "description": "attacker-controlled length added without bounds check",
+     "attack_scenario": "1. Mallory sends a frame whose length wraps."}
   ],
   "gaps": [{"area": "src/parse.rs error path", "reason": "did not test truncated input"}]
 }
@@ -180,6 +181,10 @@ async fn full_pipeline_reports_one_finding() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0]["impact"], "heap buffer overflow leading to RCE");
     assert_eq!(payloads[0]["verdict"], "confirmed");
+    assert_eq!(
+        payloads[0]["attack_scenario"],
+        "1. Mallory sends a frame whose length wraps."
+    );
     let run_id = std::fs::read_to_string(out.join("run-id.txt")).unwrap();
     assert_eq!(payloads[0]["id"], format!("{}-T-0001-F01", run_id.trim()));
 }
