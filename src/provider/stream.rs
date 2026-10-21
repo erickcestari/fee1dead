@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::warn;
 
+use super::process::AgentProcess;
 use super::{AgentRequest, ProviderError};
 
 /// Folds an adapter's event stream into what it needs from the run.
@@ -30,6 +31,7 @@ pub(super) struct Exit {
 
 /// Spawn `cmd`, feed its stdout lines to `observer`, and wait for it to exit
 /// (or be killed by a `Break`). A timeout is a [`ProviderError::TimedOut`].
+/// Either kill takes the agent's whole process group with it.
 pub(super) async fn run_streaming(
     mut cmd: Command,
     req: &AgentRequest,
@@ -38,11 +40,10 @@ pub(super) async fn run_streaming(
     let program = cmd.as_std().get_program().to_string_lossy().into_owned();
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
+        .stderr(Stdio::piped());
+    let mut agent = AgentProcess::spawn(&mut cmd).with_context(|| format!("spawning {program}"))?;
+    let stdout = agent.child.stdout.take().expect("stdout is piped");
+    let mut stderr = agent.child.stderr.take().expect("stderr is piped");
     // Drained concurrently: a full stderr pipe would block the child.
     let stderr = tokio::spawn(async move {
         let mut buf = String::new();
@@ -74,7 +75,7 @@ pub(super) async fn run_streaming(
     };
     let stopped = match tokio::time::timeout(req.timeout, pump).await {
         Err(_) => {
-            let _ = child.start_kill();
+            agent.kill_group();
             stderr.abort();
             return Err(ProviderError::TimedOut {
                 session_id: observer.session_id().map(str::to_owned),
@@ -84,11 +85,12 @@ pub(super) async fn run_streaming(
         Ok(read) => read.with_context(|| format!("reading the {program} event stream"))?,
     };
     if stopped {
-        let _ = child.start_kill();
-        // The agent's own subprocesses may still hold stderr open.
+        agent.kill_group();
+        // A subprocess that left the group may still hold stderr open.
         stderr.abort();
     }
-    let status = child
+    let status = agent
+        .child
         .wait()
         .await
         .with_context(|| format!("waiting on {program}"))?;
@@ -198,6 +200,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lines.seen, ["stop"]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timeout_kills_what_the_agent_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = req(dir.path(), Duration::from_millis(300));
+        let mut lines = Lines::default();
+        run_streaming(sh("sleep 30 & echo $!; wait"), &req, &mut lines)
+            .await
+            .unwrap_err();
+        let pid = &lines.seen[0];
+        assert!(
+            super::super::process::exits(pid).await,
+            "the agent's sleep survived"
+        );
     }
 
     #[tokio::test]

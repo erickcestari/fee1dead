@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use tokio::process::Command;
 
+use super::process::AgentProcess;
 use super::{AgentRequest, AgentResult, AgentRunner, ProviderError};
 use crate::config::{ExecConfig, ExecOutput};
 
@@ -43,13 +44,15 @@ impl AgentRunner for ExecRunner {
             .current_dir(&req.working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
 
-        let output = tokio::time::timeout(req.timeout, cmd.output())
+        let mut agent = AgentProcess::spawn(&mut cmd)
+            .with_context(|| format!("spawning provider '{}' ({})", self.name, self.cfg.command))?;
+        // On timeout, dropping `agent` kills its process group.
+        let output = tokio::time::timeout(req.timeout, agent.output())
             .await
             .map_err(|_| ProviderError::TimedOut { session_id: None })?
-            .with_context(|| format!("spawning provider '{}' ({})", self.name, self.cfg.command))?;
+            .with_context(|| format!("running provider '{}'", self.name))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
         if self.cfg.output == ExecOutput::Json {
@@ -105,11 +108,20 @@ mod tests {
             Duration::from_millis(200),
             Effort::Low,
         );
-        let err = runner("sleep", &["30"]).run(req).await.unwrap_err();
+        let script = "sleep 30 & echo $! > {working_dir}/pid; wait";
+        let err = runner("sh", &["-c", script]).run(req).await.unwrap_err();
         assert!(matches!(
             err.downcast_ref(),
             Some(ProviderError::TimedOut { .. })
         ));
         assert_eq!(timed_out_session(&err), None);
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::fs::read_to_string(dir.path().join("pid")).unwrap();
+            assert!(
+                crate::provider::process::exits(pid.trim()).await,
+                "the agent's sleep survived"
+            );
+        }
     }
 }

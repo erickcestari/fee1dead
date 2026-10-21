@@ -27,6 +27,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
   adapters: each folds its CLI's events through a `StreamObserver`, while
   `stream.rs` owns the shared spawn/tee/timeout loop and `final_output.rs` the
   answer-file contract; `error.rs` classifies quota vs throttle vs timeout.
+  `process.rs` runs each agent in its own process group, so a kill also stops
+  the builds and fuzzers it started.
   **Add any other CLI via a `type = "exec"` config block, not Rust code**
   (`generic_exec.rs`, `{prompt}`/`{working_dir}` placeholders). `mock.rs` is
   feature-gated. Fields an adapter's CLI has no equivalent for (e.g. a tool

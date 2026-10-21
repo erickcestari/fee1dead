@@ -329,6 +329,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonschema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

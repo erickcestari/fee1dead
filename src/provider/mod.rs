@@ -8,6 +8,7 @@ mod generic_exec;
 #[cfg(any(test, feature = "mock-runner"))]
 mod mock;
 mod opencode;
+mod process;
 mod retry;
 mod stream;
 mod usage;

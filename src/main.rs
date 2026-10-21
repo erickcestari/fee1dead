@@ -56,10 +56,18 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run { resume } => {
             let pipeline = Pipeline::new(cfg)?;
-            if resume {
-                pipeline.resume().await
-            } else {
-                pipeline.run().await
+            let run = async {
+                if resume {
+                    pipeline.resume().await
+                } else {
+                    pipeline.run().await
+                }
+            };
+            // Agents run in their own process groups, beyond the terminal's
+            // Ctrl-C; dropping the run on it kills them.
+            tokio::select! {
+                result = run => result,
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("interrupted"),
             }
         }
         Command::Check => {
