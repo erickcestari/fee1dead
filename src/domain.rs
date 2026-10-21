@@ -211,6 +211,32 @@ impl GapMarker {
     }
 }
 
+impl Task {
+    /// Whether this task already hunts `gap`'s follow-up class over an
+    /// overlapping area. The class counts because a gap usually names a
+    /// *different* class in an area a hunter covered.
+    pub fn covers(&self, gap: &GapMarker) -> bool {
+        let area = gap.area.trim().to_lowercase();
+        self.attack_class.to_lowercase() == gap.follow_up_class().to_lowercase()
+            && self.scopes().any(|scope| overlaps(&scope, &area))
+    }
+
+    /// Non-empty scopes, lowercased: recon's path prefixes, else the hint.
+    fn scopes(&self) -> impl Iterator<Item = String> + '_ {
+        let hint = self.scope_paths.is_empty().then_some(&self.scope_hint);
+        self.scope_paths
+            .iter()
+            .chain(hint)
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// An empty area overlaps nothing, so it is never silently dropped.
+fn overlaps(scope: &str, area: &str) -> bool {
+    !area.is_empty() && (area.starts_with(scope) || scope.starts_with(area))
+}
+
 /// Something an agent needed but the sandbox lacks, recorded so the agent
 /// carries on instead of stalling. The agents' channel back to the operator,
 /// who grants wishes between runs.

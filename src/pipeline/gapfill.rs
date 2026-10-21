@@ -23,49 +23,19 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-/// One task per gap, unless a task already hunts the same class over an
-/// overlapping area. The class is part of the key because a gap usually names
-/// a *different* class in an area a hunter covered. Ids continue the queue's
-/// numbering with a `G-` prefix.
+/// One task per gap, unless a queued or newly planned task already covers it
+/// ([`Task::covers`]). Ids continue the queue's numbering with a `G-` prefix.
 fn plan_gapfill(queue: &[Task], gaps: Vec<GapMarker>) -> Vec<Task> {
-    let mut covered: Vec<(String, String)> = queue
-        .iter()
-        .flat_map(|t| {
-            let class = t.attack_class.to_lowercase();
-            scopes(t).map(move |scope| (class.clone(), scope))
-        })
-        .collect();
     let mut next = queue.len() + 1;
-    let mut new_tasks = Vec::new();
+    let mut new_tasks: Vec<Task> = Vec::new();
     for gap in gaps {
-        let class = gap.follow_up_class().to_lowercase();
-        let area = gap.area.trim().to_lowercase();
-        if covered
-            .iter()
-            .any(|(c, scope)| *c == class && overlaps(scope, &area))
-        {
+        if queue.iter().chain(&new_tasks).any(|t| t.covers(&gap)) {
             continue;
         }
         new_tasks.push(gap.to_task(format!("G-{next:04}"), TaskOrigin::Gapfill));
-        covered.push((class, area));
         next += 1;
     }
     new_tasks
-}
-
-/// A task's non-empty scopes, lowercased: recon's path prefixes, else the hint.
-fn scopes(task: &Task) -> impl Iterator<Item = String> + '_ {
-    let hint = task.scope_paths.is_empty().then_some(&task.scope_hint);
-    task.scope_paths
-        .iter()
-        .chain(hint)
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-}
-
-/// An empty area overlaps nothing, so it is never silently dropped.
-fn overlaps(scope: &str, area: &str) -> bool {
-    !area.is_empty() && (area.starts_with(scope) || scope.starts_with(area))
 }
 
 #[cfg(test)]
@@ -132,6 +102,12 @@ mod tests {
         let queue = vec![task("T-0001", "overflow", "")];
         let plan = plan_gapfill(&queue, vec![gap("src/x.rs", "overflow", "a")]);
         assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn a_gap_without_an_area_does_not_swallow_later_gaps_of_its_class() {
+        let plan = plan_gapfill(&[], vec![gap("", "dos", "a"), gap("src/x.rs", "dos", "b")]);
+        assert_eq!(plan.len(), 2);
     }
 
     #[test]

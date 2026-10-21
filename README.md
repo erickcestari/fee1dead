@@ -18,7 +18,7 @@ findings. The orchestrator never hunts bugs itself.
 | `skip-reported` | Drops candidates the sink already holds (filed GitHub issues) before validate spends tokens on them. Token overlap settles clear cases; cheap judges take the ambiguous ones concurrently (`run.concurrency`) and fail open. |
 | `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
 | `report` | Writes every finding but `likely_false_positive` to the sink, with its verdict. |
-| `feedback` | Turns real bugs (as variant hunts) and open gaps into `feedback-seeds.jsonl` for the next run's recon. |
+| `feedback` | Turns real bugs (as variant hunts) and gaps no follow-up hunt covered into `feedback-seeds.jsonl` for the next run's recon. |
 | `aggregate` | Compiles everything into one reviewable `findings.json`, most severe first and likely false positives last. |
 
 Stages run in the order of `stages.enabled` and talk only through files in
