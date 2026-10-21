@@ -22,7 +22,7 @@ use crate::artifacts::names;
 use crate::config::Stage;
 use crate::domain::{Finding, Severity, Validation, Verdict, Wish};
 use crate::json_block;
-use crate::provider::{AgentRequest, Effort};
+use crate::provider::AgentRequest;
 
 const PROMPT: &str = include_str!("../../prompts/validate.md");
 
@@ -140,7 +140,7 @@ fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
         + prompt::skills_directive(cfg);
     Ok(AgentRequest {
         working_dir: cfg.run.target_dir.clone(),
-        ..ctx.agent_request(Stage::Validate, &batch[0].id, prompt, Effort::High)?
+        ..ctx.agent_request(Stage::Validate, &batch[0].id, prompt)?
     })
 }
 

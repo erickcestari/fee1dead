@@ -33,7 +33,7 @@ schema-validated findings. See `README.md` for the user-facing overview.
   deny-list) are ignored, never emulated.
 - `src/pipeline/` — `mod.rs` sequences stages; one file per stage. Every stage
   agent's request starts from `StageCtx::agent_request` (deny-list, timeout,
-  stage model, reference dir, and a `<stage>-<key>` scratch dir and transcript).
+  stage model and effort, reference dir, and a `<stage>-<key>` scratch dir and transcript).
   `prompt.rs` holds the prompt fragments several stages append.
   `wishlist.rs` owns the wish hunters and reviewers emit for what the sandbox
   lacks (`wishlist.jsonl`), the agents' channel back to the operator.

@@ -16,17 +16,13 @@ use crate::artifacts::names;
 use crate::config::Stage;
 use crate::domain::{Priority, Task, TaskOrigin};
 use crate::json_block;
-use crate::provider::{AgentRequest, Effort};
+use crate::provider::AgentRequest;
 
 const PROMPT: &str = include_str!("../../prompts/recon.md");
 
 /// Size tiers, computed here so the agent spends no turns measuring.
 const MEDIUM_LOC: u64 = 10_000;
 const LARGE_LOC: u64 = 100_000;
-
-/// Hunters fork recon's session at this effort too: another effort misses the
-/// prompt cache and re-bills the whole session per hunter.
-pub(super) const EFFORT: Effort = Effort::Xhigh;
 
 /// The slice of the threat model the harness consumes; serde drops the rest.
 #[derive(Debug, Default, Deserialize)]
@@ -90,7 +86,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // Every hunter forks this session; its prefix must outlive the 5m TTL
         // until the last one launches.
         cache_1h: true,
-        ..ctx.agent_request(Stage::Recon, "recon", prompt, EFFORT)?
+        ..ctx.agent_request(Stage::Recon, "recon", prompt)?
     };
     let (json, report, session_id) = run_parsed(ctx.runner.as_ref(), req, |result| {
         let json =

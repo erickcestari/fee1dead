@@ -19,7 +19,7 @@ use crate::artifacts::names;
 use crate::config::Stage;
 use crate::domain::Finding;
 use crate::json_block;
-use crate::provider::{AgentRequest, AgentResult, Effort};
+use crate::provider::{AgentRequest, AgentResult};
 use crate::store::{ExistingReport, build_sink};
 
 /// At or above this overlap, a pair is a confident duplicate.
@@ -138,7 +138,7 @@ fn judge_request(
     Ok(AgentRequest {
         // It compares two texts; it reads no code.
         extra_dirs: Vec::new(),
-        ..ctx.agent_request(Stage::SkipReported, &finding.id, prompt, Effort::Low)?
+        ..ctx.agent_request(Stage::SkipReported, &finding.id, prompt)?
     })
 }
 

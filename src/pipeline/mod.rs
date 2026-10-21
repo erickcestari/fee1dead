@@ -65,15 +65,22 @@ pub struct StageCtx {
     pub runner: Arc<dyn AgentRunner>,
 }
 
+/// The reasoning effort a stage's agents run at; `None` for a stage without
+/// agents. Hunters fork recon's session at recon's effort: another effort
+/// misses the prompt cache and re-bills the whole session per hunter.
+fn stage_effort(stage: Stage) -> Option<Effort> {
+    match stage {
+        Stage::Recon | Stage::Hunt => Some(Effort::Xhigh),
+        Stage::Validate => Some(Effort::High),
+        Stage::SkipReported => Some(Effort::Low),
+        Stage::Gapfill | Stage::Dedupe | Stage::Report | Stage::Feedback | Stage::Aggregate => None,
+    }
+}
+
 impl StageCtx {
     /// A cold run in the agent's own `<stage>-<key>` scratch dir and transcript.
-    fn agent_request(
-        &self,
-        stage: Stage,
-        key: &str,
-        prompt: String,
-        effort: Effort,
-    ) -> Result<AgentRequest> {
+    fn agent_request(&self, stage: Stage, key: &str, prompt: String) -> Result<AgentRequest> {
+        let effort = stage_effort(stage).unwrap_or_else(|| panic!("{stage} runs no agent"));
         let label = format!("{stage}-{key}");
         let dir = self.scratch.for_agent(&label)?;
         Ok(AgentRequest {
@@ -198,5 +205,17 @@ async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<()> {
         Stage::Report => report::run(ctx),
         Stage::Feedback => feedback::run(ctx),
         Stage::Aggregate => aggregate::run(ctx),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exactly_the_agent_stages_have_an_effort() {
+        for stage in Stage::ALL {
+            assert_eq!(stage_effort(stage).is_some(), stage.runs_agent(), "{stage}");
+        }
     }
 }

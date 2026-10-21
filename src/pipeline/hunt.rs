@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::salvage::run_parsed;
 use super::similarity::{jaccard, report_signature, tokenize};
 use super::wishlist::{self, RawWish};
-use super::{StageCtx, prompt, recon};
+use super::{StageCtx, prompt};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
 use crate::domain::{Finding, GapMarker, Severity, Task, default_confidence};
@@ -122,7 +122,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                 }
             }
         };
-        let mut req = ctx.agent_request(Stage::Hunt, &task.id, String::new(), recon::EFFORT)?;
+        let mut req = ctx.agent_request(Stage::Hunt, &task.id, String::new())?;
         let scratch_dir = req.working_dir.clone();
         req.prompt = prompt.render(&task, &scratch_dir);
         req.resume = recon_session.clone().map(|session_id| ResumeSession {
