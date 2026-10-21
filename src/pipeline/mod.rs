@@ -78,6 +78,19 @@ fn stage_effort(stage: Stage) -> Option<Effort> {
     }
 }
 
+/// The stage whose agent wrote `logs/<file_name>`, per [`StageCtx::agent_request`]'s
+/// `<stage>-<key>` naming; `None` for any other file there.
+fn log_stage(file_name: &str) -> Option<Stage> {
+    if !file_name.ends_with(".jsonl") {
+        return None;
+    }
+    Stage::ALL.into_iter().find(|s| {
+        file_name
+            .strip_prefix(s.name())
+            .is_some_and(|rest| rest.starts_with('-'))
+    })
+}
+
 impl StageCtx {
     /// A cold run in the agent's own `<stage>-<key>` scratch dir and transcript.
     fn agent_request(&self, stage: Stage, key: &str, prompt: String) -> Result<AgentRequest> {
@@ -226,5 +239,20 @@ mod tests {
         for stage in Stage::ALL {
             assert_eq!(stage_effort(stage).is_some(), stage.runs_agent(), "{stage}");
         }
+    }
+
+    #[test]
+    fn a_log_is_credited_to_the_stage_in_its_name() {
+        assert_eq!(log_stage("hunt-T-0001.jsonl"), Some(Stage::Hunt));
+        assert_eq!(log_stage("hunt-T-0001.repair.jsonl"), Some(Stage::Hunt));
+        assert_eq!(
+            log_stage("skip-reported-R-T-0001-F01.jsonl"),
+            Some(Stage::SkipReported)
+        );
+        assert_eq!(log_stage("recon-recon.jsonl"), Some(Stage::Recon));
+        // The agent's answer sidecar, and anything not named by agent_request.
+        assert_eq!(log_stage("hunt-T-0001.output.json"), None);
+        assert_eq!(log_stage("hunter-x.jsonl"), None);
+        assert_eq!(log_stage("notes.jsonl"), None);
     }
 }

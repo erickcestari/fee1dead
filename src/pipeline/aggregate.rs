@@ -1,18 +1,22 @@
 //! Aggregate stage: join findings, their task leads and reviews, gaps,
 //! duplicates, and wishes into one reviewable `findings.json`, with what the
-//! run audited. No agent call, so it completes even after a run spent its
-//! budget.
+//! run audited and what it cost. No agent call, so it completes even after a
+//! run spent its budget.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use super::StageCtx;
 use super::run_meta::{self, RunMeta};
+use super::{StageCtx, log_stage};
 use crate::artifacts::{Artifacts, names};
+use crate::config::Stage;
 use crate::domain::{Duplicate, Finding, GapMarker, Severity, Task, Validation, Verdict, Wish};
+use crate::provider::Usage;
 
 pub fn run(ctx: &StageCtx) -> Result<()> {
     write_report(&ctx.artifacts)
@@ -27,6 +31,7 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
         duplicates: artifacts.read_jsonl(names::DUPLICATES)?,
         validations: artifacts.read_jsonl(names::VALIDATED)?,
         wishes: artifacts.read_jsonl(names::WISHLIST)?,
+        agent_usage: agent_usage(artifacts)?,
         run: run_meta::read(artifacts)
             .inspect_err(|e| warn!(error = format!("{e:#}"), "run meta unreadable; omitted"))
             .ok()
@@ -39,10 +44,32 @@ pub fn write_report(artifacts: &Artifacts) -> Result<()> {
         findings = report.summary.findings,
         gaps = report.summary.gaps,
         wishes = report.summary.wishes,
+        cost_usd = report
+            .summary
+            .cost
+            .as_ref()
+            .map(|c| c.total.usage.total_cost_usd),
         file = names::REPORT_JSON,
         "aggregate complete"
     );
     Ok(())
+}
+
+/// Each agent log's stage and its usage; `None` for a log that reports none.
+fn agent_usage(artifacts: &Artifacts) -> Result<Vec<(Stage, Option<Usage>)>> {
+    let mut out = Vec::new();
+    for path in artifacts.log_files()? {
+        let Some(stage) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(log_stage)
+        else {
+            continue;
+        };
+        let log = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        out.push((stage, Usage::from_log(BufReader::new(log))));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +96,60 @@ struct Summary {
     /// Present once validate has run.
     #[serde(skip_serializing_if = "Option::is_none")]
     by_verdict: Option<VerdictCounts>,
+    /// Present once an agent has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost: Option<Cost>,
+}
+
+/// Spend summed from the agents' stream logs.
+#[derive(Debug, Serialize)]
+struct Cost {
+    total: StageCost,
+    /// In pipeline order.
+    by_stage: BTreeMap<Stage, StageCost>,
+}
+
+impl Cost {
+    fn of(agent_usage: &[(Stage, Option<Usage>)]) -> Option<Self> {
+        if agent_usage.is_empty() {
+            return None;
+        }
+        let mut cost = Cost {
+            total: StageCost::default(),
+            by_stage: BTreeMap::new(),
+        };
+        for &(stage, usage) in agent_usage {
+            cost.total.add(usage);
+            cost.by_stage.entry(stage).or_default().add(usage);
+        }
+        Some(cost)
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+struct StageCost {
+    /// Agent runs; a repair turn counts as its own.
+    runs: usize,
+    /// Runs whose log reports no usage, e.g. a claude agent killed at its
+    /// timeout. Their spend is missing from the sums below.
+    #[serde(skip_serializing_if = "is_zero")]
+    unpriced: usize,
+    #[serde(flatten)]
+    usage: Usage,
+}
+
+impl StageCost {
+    fn add(&mut self, usage: Option<Usage>) {
+        self.runs += 1;
+        match usage {
+            Some(usage) => self.usage += usage,
+            None => self.unpriced += 1,
+        }
+    }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -182,6 +263,7 @@ struct Inputs {
     duplicates: Vec<Duplicate>,
     validations: Vec<Validation>,
     wishes: Vec<Wish>,
+    agent_usage: Vec<(Stage, Option<Usage>)>,
     run: Option<RunMeta>,
 }
 
@@ -195,6 +277,7 @@ fn aggregate(inputs: Inputs) -> Report {
         duplicates,
         validations,
         mut wishes,
+        agent_usage,
         run,
     } = inputs;
     let tasks_by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
@@ -247,6 +330,7 @@ fn aggregate(inputs: Inputs) -> Report {
             wishes: wishes.len(),
             by_severity,
             by_verdict: (!validations.is_empty()).then_some(by_verdict),
+            cost: Cost::of(&agent_usage),
         },
         findings,
         gaps,
@@ -259,6 +343,7 @@ fn aggregate(inputs: Inputs) -> Report {
 mod tests {
     use super::*;
     use crate::domain::{WishKind, fixtures};
+    use serde_json::json;
 
     fn finding(id: &str, task_id: &str, severity: Severity, confidence: f64) -> Finding {
         Finding {
@@ -434,6 +519,44 @@ mod tests {
             !json.contains("by_verdict") && !json.contains("\"review\""),
             "{json}"
         );
+    }
+
+    #[test]
+    fn cost_is_summed_per_stage_from_the_agent_logs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifacts = Artifacts::new(tmp.path()).unwrap();
+        let log = |file: &str, body: &str| {
+            let path = artifacts.log_path(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let claude = |usd: f64| {
+            format!(r#"{{"type":"result","total_cost_usd":{usd},"usage":{{"input_tokens":10}}}}"#)
+        };
+        log("recon-recon.jsonl", &claude(2.0));
+        log("hunt-T-0001.jsonl", &claude(0.5));
+        log("hunt-T-0001.repair.jsonl", &claude(0.25));
+        // Killed before its result event.
+        log("hunt-T-0002.jsonl", r#"{"type":"assistant"}"#);
+        log("hunt-T-0001.output.json", &claude(100.0));
+        write_report(&artifacts).unwrap();
+
+        let text = artifacts.read_text(names::REPORT_JSON).unwrap();
+        // Pipeline order, checked on the text: a parsed Value re-sorts its keys.
+        let at = |stage: &str| text.find(&format!("\"{stage}\": {{")).unwrap();
+        assert!(at("recon") < at("hunt"), "{text}");
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let cost = &report["summary"]["cost"];
+        assert_eq!(cost["total"]["total_cost_usd"], 2.75);
+        assert_eq!(cost["total"]["input_tokens"], 30);
+        let stages: Vec<&String> = cost["by_stage"].as_object().unwrap().keys().collect();
+        assert_eq!(stages.len(), 2);
+        let hunt = &cost["by_stage"]["hunt"];
+        assert_eq!(
+            (&hunt["runs"], &hunt["unpriced"], &hunt["total_cost_usd"]),
+            (&json!(3), &json!(1), &json!(0.75))
+        );
+        assert!(cost["by_stage"]["recon"].get("unpriced").is_none());
     }
 
     #[test]

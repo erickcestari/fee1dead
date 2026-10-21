@@ -12,7 +12,8 @@ use tokio::process::Command;
 use super::error::limit_error;
 use super::final_output::{clear_final_output, read_final_output, with_final_output_instruction};
 use super::stream::{StreamObserver, run_streaming};
-use super::{AgentRequest, AgentResult, AgentRunner};
+use super::usage::tokens;
+use super::{AgentRequest, AgentResult, AgentRunner, Usage};
 use crate::config::OpenCodeConfig;
 
 pub struct OpenCodeRunner {
@@ -111,6 +112,23 @@ impl StreamObserver for OpenCodeStream {
     fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
+}
+
+/// One model step's spend: opencode reports usage per `step_finish`, so a run
+/// cut short still accounts for the steps it finished.
+pub(super) fn usage(event: &Value) -> Option<Usage> {
+    if event["type"] != "step_finish" {
+        return None;
+    }
+    let part = &event["part"];
+    Some(Usage {
+        total_cost_usd: part["cost"].as_f64().unwrap_or(0.0),
+        input_tokens: tokens(part, "/tokens/input"),
+        // Billed as output.
+        output_tokens: tokens(part, "/tokens/output") + tokens(part, "/tokens/reasoning"),
+        cache_read_input_tokens: tokens(part, "/tokens/cache/read"),
+        cache_creation_input_tokens: tokens(part, "/tokens/cache/write"),
+    })
 }
 
 /// `{"name": .., "data": {"message": ..}}`, falling back to the name, then the

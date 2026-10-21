@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::warn;
@@ -98,16 +98,20 @@ pub(super) async fn run_streaming(
     })
 }
 
-/// Create (truncating) a stream-log file, making parent dirs as needed.
+/// Open a stream-log file for append, making parent dirs as needed. Appended,
+/// so an agent re-run (a retry, or on resume) keeps its earlier spend on record.
 async fn open_log(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("creating log dir {}", parent.display()))?;
     }
-    File::create(path)
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
         .await
-        .with_context(|| format!("creating stream log {}", path.display()))
+        .with_context(|| format!("opening stream log {}", path.display()))
 }
 
 #[cfg(test)]
@@ -167,6 +171,19 @@ mod tests {
         assert_eq!(exit.stderr.trim(), "oops");
         let log = std::fs::read_to_string(req.stream_log_path.unwrap()).unwrap();
         assert_eq!(log, "a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn a_rerun_appends_to_the_log_so_earlier_spend_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = req(dir.path(), Duration::from_secs(10));
+        for line in ["first", "second"] {
+            run_streaming(sh(&format!("echo {line}")), &req, &mut Lines::default())
+                .await
+                .unwrap();
+        }
+        let log = std::fs::read_to_string(req.stream_log_path.unwrap()).unwrap();
+        assert_eq!(log, "first\nsecond\n");
     }
 
     #[tokio::test]

@@ -42,12 +42,8 @@ times out, gets one repair turn in its own session.
 
 Each agent's raw event stream is teed live to `out_dir/logs/<stage>-<label>.jsonl`,
 so it survives a timeout, and its answer lands beside it as
-`<stage>-<label>.output.json`. Cost and token usage are in the final `result`
-event:
-
-```sh
-jq -s 'map(select(.type=="result") | .total_cost_usd) | add' out/logs/*.jsonl
-```
+`<stage>-<label>.output.json`. `findings.json` sums their cost and token usage
+per stage under `summary.cost`.
 
 ### Wishlist
 

@@ -82,6 +82,25 @@ impl Artifacts {
         self.path(names::LOGS).join(file)
     }
 
+    /// The files in `logs/`; none before any agent ran.
+    pub fn log_files(&self) -> Result<Vec<PathBuf>> {
+        let dir = self.path(names::LOGS);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
     pub fn exists(&self, name: &str) -> bool {
         self.path(name).exists()
     }

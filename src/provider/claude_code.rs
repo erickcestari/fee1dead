@@ -11,7 +11,8 @@ use tokio::process::Command;
 use super::error::limit_error;
 use super::final_output::{clear_final_output, read_final_output, with_final_output_instruction};
 use super::stream::{StreamObserver, run_streaming};
-use super::{AgentRequest, AgentResult, AgentRunner, ProviderError};
+use super::usage::tokens;
+use super::{AgentRequest, AgentResult, AgentRunner, ProviderError, Usage};
 use crate::config::ClaudeCodeConfig;
 
 /// Keep the cached system-prompt prefix stable across targets. A target's
@@ -103,6 +104,20 @@ fn weekly_utilization(event: &Value) -> Option<f64> {
     event
         .pointer("/rate_limit_info/unifiedWindows/seven_day/utilization")?
         .as_f64()
+}
+
+/// The run's totals, carried by its one `result` event.
+pub(super) fn usage(event: &Value) -> Option<Usage> {
+    if event["type"] != "result" {
+        return None;
+    }
+    Some(Usage {
+        total_cost_usd: event["total_cost_usd"].as_f64().unwrap_or(0.0),
+        input_tokens: tokens(event, "/usage/input_tokens"),
+        output_tokens: tokens(event, "/usage/output_tokens"),
+        cache_read_input_tokens: tokens(event, "/usage/cache_read_input_tokens"),
+        cache_creation_input_tokens: tokens(event, "/usage/cache_creation_input_tokens"),
+    })
 }
 
 fn reached_cap(utilization: f64, cap_pct: u8) -> bool {

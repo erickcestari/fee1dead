@@ -10,6 +10,7 @@ mod mock;
 mod opencode;
 mod retry;
 mod stream;
+mod usage;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub use generic_exec::ExecRunner;
 pub use mock::{CannedReply, MockRunner};
 pub use opencode::OpenCodeRunner;
 pub use retry::RetryOnRateLimit;
+pub use usage::Usage;
 
 /// Reasoning effort for one run. Providers without an effort knob ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +111,7 @@ pub struct ResumeSession {
     pub project_dir: PathBuf,
 }
 
-/// Cost and usage live in the stream log's final event, not here.
+/// Cost and usage live in the stream log, read back by [`Usage::from_log`].
 #[derive(Debug, Clone)]
 pub struct AgentResult {
     /// The agent's final answer.
