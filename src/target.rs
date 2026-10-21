@@ -217,4 +217,66 @@ enabled = ["recon"]
         let err = ensure_target(&config(&dir.path().join("absent"), &[])).unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
+
+    /// Commit `contents` to `file` in `repo`, returning the new HEAD.
+    fn commit(repo: &Path, file: &str, contents: &str) -> String {
+        let repo = repo.to_str().unwrap();
+        std::fs::write(Path::new(repo).join(file), contents).unwrap();
+        git(&["-C", repo, "add", file]).unwrap();
+        // Pinned identity and no signing, so a developer's git config can't interfere.
+        git(&[
+            "-C",
+            repo,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            contents,
+        ])
+        .unwrap();
+        head(Path::new(repo))
+    }
+
+    fn head(repo: &Path) -> String {
+        git(&["-C", repo.to_str().unwrap(), "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn clone_or_update_clones_then_fetches_and_forces_the_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        git(&["init", "-q", origin.to_str().unwrap()]).unwrap();
+        let first = commit(&origin, "a.txt", "first");
+        let origin_url = origin.to_str().unwrap();
+        let clone = tmp.path().join("nested/clone");
+
+        clone_or_update(origin_url, &clone, Some(&first), "target").unwrap();
+        assert_eq!(head(&clone), first);
+
+        // A commit made after the clone is only reachable through a fetch.
+        let second = commit(&origin, "a.txt", "second");
+        std::fs::write(clone.join("a.txt"), "local edit").unwrap();
+        clone_or_update(origin_url, &clone, Some(&second), "target").unwrap();
+        assert_eq!(head(&clone), second);
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.txt")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn clone_or_update_refuses_to_clone_over_a_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("keep.txt"), "mine").unwrap();
+        let err = clone_or_update("/nonexistent", tmp.path(), None, "target").unwrap_err();
+        assert!(err.to_string().contains("refusing to clone"), "{err}");
+        assert!(tmp.path().join("keep.txt").exists());
+    }
 }

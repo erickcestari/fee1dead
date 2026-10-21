@@ -3,13 +3,16 @@
 #![cfg(feature = "mock-runner")]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fee1dead::config::Config;
 use fee1dead::domain::Task;
 use fee1dead::json_block;
 use fee1dead::pipeline::Pipeline;
-use fee1dead::provider::{AgentRequest, AgentResult, AgentRunner, CannedReply, MockRunner};
+use fee1dead::provider::{
+    AgentRequest, AgentResult, AgentRunner, CannedReply, MockRunner, ProviderError,
+};
 use serde_json::{Value, json};
 
 const RECON_SESSION_ID: &str = "recon-sess-abc123";
@@ -317,6 +320,101 @@ async fn resume_hunts_the_pending_queue_without_rerunning_recon() {
         std::fs::read_to_string(out.join("run-id.txt")).unwrap(),
         run_id
     );
+}
+
+/// Hits the account's usage limit on the second hunter.
+struct LimitedOnSecondHunter {
+    inner: MockRunner,
+    hunters: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl AgentRunner for LimitedOnSecondHunter {
+    fn name(&self) -> &str {
+        "limited"
+    }
+
+    async fn run(&self, req: AgentRequest) -> anyhow::Result<AgentResult> {
+        if req.prompt.contains("You are a Hunter")
+            && self.hunters.fetch_add(1, Ordering::SeqCst) == 1
+        {
+            return Err(ProviderError::UsageLimited("weekly limit reached".into()).into());
+        }
+        self.inner.run(req).await
+    }
+}
+
+/// A usage limit stops hunt from spawning; `--resume` hunts the limited task
+/// and the skipped one, and none twice.
+#[tokio::test]
+async fn resume_after_a_usage_limit_hunts_only_the_unhunted_tasks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt""#);
+    let limited = Arc::new(LimitedOnSecondHunter {
+        inner: MockRunner::new(three_task_replies()),
+        hunters: AtomicUsize::new(0),
+    });
+    run_with(cfg, limited.clone()).await.unwrap();
+    assert_eq!(
+        limited.hunters.load(Ordering::SeqCst),
+        2,
+        "no hunter spawns after the limit"
+    );
+    let hunted: Vec<String> = read_jsonl(&out.join("hunted.jsonl"));
+    assert_eq!(hunted, ["T-0001"], "the limited hunter is not marked done");
+
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let runner = Arc::new(MockRunner::new(three_task_replies()));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .resume()
+        .await
+        .unwrap();
+
+    let seen = runner.seen.lock().unwrap();
+    let hunters: Vec<&String> = seen
+        .iter()
+        .filter(|p| p.contains("You are a Hunter"))
+        .collect();
+    assert_eq!(hunters.len(), 2);
+    assert!(hunters[0].contains("Attack class: panic-dos"));
+    assert!(hunters[1].contains("Attack class: auth-bypass"));
+    let hunted: Vec<String> = read_jsonl(&out.join("hunted.jsonl"));
+    assert_eq!(hunted, ["T-0001", "T-0002", "T-0003"]);
+    let candidates: Vec<Value> = read_jsonl(&out.join("candidates.jsonl"));
+    assert_eq!(candidates.len(), 3);
+}
+
+/// A gap a hunter flags becomes a task the next hunt pass picks up, without
+/// re-hunting the task that flagged it.
+#[tokio::test]
+async fn gapfill_feeds_a_second_hunt_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "gapfill", "hunt""#);
+    let runner = Arc::new(MockRunner::new(replies()));
+    run_with(cfg, runner.clone()).await.unwrap();
+
+    let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
+    let ids: Vec<&str> = queue.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["T-0001", "G-0002"]);
+    let seen = runner.seen.lock().unwrap();
+    let hunters: Vec<&String> = seen
+        .iter()
+        .filter(|p| p.contains("You are a Hunter"))
+        .collect();
+    assert_eq!(hunters.len(), 2, "the flagging task is not hunted again");
+    assert!(
+        hunters[1].contains("did not test truncated input"),
+        "the gap's reason is the follow-up's hypothesis"
+    );
+    let hunted: Vec<String> = read_jsonl(&out.join("hunted.jsonl"));
+    assert_eq!(hunted, ["T-0001", "G-0002"]);
+    let candidates: Vec<Value> = read_jsonl(&out.join("candidates.jsonl"));
+    let tasks: Vec<&str> = candidates
+        .iter()
+        .map(|c| c["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(tasks, ["T-0001", "G-0002"]);
 }
 
 #[tokio::test]
