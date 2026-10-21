@@ -667,6 +667,27 @@ mod tests {
         assert!(!rendered.contains("{filed}"));
     }
 
+    /// Prefix-caching providers reuse the architecture across cold hunters only
+    /// if it comes before anything task-specific.
+    #[test]
+    fn architecture_precedes_every_task_specific_part() {
+        let p = HuntPrompt {
+            target_dir: "/t".into(),
+            architecture: "RECON REPORT".into(),
+            poc: PocText::new(true),
+            use_skills: true,
+            suffix: String::new(),
+            filed: vec![filed("Dust overflow", "a.go:1")],
+        };
+        let a = p.render(
+            &task("overflow", &["a.go:1"], &["sharp-edges"]),
+            Path::new("/s1"),
+        );
+        let b = p.render(&task("dust overflow", &["b.go:2"], &[]), Path::new("/s2"));
+        let shared = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+        assert!(a[..shared].contains("RECON REPORT"), "{}", &a[..shared]);
+    }
+
     #[test]
     fn poc_text_embeds_the_scratch_dir_only_when_pocs_are_required() {
         let with = PocText::new(true);
