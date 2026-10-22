@@ -6,6 +6,7 @@
 //! `--resume` reviews only what failed batches left.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +30,12 @@ const PROMPT: &str = include_str!("../../prompts/validate.md");
 /// Enough to share reading across a file, few enough that verifying each
 /// fits the agent timeout.
 const BATCH_SIZE: usize = 8;
+
+/// Only in a batch with a PoC, the evidence that settles a finding fastest.
+const POC_NOTE: &str = "A finding with a `poc` carries the hunter's proof of concept. Copy it \
+     into your scratch dir `{scratch_dir}` and run it there: a PoC that does not behave as the \
+     finding claims is evidence against it, and one that does still needs its input traced to \
+     a real attacker.\n\n";
 
 #[derive(Debug, Deserialize)]
 struct RawReview {
@@ -132,22 +139,37 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 /// Keyed by the batch's first finding id, unique across runs.
 fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
     let cfg = &ctx.config;
-    let prompt = review_prompt(&cfg.run.target_dir.to_string_lossy(), batch)
-        + &prompt::reference_note(cfg)
+    let mut req = ctx.agent_request(Stage::Validate, &batch[0].id, String::new())?;
+    req.prompt = review_prompt(
+        &cfg.run.target_dir,
+        &req.working_dir,
+        &cfg.run.out_dir,
+        batch,
+    ) + &prompt::reference_note(cfg)
         + prompt::skills_directive(cfg);
-    Ok(AgentRequest {
-        working_dir: cfg.run.target_dir.clone(),
-        ..ctx.agent_request(Stage::Validate, &batch[0].id, prompt)?
-    })
+    // The reviewer reads from the target; its own dir stays its scratch.
+    req.working_dir = cfg.run.target_dir.clone();
+    Ok(req)
 }
 
-fn review_prompt(target_dir: &str, batch: &[Finding]) -> String {
+fn review_prompt(
+    target_dir: &Path,
+    scratch_dir: &Path,
+    out_dir: &Path,
+    batch: &[Finding],
+) -> String {
+    let poc_note = if batch.iter().any(|f| f.poc_path.is_some()) {
+        POC_NOTE.replace("{scratch_dir}", &scratch_dir.to_string_lossy())
+    } else {
+        String::new()
+    };
     PROMPT
-        .replace("{target_dir}", target_dir)
+        .replace("{target_dir}", &target_dir.to_string_lossy())
         .replace("{wish_kinds}", wishlist::KINDS)
         .replace("{severity_scale}", prompt::severity_scale())
+        .replace("{poc_note}", &poc_note)
         // Last, so no placeholder in a finding's text is ever substituted.
-        .replace("{findings_json}", &review_input(batch))
+        .replace("{findings_json}", &review_input(batch, out_dir))
 }
 
 /// Split into batches of at most `max`, keeping each file's findings together
@@ -185,7 +207,8 @@ fn batch_by_file(mut findings: Vec<Finding>, max: usize) -> Vec<Vec<Finding>> {
 
 /// The hunter's confidence is withheld: it is not needed for any verdict and
 /// would anchor the reviewer. Severity stays, since a downgrade is against it.
-fn review_input(batch: &[Finding]) -> String {
+/// A PoC is given by its absolute path under `out_dir`.
+fn review_input(batch: &[Finding], out_dir: &Path) -> String {
     let items: Vec<_> = batch
         .iter()
         .map(|f| {
@@ -200,6 +223,9 @@ fn review_input(batch: &[Finding]) -> String {
             });
             if !f.trace.is_empty() {
                 item["trace"] = json!(f.trace);
+            }
+            if let Some(poc) = &f.poc_path {
+                item["poc"] = json!(out_dir.join(poc));
             }
             item
         })
@@ -297,31 +323,55 @@ mod tests {
         assert!(json_block::parse::<Vec<RawReview>>("{\"finding_id\":1}", "review array").is_err());
     }
 
+    fn prompt_for(batch: &[Finding]) -> String {
+        review_prompt(
+            Path::new("/t"),
+            Path::new("/s/validate-F"),
+            Path::new("/o"),
+            batch,
+        )
+    }
+
     #[test]
     fn review_prompt_fills_the_severity_scale() {
-        let text = review_prompt("/t", &[finding("F-1")]);
+        let text = prompt_for(&[finding("F-1")]);
         assert!(text.contains(prompt::severity_scale()));
         assert!(!text.contains("{severity_scale}"));
     }
 
     #[test]
-    fn review_input_withholds_the_hunters_confidence() {
-        let input: Vec<serde_json::Value> =
-            serde_json::from_str(&review_input(&[finding("F-1")])).unwrap();
-        assert_eq!(input[0]["finding_id"], "F-1");
-        assert_eq!(input[0]["severity"], "high");
-        assert!(input[0].get("confidence").is_none());
-        assert!(input[0].get("trace").is_none());
+    fn only_a_batch_with_a_poc_is_told_to_run_it_in_its_scratch_dir() {
+        let without = prompt_for(&[finding("F-1")]);
+        assert!(!without.contains("proof of concept") && !without.contains("{poc_note}"));
+        let with_poc = Finding {
+            poc_path: Some("pocs/F-2/poc.go".into()),
+            ..finding("F-2")
+        };
+        let with = prompt_for(&[finding("F-1"), with_poc]);
+        assert!(with.contains("scratch dir `/s/validate-F`"), "{with}");
     }
 
     #[test]
-    fn review_input_carries_the_trace() {
+    fn review_input_withholds_the_hunters_confidence() {
+        let input: Vec<serde_json::Value> =
+            serde_json::from_str(&review_input(&[finding("F-1")], Path::new("/o"))).unwrap();
+        assert_eq!(input[0]["finding_id"], "F-1");
+        assert_eq!(input[0]["severity"], "high");
+        assert!(input[0].get("confidence").is_none());
+        assert!(input[0].get("trace").is_none() && input[0].get("poc").is_none());
+    }
+
+    #[test]
+    fn review_input_carries_the_trace_and_the_pocs_absolute_path() {
         let f = Finding {
             trace: serde_json::from_str(r#"[{"kind": "sink", "location": "a.rs:9"}]"#).unwrap(),
+            poc_path: Some("pocs/F-1/poc.go".into()),
             ..finding("F-1")
         };
-        let input: Vec<serde_json::Value> = serde_json::from_str(&review_input(&[f])).unwrap();
+        let input: Vec<serde_json::Value> =
+            serde_json::from_str(&review_input(&[f], Path::new("/o"))).unwrap();
         assert_eq!(input[0]["trace"][0]["kind"], "sink");
+        assert_eq!(input[0]["poc"], "/o/pocs/F-1/poc.go");
     }
 
     #[test]

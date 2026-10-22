@@ -76,7 +76,7 @@ downgrade a rating the trace does not support.
 Looking unsafe is not being reachable, and a similar bug elsewhere says nothing
 about this instance's guards: decide each finding on its own trace.
 
-## Findings under review
+{poc_note}## Findings under review
 
 The harness matches your verdicts back to these by `finding_id`, so echo each
 one exactly as given.

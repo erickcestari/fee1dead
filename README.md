@@ -16,7 +16,7 @@ findings. The orchestrator never hunts bugs itself.
 | `gapfill` | Re-queues areas hunters flagged as under-covered. Run `hunt` again after it. |
 | `dedupe` | Collapses findings with one root cause (same file, and the same root-cause line, the same sink, or a similar title under the same attack class). The most severe survives; the rest go to `duplicates.jsonl`. |
 | `skip-reported` | Drops candidates the sink already holds (filed GitHub issues) before validate spends tokens on them. Token overlap settles clear cases; cheap judges take the ambiguous ones concurrently (`run.concurrency`) and fail open. |
-| `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file, check each hop of the hunter's trace, and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
+| `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file, check each hop of the hunter's trace, re-run its PoC when there is one, and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
 | `report` | Writes every finding but `likely_false_positive` to the sink, with its verdict. |
 | `feedback` | Turns real bugs (as variant hunts) and gaps no follow-up hunt covered into `feedback-seeds.jsonl` for the next run's recon. |
 | `aggregate` | Compiles everything into one reviewable `findings.json`, most severe first and likely false positives last. |
