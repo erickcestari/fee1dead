@@ -150,7 +150,8 @@ or wrong check. `trace` is the data path from where the attacker's input enters
 (`entrypoint`) through each hop (`propagation`) to where it does damage
 (`sink`); set `"assumed": true` on a hop you inferred rather than read. Paths
 are relative to the target repository, except code outside it (a dependency,
-the reference), which takes an absolute path.
+the reference), which takes an absolute path. The harness checks that every
+relative `file:line` you cite exists, so cite lines you read.
 
 `attack_scenario` is how an attacker exploits the bug, written so a maintainer
 can replay the attack without the code open. Name the actors and their roles

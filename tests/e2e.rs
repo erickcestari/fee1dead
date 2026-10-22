@@ -101,7 +101,9 @@ fn three_task_replies() -> Vec<CannedReply> {
 /// A config for `stages` under `tmp`, with `run_extra` appended to `[run]`.
 fn setup_with(tmp: &Path, stages: &str, run_extra: &str) -> (Config, PathBuf) {
     let target = tmp.join("target");
-    std::fs::create_dir_all(&target).unwrap();
+    // The file the mock hunter cites, long enough for the line it names.
+    std::fs::create_dir_all(target.join("src")).unwrap();
+    std::fs::write(target.join("src/parse.rs"), "// parse\n".repeat(50)).unwrap();
     let out = tmp.join("out");
     let toml = format!(
         r#"
@@ -538,4 +540,34 @@ async fn wishes_reach_the_wishlist_and_the_report() {
         "findings.json carries the run meta"
     );
     assert_eq!(report["wishes"][0]["kind"], "toolchain");
+}
+
+/// A hunter citing a line its file lacks is resumed once to fix the citation,
+/// so no reviewer spends a turn on a location that does not exist.
+#[tokio::test]
+async fn a_citation_the_target_lacks_is_sent_back_for_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt""#);
+    let mut replies = replies();
+    let hunter = replies
+        .iter_mut()
+        .find(|r| r.match_substr.as_deref() == Some("You are a Hunter"))
+        .unwrap();
+    let good = hunter.stdout.clone();
+    hunter.stdout = good.replace("src/parse.rs:42", "src/parse.rs:420");
+    hunter.session_id = Some("hunter-sess".into());
+    replies.push(CannedReply {
+        match_substr: Some("`src/parse.rs:420` (the file has 50 lines)".into()),
+        stdout: good,
+        session_id: None,
+        render: None,
+    });
+
+    run_with(cfg, Arc::new(MockRunner::new(replies)))
+        .await
+        .unwrap();
+
+    let candidates: Vec<Value> = read_jsonl(&out.join("candidates.jsonl"));
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["location"], "src/parse.rs:42");
 }

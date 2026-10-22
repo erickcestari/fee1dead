@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::salvage::run_parsed;
 use super::similarity::{jaccard, report_signature, tokenize};
 use super::wishlist::{self, RawWish};
-use super::{StageCtx, prompt};
+use super::{StageCtx, citation, prompt};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
 use crate::domain::{Finding, GapMarker, Severity, Task, TraceStep, default_confidence};
@@ -53,6 +53,15 @@ struct HunterOutput {
     gaps: Vec<RawGap>,
     #[serde(default)]
     wishes: Vec<RawWish>,
+}
+
+impl HunterOutput {
+    /// Every `file:line` the answer stakes a claim on.
+    fn cited(&self) -> impl Iterator<Item = &str> {
+        self.findings.iter().flat_map(|f| {
+            std::iter::once(f.location.as_str()).chain(f.trace.iter().map(|s| s.location.as_str()))
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +99,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .read_line(names::RUN_ID)
         .context("the run has no id")?;
     let recon_session = recon_session(ctx);
+    let target = ctx.config.run.target_dir.clone();
     let prompt = HuntPrompt::new(ctx, recon_session.is_some(), filed_reports(ctx));
 
     let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
@@ -133,10 +143,13 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         });
         let runner = Arc::clone(&ctx.runner);
         let limited = Arc::clone(&limited);
+        let target = target.clone();
         running.spawn(async move {
             info!(task = %task.id, attack_class = %task.attack_class, "hunter started");
             let out = run_parsed(runner.as_ref(), req, |r| {
-                json_block::parse::<HunterOutput>(&r.stdout, "hunter report")
+                let output = json_block::parse::<HunterOutput>(&r.stdout, "hunter report")?;
+                citation::check(&target, output.cited())?;
+                Ok(output)
             })
             .await;
             if out.as_ref().is_err_and(is_usage_limited) {
@@ -651,6 +664,16 @@ mod tests {
             block.lines().filter(|l| l.starts_with("- ")).count(),
             FILED_SHOWN
         );
+    }
+
+    #[test]
+    fn cited_covers_findings_and_their_traces() {
+        let out: HunterOutput = serde_json::from_str(
+            r#"{"findings": [{"title": "t", "severity": "high", "location": "a.go:1",
+                "description": "d", "trace": [{"kind": "sink", "location": "b.go:2"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(out.cited().collect::<Vec<_>>(), ["a.go:1", "b.go:2"]);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! [`StageCtx`]; stages talk only through artifacts, so this just sequences them.
 
 mod aggregate;
+mod citation;
 mod dedupe;
 mod feedback;
 mod gapfill;

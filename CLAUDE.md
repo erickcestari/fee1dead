@@ -41,8 +41,10 @@ schema-validated findings. See `README.md` for the user-facing overview.
   lacks (`wishlist.jsonl`), the agents' channel back to the operator.
   `feedback.rs` is a cross-run memory (no consumer repos): it writes durable
   seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
-  leads (and consumes). `salvage.rs` gives an agent whose answer does not
-  parse, or that timed out, one repair turn in its own session. Add a stage:
+  leads (and consumes). `citation.rs` checks that every `file:line` a hunter
+  cites exists, so a bad one gets a repair turn. `salvage.rs` gives an agent
+  whose answer does not parse, or that timed out, one repair turn in its own
+  session. Add a stage:
   create the file, add a variant to `config::Stage`, and the compiler points at
   the `run_stage` match.
 - `src/store/` — `ReportSink` trait + sqlite/jsonl/http/github sinks. New sinks

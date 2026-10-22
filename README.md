@@ -12,7 +12,7 @@ findings. The orchestrator never hunts bugs itself.
 | Stage | What it does |
 |-------|--------------|
 | `recon` | Reads the repo and writes a threat model (`recon.json`). Its `hunt_tasks` become the queue. Leads from past runs must pass the same bar. |
-| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports closest to its task, so it skips known bugs. Emits findings with a traced data path, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. Incremental: only unhunted tasks run. |
+| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports closest to its task, so it skips known bugs. Emits findings with a traced data path, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. A cited `file:line` the target lacks gets a repair turn. Incremental: only unhunted tasks run. |
 | `gapfill` | Re-queues areas hunters flagged as under-covered. Run `hunt` again after it. |
 | `dedupe` | Collapses findings with one root cause (same file, and the same root-cause line, the same sink, or a similar title under the same attack class). The most severe survives; the rest go to `duplicates.jsonl`. |
 | `skip-reported` | Drops candidates the sink already holds (filed GitHub issues) before validate spends tokens on them. Token overlap settles clear cases; cheap judges take the ambiguous ones concurrently (`run.concurrency`) and fail open. |
