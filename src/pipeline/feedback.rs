@@ -2,14 +2,14 @@
 //! (variant hunts around real bugs, and the gaps hunters left that no
 //! follow-up hunt covered) reach the next recon as leads, deduped and capped
 //! at `feedback.max_seeds`, newest first. Claims code settled as not bugs
-//! reach the next hunters.
+//! reach the next hunters, and the audited commit the next recon's history.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::{StageCtx, ruled_out};
+use super::{StageCtx, ruled_out, run_meta};
 use crate::artifacts::names;
 use crate::domain::{Finding, GapMarker, Priority, RuledOut, Task, TaskOrigin, Validation};
 use crate::target::head_commit;
@@ -43,7 +43,8 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
 
     info!(seeds = merged.len(), "feedback updated cross-run memory");
     ctx.artifacts.write_jsonl(names::SEEDS, &merged)?;
-    remember_ruled_out(ctx, &candidates, &validations)
+    remember_ruled_out(ctx, &candidates, &validations)?;
+    remember_audited_commit(ctx)
 }
 
 /// Fold this run's cleared hypotheses and likely false positives into the
@@ -68,6 +69,19 @@ fn remember_ruled_out(
     );
     info!(entries = kept.len(), "feedback updated ruled-out memory");
     ctx.artifacts.write_jsonl(names::RULED_OUT, &kept)
+}
+
+/// The commit this run audited, for the next recon to diff against.
+fn remember_audited_commit(ctx: &StageCtx) -> Result<()> {
+    let commit = run_meta::read(&ctx.artifacts)
+        .inspect_err(|e| warn!(error = format!("{e:#}"), "run meta unreadable"))
+        .ok()
+        .flatten()
+        .and_then(|meta| meta.target.commit);
+    match commit {
+        Some(commit) => ctx.artifacts.write_text(names::AUDITED_COMMIT, &commit),
+        None => Ok(()),
+    }
 }
 
 /// Gaps no hunted gapfill task covers. The task a gap came from does not

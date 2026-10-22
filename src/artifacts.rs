@@ -34,6 +34,9 @@ pub mod names {
     pub const SEEDS: &str = "feedback-seeds.jsonl";
     /// Cross-run memory of claims code settled as not bugs; never reset.
     pub const RULED_OUT: &str = "ruled-out.jsonl";
+    /// The target commit the last run audited, for the next recon to diff
+    /// against; never reset.
+    pub const AUDITED_COMMIT: &str = "audited-commit.txt";
     /// Recon's session id, for hunters to fork. One line of text.
     pub const RECON_SESSION: &str = "recon-session.txt";
     /// Prefixed to finding ids, which would otherwise repeat across runs.
@@ -290,7 +293,7 @@ mod tests {
     #[test]
     fn reset_clears_the_run_but_keeps_the_cross_run_memory() {
         let (_dir, art) = artifacts();
-        let durable = [names::SEEDS, names::RULED_OUT];
+        let durable = [names::SEEDS, names::RULED_OUT, names::AUDITED_COMMIT];
         for name in durable.iter().chain(&[names::QUEUE, names::CLEARED]) {
             art.write_text(name, "{}").unwrap();
         }

@@ -42,7 +42,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `feedback.rs` is a cross-run memory (no consumer repos): it writes durable
   seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
   leads (and consumes); it also keeps `ruled-out.jsonl` (`ruled_out.rs`:
-  claims code settled, shown to hunters until the settling file changes).
+  claims code settled, shown to hunters until the settling file changes) and
+  `audited-commit.txt`, where the next recon's history starts.
   `citation.rs` checks that every `file:line` a hunter
   cites exists, so a bad one gets a repair turn. `salvage.rs` gives an agent
   whose answer does not parse, or that timed out, one repair turn in its own
@@ -93,8 +94,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
   ids in `hunted.jsonl`. Never truncate `candidates.jsonl`/`gaps.jsonl` from a
   stage that can run more than once.
 - A recon-led run resets per-run artifacts (`artifacts::names::PER_RUN`) at
-  startup; `feedback-seeds.jsonl` and `ruled-out.jsonl` are deliberately
-  excluded so the cross-run memory persists. If you add a durable artifact,
+  startup; `feedback-seeds.jsonl`, `ruled-out.jsonl`, and `audited-commit.txt`
+  are deliberately excluded so the cross-run memory persists. If you add a durable artifact,
   keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
 - Every agent gets its own `output_dir` (a scratch dir) for its answer file;
   never share one between agents, or one can read another's answer.

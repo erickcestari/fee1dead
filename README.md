@@ -11,7 +11,7 @@ findings. The orchestrator never hunts bugs itself.
 
 | Stage | What it does |
 |-------|--------------|
-| `recon` | Reads the repo and writes a threat model (`recon.json`). Its `hunt_tasks` become the queue. Leads from past runs must pass the same bar. |
+| `recon` | Reads the repo and writes a threat model (`recon.json`). Its `hunt_tasks` become the queue. Leads from past runs must pass the same bar. Recent changes start from the last audited commit when known. |
 | `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports and 15 [ruled-out claims](#cross-run-memory) closest to its task, so it skips known bugs and settled claims. Emits findings with a traced data path, the hypotheses it disproved, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. A cited `file:line` the target lacks gets a repair turn. Incremental: only unhunted tasks run. |
 | `gapfill` | Re-queues areas hunters flagged as under-covered. Run `hunt` again after it. |
 | `dedupe` | Collapses findings with one root cause (same file, and the same root-cause line, the same sink, or a similar title under the same attack class). The most severe survives; the rest go to `duplicates.jsonl`. |
@@ -47,12 +47,13 @@ per stage under `summary.cost`.
 
 ### Cross-run memory
 
-Feedback writes two files that survive the next run's reset:
+Feedback writes three files that survive the next run's reset:
 
 | File | Read by | Holds |
 |------|---------|-------|
 | `feedback-seeds.jsonl` | recon, as leads | variant hunts around real bugs, and unfinished gaps |
 | `ruled-out.jsonl` | hunters | claims a hunter disproved or a reviewer judged a likely false positive, each with the code that settled it; dropped once that file changes (needs a git target) |
+| `audited-commit.txt` | recon | the target commit the run audited; the next recon's history starts there |
 
 ### Wishlist
 

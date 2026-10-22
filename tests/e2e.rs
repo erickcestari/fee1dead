@@ -609,9 +609,9 @@ fn commit_all(repo: &Path, message: &str) -> String {
 }
 
 /// A hypothesis a hunter cleared reaches the next run's hunters until the file
-/// that settled it changes.
+/// that settled it changes, and the next recon diffs from the audited commit.
 #[tokio::test]
-async fn cleared_claims_reach_the_next_run_until_their_file_changes() {
+async fn cleared_claims_and_the_audited_commit_reach_the_next_run() {
     let tmp = tempfile::tempdir().unwrap();
     let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "validate", "feedback""#);
     let target = tmp.path().join("target");
@@ -633,6 +633,12 @@ async fn cleared_claims_reach_the_next_run_until_their_file_changes() {
     let ruled_out: Vec<Value> = read_jsonl(&out.join("ruled-out.jsonl"));
     assert_eq!(ruled_out.len(), 1);
     assert_eq!(ruled_out[0]["commit"], audited);
+    assert_eq!(
+        std::fs::read_to_string(out.join("audited-commit.txt"))
+            .unwrap()
+            .trim(),
+        audited
+    );
 
     // Run 2: another file changes, so the claim still holds.
     std::fs::write(target.join("README"), "docs").unwrap();
@@ -641,6 +647,10 @@ async fn cleared_claims_reach_the_next_run_until_their_file_changes() {
     let runner = Arc::new(MockRunner::new(replies.clone()));
     run_with(cfg, runner.clone()).await.unwrap();
     let seen = snapshot(&runner);
+    assert!(
+        seen[0].contains(&format!("{audited}..HEAD")),
+        "recon diffs from the audit"
+    );
     let hunter = seen
         .iter()
         .find(|p| p.contains("You are a Hunter"))

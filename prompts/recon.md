@@ -15,7 +15,7 @@ Every hunter forks from your session, so whatever you read is re-billed to each 
 <context>
 **Repository**: `$REPO_PATH` (`$REPO_NAME`)
 **Repo size**: $REPO_SIZE (~$LOC LOC). Apply $REPO_SIZE-repo caps throughout.
-</context>
+$LAST_AUDIT</context>
 
 $LEADS
 <size_adaptive_caps>
@@ -69,8 +69,8 @@ From the entry points and invariants, select the files or functions hunters shou
 **Recent changes.** Recent regressions often break implicit contracts that older code relied on. For each priority-target file only:
 
 ```
-git -C $REPO_PATH log --since=90.days --oneline --no-merges -- <file>
-git -C $REPO_PATH log -p --since=90.days --no-merges -- <file>   # only if oneline shows commits
+git -C $REPO_PATH log $SINCE --oneline --no-merges -- <file>
+git -C $REPO_PATH log -p $SINCE --no-merges -- <file>   # only if oneline shows commits
 ```
 
 Record at most 5 `recent_changes` entries, one line of prose each, no pasted diffs. Include only commits that altered function bodies in a way that could change a documented or implied contract (idempotency, ordering, return semantics, exclusion or cascade behavior). Skip renames, formatting, comment-only, and test-only changes.

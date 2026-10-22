@@ -138,6 +138,13 @@ pub fn head_commit(dir: &Path) -> Option<String> {
     Some(head.trim().to_string())
 }
 
+/// Whether `commit` is in `dir`'s history.
+pub fn has_commit(dir: &Path, commit: &str) -> bool {
+    dir.to_str().is_some_and(|dir| {
+        git(&["-C", dir, "cat-file", "-e", &format!("{commit}^{{commit}}")]).is_ok()
+    })
+}
+
 /// The repo-relative paths that differ between `from` and HEAD in `dir`.
 /// Commit to commit, so a read-only checkout needs no index refresh.
 pub fn changed_since(dir: &Path, from: &str) -> Result<HashSet<String>> {
@@ -301,6 +308,11 @@ enabled = ["recon"]
         git(&["init", "-q", repo.to_str().unwrap()]).unwrap();
         let first = commit(repo, "a.txt", "first");
         commit(repo, "b.txt", "second");
+        assert!(has_commit(repo, &first));
+        assert!(!has_commit(
+            repo,
+            "0000000000000000000000000000000000000000"
+        ));
         assert_eq!(
             changed_since(repo, &first).unwrap(),
             HashSet::from(["b.txt".to_string()])

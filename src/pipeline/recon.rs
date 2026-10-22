@@ -17,6 +17,7 @@ use crate::config::Stage;
 use crate::domain::{Priority, Task, TaskOrigin};
 use crate::json_block;
 use crate::provider::AgentRequest;
+use crate::target::has_commit;
 
 const PROMPT: &str = include_str!("../../prompts/recon.md");
 
@@ -65,6 +66,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let target = &cfg.run.target_dir;
     let loc = loc::count(target);
     let seeds: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
+    let audited = ctx
+        .artifacts
+        .read_line(names::AUDITED_COMMIT)
+        .filter(|commit| has_commit(target, commit));
+    let (since, last_audit) = history_range(audited.as_deref(), &target.to_string_lossy());
     let spec_path = cfg
         .reference
         .active_dir()
@@ -76,6 +82,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .replace("$REPO_SIZE", size_tier(loc))
         .replace("$LOC", &loc.to_string())
         .replace("$SPEC_PATH", &spec_path)
+        .replace("$LAST_AUDIT", &last_audit)
+        .replace("$SINCE", &since)
         .replace("$LEADS", &leads_block(&seeds))
         + &prompt::reference_recon_directive(cfg)
         + prompt::skills_directive(cfg);
@@ -119,6 +127,22 @@ fn into_queue(hunt_tasks: Vec<HuntTask>) -> Vec<Task> {
         .enumerate()
         .map(|(i, t)| t.into_task(format!("T-{:04}", i + 1)))
         .collect()
+}
+
+/// The `git log` range for recent changes, and a note on the last audit: the
+/// commits since an `audited` one when known, else the last 90 days.
+fn history_range(audited: Option<&str>, repo: &str) -> (String, String) {
+    match audited {
+        Some(commit) => (
+            format!("{commit}..HEAD"),
+            format!(
+                "**Last audit**: commit `{commit}`. Code changed since then has had no \
+                 audit, so run `git -C {repo} diff --stat {commit} HEAD` once and treat \
+                 changed files on a trust boundary as priority targets.\n"
+            ),
+        ),
+        None => ("--since=90.days".to_string(), String::new()),
+    }
 }
 
 fn size_tier(loc: u64) -> &'static str {
@@ -180,6 +204,16 @@ mod tests {
     fn queue(json: &str) -> Vec<Task> {
         let report: ReconReport = json_block::parse(json, "threat model").unwrap();
         into_queue(report.hunt_tasks)
+    }
+
+    #[test]
+    fn history_starts_at_the_last_audit_when_known() {
+        let (since, note) = history_range(Some("abc123"), "/work/target");
+        assert_eq!(since, "abc123..HEAD");
+        assert!(note.contains("git -C /work/target diff --stat abc123 HEAD"));
+        let (since, note) = history_range(None, "/work/target");
+        assert_eq!(since, "--since=90.days");
+        assert!(note.is_empty());
     }
 
     #[test]
