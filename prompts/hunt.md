@@ -62,17 +62,40 @@ with the final JSON.
   revoked commitment") and cite the code that makes it true. One you cannot
   verify rules nothing out: keep the finding at low confidence, or emit a gap
   whose `reason` names the assumption.
+- Read every path that reaches the same effect as your target: sibling
+  handlers, legacy and batch variants, and the retry, cancellation, error, and
+  restart or reestablish paths. Their guards must be equivalent, not merely
+  present; a check one path has and its sibling lacks is the bug.
+- Try the edge inputs the interface accepts: zero, max, over-limit, duplicate,
+  reordered, stale or replayed, concurrent, and state left mid-restart.
+  Protocol state machines break most often on duplicate and reordered messages
+  and across restart and reestablish.
 - For fund loss, the sink is the value's final owner: follow every output the
   attacker can broadcast, and every obligation tied to it, through the code that
   resolves it (a forwarded HTLC is safe only if the preimage revealed on the
   outgoing leg settles the incoming leg before it expires). Loss often comes
   from the victim failing to recognize, learn, or act; anything the node signed
   or sent but never recorded is a lead in itself.
+- For DoS, the bar is an input-to-cost path that no cap bounds after you
+  checked every one (message size, count, rate, queue depth, timeout, per-peer
+  limit), with the cost landing on the node or other peers, not only the
+  attacker's own connection. State the attacker's cost against the effect: one
+  cheap input with superlinear or lasting effect is far worse than flooding
+  that ends when the attacker stops.
+- After you trace a `high` or `critical` bug, grep your scope for the same root
+  cause (the same missing check, misused call, or copied pattern) before you
+  finish. Report a variant that needs its own fix as its own finding, fold one
+  the same fix covers into the original's description, and name a variant
+  outside your scope as a gap.
 - If a check needs something this sandbox lacks (a blocked host, a dependency's
   source, a tool, another OS or a VM, a running service), do not work around it
   or retry: add a wish and carry on from the code. The operator grants wishes
   between runs, so a wish is how a blocked check gets done next time.
 {poc_rule}
+
+## Severity
+
+{severity_scale}
 
 ## Workflow
 
@@ -80,10 +103,13 @@ with the final JSON.
 Hunt progress:
 - [ ] Read the targets, trace untrusted input to the sink, then follow the
       impact to the asset's final owner
+- [ ] Read the sibling paths to the same effect and try the edge inputs
 - [ ] Grep callers for reachability and the chain for guards; verify in code
       each assumption that ruled a path out
 {poc_step}
-- [ ] Set confidence + severity from reachability; keep every traced defect
+- [ ] Set confidence from reachability and severity from the scale; keep
+      every traced defect
+- [ ] For each high or critical bug, grep the scope for variants
 - [ ] Note areas you touched but could not fully cover (gaps)
 ```
 

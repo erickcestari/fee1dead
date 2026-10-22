@@ -132,16 +132,22 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 /// Keyed by the batch's first finding id, unique across runs.
 fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
     let cfg = &ctx.config;
-    let prompt = PROMPT
-        .replace("{target_dir}", &cfg.run.target_dir.to_string_lossy())
-        .replace("{wish_kinds}", wishlist::KINDS)
-        .replace("{findings_json}", &review_input(batch))
+    let prompt = review_prompt(&cfg.run.target_dir.to_string_lossy(), batch)
         + &prompt::reference_note(cfg)
         + prompt::skills_directive(cfg);
     Ok(AgentRequest {
         working_dir: cfg.run.target_dir.clone(),
         ..ctx.agent_request(Stage::Validate, &batch[0].id, prompt)?
     })
+}
+
+fn review_prompt(target_dir: &str, batch: &[Finding]) -> String {
+    PROMPT
+        .replace("{target_dir}", target_dir)
+        .replace("{wish_kinds}", wishlist::KINDS)
+        .replace("{severity_scale}", prompt::severity_scale())
+        // Last, so no placeholder in a finding's text is ever substituted.
+        .replace("{findings_json}", &review_input(batch))
 }
 
 /// Split into batches of at most `max`, keeping each file's findings together
@@ -285,6 +291,13 @@ mod tests {
         assert_eq!(reviews[0].verdict, Verdict::Confirmed);
         assert_eq!(reviews[0].impact, "i");
         assert!(json_block::parse::<Vec<RawReview>>("{\"finding_id\":1}", "review array").is_err());
+    }
+
+    #[test]
+    fn review_prompt_fills_the_severity_scale() {
+        let text = review_prompt("/t", &[finding("F-1")]);
+        assert!(text.contains(prompt::severity_scale()));
+        assert!(!text.contains("{severity_scale}"));
     }
 
     #[test]

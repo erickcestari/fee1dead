@@ -321,6 +321,7 @@ impl HuntPrompt {
             .replace("{poc_rule}", self.poc.rule)
             .replace("{poc_step}", self.poc.step)
             .replace("{wish_kinds}", wishlist::KINDS)
+            .replace("{severity_scale}", prompt::severity_scale())
             // After poc_intro, which may embed it.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &self.architecture)
@@ -665,6 +666,21 @@ mod tests {
         let rendered = p.render(&t, Path::new("/s"));
         assert!(rendered.contains("- Dust overflow (`a.go:1`)"));
         assert!(!rendered.contains("{filed}"));
+    }
+
+    #[test]
+    fn render_fills_the_severity_scale() {
+        let p = HuntPrompt {
+            target_dir: "/t".into(),
+            architecture: String::new(),
+            poc: PocText::new(false),
+            use_skills: false,
+            suffix: String::new(),
+            filed: Vec::new(),
+        };
+        let rendered = p.render(&task("dust overflow", &[], &[]), Path::new("/s"));
+        assert!(rendered.contains(prompt::severity_scale()));
+        assert!(!rendered.contains("{severity_scale}"));
     }
 
     /// Prefix-caching providers reuse the architecture across cold hunters only

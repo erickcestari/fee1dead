@@ -38,6 +38,12 @@ pub(super) fn reference_recon_directive(cfg: &Config) -> String {
     }
 }
 
+/// The scale hunters rate on and reviewers correct against, in one place so
+/// both judge severity alike.
+pub(super) fn severity_scale() -> &'static str {
+    include_str!("../../prompts/severity.md").trim_end()
+}
+
 /// Countermands the templates' skill instructions when skills are disabled.
 pub(super) fn skills_directive(cfg: &Config) -> &'static str {
     if cfg.run.use_skills {

@@ -45,6 +45,20 @@ should do, not what it does. Calling a deviation benign is a dismissal too.
 Name the assumption each dismissal rests on and cite the code that makes it
 true; if you cannot, it does not support `likely_false_positive`.
 
+A DoS finding holds only with an input-to-cost path that no cap bounds (message
+size, count, rate, queue depth, timeout, per-peer limit) and a cost that lands
+on the node or other peers; one confined to the attacker's own connection is
+`likely_false_positive`. Weigh the attacker's cost against the effect: flooding
+that ends when the attacker stops rates lower than one cheap input with
+superlinear or lasting effect.
+
+## Severity
+
+Hunters rated on this scale. Judge each finding's severity on it, and
+downgrade a rating the trace does not support.
+
+{severity_scale}
+
 ## Method (per finding)
 
 ```
