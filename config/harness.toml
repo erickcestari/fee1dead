@@ -97,6 +97,7 @@ path = "/work/out/findings.db"
 
 [feedback]
 max_seeds = 200
+max_ruled_out = 300
 
 [stages]
 # Run in order; a stage may repeat (hunt again after gapfill).

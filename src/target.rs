@@ -3,6 +3,7 @@
 //! behind the firewall, so every git host (submodules too) must be allowed,
 //! even when `[target].setup` already cloned it.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
@@ -135,6 +136,25 @@ fn clone_or_update(repo: &str, dir: &Path, git_ref: Option<&str>, label: &str) -
 pub fn head_commit(dir: &Path) -> Option<String> {
     let head = git(&["-C", dir.to_str()?, "rev-parse", "HEAD"]).ok()?;
     Some(head.trim().to_string())
+}
+
+/// The repo-relative paths that differ between `from` and HEAD in `dir`.
+/// Commit to commit, so a read-only checkout needs no index refresh.
+pub fn changed_since(dir: &Path, from: &str) -> Result<HashSet<String>> {
+    let dir = dir
+        .to_str()
+        .context("the checkout path is not valid UTF-8")?;
+    let out = git(&[
+        "-C",
+        dir,
+        "diff",
+        "--name-only",
+        "--relative",
+        from,
+        "HEAD",
+        "--",
+    ])?;
+    Ok(out.lines().map(str::to_string).collect())
 }
 
 fn is_empty_dir(dir: &Path) -> Result<bool> {
@@ -272,6 +292,21 @@ enabled = ["recon"]
             std::fs::read_to_string(clone.join("a.txt")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn changed_since_lists_the_files_a_later_commit_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(&["init", "-q", repo.to_str().unwrap()]).unwrap();
+        let first = commit(repo, "a.txt", "first");
+        commit(repo, "b.txt", "second");
+        assert_eq!(
+            changed_since(repo, &first).unwrap(),
+            HashSet::from(["b.txt".to_string()])
+        );
+        assert!(changed_since(repo, &head(repo)).unwrap().is_empty());
+        assert!(changed_since(repo, "0000000000000000000000000000000000000000").is_err());
     }
 
     #[test]

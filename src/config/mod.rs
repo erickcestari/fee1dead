@@ -149,11 +149,16 @@ pub struct FirewallConfig {
 pub struct FeedbackConfig {
     /// Cap on persisted seeds, so the cross-run memory stays bounded.
     pub max_seeds: usize,
+    /// Cap on persisted ruled-out claims, likewise.
+    pub max_ruled_out: usize,
 }
 
 impl Default for FeedbackConfig {
     fn default() -> Self {
-        Self { max_seeds: 200 }
+        Self {
+            max_seeds: 200,
+            max_ruled_out: 300,
+        }
     }
 }
 
@@ -188,6 +193,10 @@ impl Config {
         ensure!(
             self.feedback.max_seeds >= 1,
             "feedback.max_seeds must be >= 1"
+        );
+        ensure!(
+            self.feedback.max_ruled_out >= 1,
+            "feedback.max_ruled_out must be >= 1"
         );
         for (stage, model) in &self.stages.models {
             ensure!(
@@ -309,6 +318,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert!(cfg.run.use_skills);
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
+        assert_eq!(cfg.feedback.max_ruled_out, 300);
         assert!(cfg.target.prepare.is_empty());
         assert!(cfg.target.setup.is_none());
         assert!(cfg.reference.active_dir().is_none());

@@ -571,3 +571,94 @@ async fn a_citation_the_target_lacks_is_sent_back_for_repair() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0]["location"], "src/parse.rs:42");
 }
+
+/// The prompts `runner` saw so far, without holding its lock.
+fn snapshot(runner: &MockRunner) -> Vec<String> {
+    runner.seen.lock().unwrap().iter().cloned().collect()
+}
+
+/// Run `git` in `repo` with a pinned identity, so a developer's config can't
+/// interfere.
+fn git(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn commit_all(repo: &Path, message: &str) -> String {
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-qm", message]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A hypothesis a hunter cleared reaches the next run's hunters until the file
+/// that settled it changes.
+#[tokio::test]
+async fn cleared_claims_reach_the_next_run_until_their_file_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "validate", "feedback""#);
+    let target = tmp.path().join("target");
+    git(&target, &["init", "-q"]);
+    let audited = commit_all(&target, "first");
+    let mut replies = replies();
+    for reply in &mut replies {
+        if reply.match_substr.as_deref() == Some("You are a Hunter") {
+            reply.stdout = reply.stdout.replace(
+                r#""gaps": ["#,
+                r#""cleared": [{"claim": "decode trusts the length prefix", "guard": "src/parse.rs:7", "reason": "the length is capped first"}],
+  "gaps": ["#,
+            );
+        }
+    }
+    run_with(cfg, Arc::new(MockRunner::new(replies.clone())))
+        .await
+        .unwrap();
+    let ruled_out: Vec<Value> = read_jsonl(&out.join("ruled-out.jsonl"));
+    assert_eq!(ruled_out.len(), 1);
+    assert_eq!(ruled_out[0]["commit"], audited);
+
+    // Run 2: another file changes, so the claim still holds.
+    std::fs::write(target.join("README"), "docs").unwrap();
+    commit_all(&target, "docs");
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let runner = Arc::new(MockRunner::new(replies.clone()));
+    run_with(cfg, runner.clone()).await.unwrap();
+    let seen = snapshot(&runner);
+    let hunter = seen
+        .iter()
+        .find(|p| p.contains("You are a Hunter"))
+        .unwrap();
+    assert!(hunter.contains(
+        "- decode trusts the length prefix (`src/parse.rs:7`): the length is capped first"
+    ));
+
+    // Run 3: the settling file changes, so the claim is reopened.
+    std::fs::write(target.join("src/parse.rs"), "// rewritten\n".repeat(50)).unwrap();
+    commit_all(&target, "rewrite");
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let runner = Arc::new(MockRunner::new(replies));
+    run_with(cfg, runner.clone()).await.unwrap();
+    let seen = snapshot(&runner);
+    let hunter = seen
+        .iter()
+        .find(|p| p.contains("You are a Hunter"))
+        .unwrap();
+    assert!(!hunter.contains("decode trusts the length prefix"));
+}

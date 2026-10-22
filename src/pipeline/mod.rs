@@ -11,6 +11,7 @@ mod loc;
 mod prompt;
 mod recon;
 mod report;
+mod ruled_out;
 mod run_meta;
 mod salvage;
 mod similarity;

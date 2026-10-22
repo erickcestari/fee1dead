@@ -12,13 +12,13 @@ findings. The orchestrator never hunts bugs itself.
 | Stage | What it does |
 |-------|--------------|
 | `recon` | Reads the repo and writes a threat model (`recon.json`). Its `hunt_tasks` become the queue. Leads from past runs must pass the same bar. |
-| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports closest to its task, so it skips known bugs. Emits findings with a traced data path, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. A cited `file:line` the target lacks gets a repair turn. Incremental: only unhunted tasks run. |
+| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports and 15 [ruled-out claims](#cross-run-memory) closest to its task, so it skips known bugs and settled claims. Emits findings with a traced data path, the hypotheses it disproved, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. A cited `file:line` the target lacks gets a repair turn. Incremental: only unhunted tasks run. |
 | `gapfill` | Re-queues areas hunters flagged as under-covered. Run `hunt` again after it. |
 | `dedupe` | Collapses findings with one root cause (same file, and the same root-cause line, the same sink, or a similar title under the same attack class). The most severe survives; the rest go to `duplicates.jsonl`. |
 | `skip-reported` | Drops candidates the sink already holds (filed GitHub issues) before validate spends tokens on them. Token overlap settles clear cases; cheap judges take the ambiguous ones concurrently (`run.concurrency`) and fail open. |
 | `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file, check each hop of the hunter's trace, re-run its PoC when there is one, and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
 | `report` | Writes every finding but `likely_false_positive` to the sink, with its verdict. |
-| `feedback` | Turns real bugs (as variant hunts) and gaps no follow-up hunt covered into `feedback-seeds.jsonl` for the next run's recon. |
+| `feedback` | Turns real bugs (as variant hunts) and gaps no follow-up hunt covered into `feedback-seeds.jsonl` for the next run's recon, and updates the [cross-run memory](#cross-run-memory). |
 | `aggregate` | Compiles everything into one reviewable `findings.json`, most severe first and likely false positives last. |
 
 Stages run in the order of `stages.enabled` and talk only through files in
@@ -28,8 +28,8 @@ times out, gets one repair turn in its own session.
 
 ## Runs
 
-- A run that starts with recon clears the previous run's artifacts except
-  `feedback-seeds.jsonl`. Reuse the same `out_dir` to keep that memory.
+- A run that starts with recon clears the previous run's artifacts except the
+  [cross-run memory](#cross-run-memory). Reuse the same `out_dir` to keep it.
 - A failed stage is logged and the rest still run; the exit code is non-zero.
 - `fee1dead run --resume` continues after a usage limit or crash: it skips
   recon, keeps every artifact, and hunts what is left.
@@ -44,6 +44,15 @@ Each agent's raw event stream is teed live to `out_dir/logs/<stage>-<label>.json
 so it survives a timeout, and its answer lands beside it as
 `<stage>-<label>.output.json`. `findings.json` sums their cost and token usage
 per stage under `summary.cost`.
+
+### Cross-run memory
+
+Feedback writes two files that survive the next run's reset:
+
+| File | Read by | Holds |
+|------|---------|-------|
+| `feedback-seeds.jsonl` | recon, as leads | variant hunts around real bugs, and unfinished gaps |
+| `ruled-out.jsonl` | hunters | claims a hunter disproved or a reviewer judged a likely false positive, each with the code that settled it; dropped once that file changes (needs a git target) |
 
 ### Wishlist
 

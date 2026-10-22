@@ -25,7 +25,7 @@ defect, if real, lives there, then widen within scope. Hunt, don't re-orient. Th
 hypothesis is a lead: confirm or disprove it from the code and report what you
 actually found.
 
-{filed}{poc_intro}Invoke the suggested skills when they fit (e.g.
+{precedents}{poc_intro}Invoke the suggested skills when they fit (e.g.
 `/constant-time-analysis`, `/sharp-edges`); otherwise analyze manually. For a
 `spec-to-code-compliance` task, check the code against the cited spec clause and
 report where it deviates.
@@ -110,6 +110,7 @@ Hunt progress:
 - [ ] Set confidence from reachability and severity from the scale; keep
       every traced defect
 - [ ] For each high or critical bug, grep the scope for variants
+- [ ] Record each hypothesis you disproved in code (cleared)
 - [ ] Note areas you touched but could not fully cover (gaps)
 ```
 
@@ -135,6 +136,9 @@ and no prose around it. Shape:
       "attack_scenario": "the exploit as the attacker runs it: actors, numbered steps, then what it needs and risks",
       "poc_path": "relative/path/in/scratch"
     }
+  ],
+  "cleared": [
+    {"claim": "a suspected defect you disproved", "guard": "path/to/file.ext:LINE", "reason": "what that code does that rules it out"}
   ],
   "gaps": [
     {"area": "file or function touched but not fully covered", "attack_class": "the bug class worth a follow-up pass there", "reason": "why it was left uncovered"}
@@ -164,7 +168,14 @@ variants (the attacker playing several roles, an honest party triggering it by
 accident).
 
 `poc_path` is optional. `confidence` is in [0,1]: how sure you are the bug is
-real and reachable (latent or guarded means low). Each gap becomes a follow-up
+real and reachable (latent or guarded means low).
+
+`cleared` lists each hypothesis you disproved in code, the task's own and any
+other you settled on the way, with the `guard` that rules it out. Later runs
+skip a cleared claim until its guard's file changes, so list only what code
+settles, never what you merely did not find; up to 5.
+
+Each gap becomes a follow-up
 hunter whose only brief is your `area`, `attack_class`, and `reason`. Emit up to
 5, one per area you traced far enough to name a specific bug class worth a
 dedicated pass, whether or not you could confirm it. Do not pad with areas you

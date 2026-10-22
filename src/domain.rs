@@ -285,6 +285,22 @@ fn overlaps(scope: &str, area: &str) -> bool {
     !area.is_empty() && (area.starts_with(scope) || scope.starts_with(area))
 }
 
+/// A suspected defect that code settled as not a bug: a hunter's disproved
+/// hypothesis or a reviewer's likely false positive. Kept across runs, so later
+/// hunters skip it while the file that settled it is unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuledOut {
+    pub claim: String,
+    /// `path/to/file.rs:120`: the code that settled it.
+    pub location: String,
+    /// Why that code rules the claim out.
+    #[serde(default)]
+    pub reason: String,
+    /// The target commit it was settled at; a change to `location`'s file
+    /// since reopens it.
+    pub commit: String,
+}
+
 /// Something an agent needed but the sandbox lacks, recorded so the agent
 /// carries on instead of stalling. The agents' channel back to the operator,
 /// who grants wishes between runs.

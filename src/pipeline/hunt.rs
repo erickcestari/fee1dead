@@ -1,5 +1,6 @@
 //! Hunt stage: one hunter per queued task, concurrently, each in its own
-//! scratch dir, emitting candidate findings, gap markers, and wishes.
+//! scratch dir, emitting candidate findings, the hypotheses it cleared, gap
+//! markers, and wishes.
 //!
 //! Incremental: tasks already in `hunted.jsonl` are skipped and results are
 //! appended, so a gapfill re-queue or `--resume` only hunts what is new.
@@ -16,16 +17,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use super::ruled_out::{self, RawCleared};
 use super::salvage::run_parsed;
 use super::similarity::{jaccard, report_signature, tokenize};
 use super::wishlist::{self, RawWish};
 use super::{StageCtx, citation, prompt};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
-use crate::domain::{Finding, GapMarker, Severity, Task, TraceStep, default_confidence};
+use crate::domain::{Finding, GapMarker, RuledOut, Severity, Task, TraceStep, default_confidence};
 use crate::json_block;
 use crate::provider::{ResumeSession, is_usage_limited};
 use crate::store::{ExistingReport, build_sink};
+use crate::target::head_commit;
 
 const PROMPT: &str = include_str!("../../prompts/hunt.md");
 
@@ -36,6 +39,14 @@ const FILED_SHOWN: usize = 30;
 const FILED_INTRO: &str = "Already filed, so do not report these again or a variant with the \
      same root cause and fix. A different defect in the same code is still new; spend your \
      effort there:";
+
+/// Ruled-out claims each hunter sees. Fewer than filed reports: each carries
+/// its reason.
+const RULED_OUT_SHOWN: usize = 15;
+
+const RULED_OUT_INTRO: &str = "Ruled out by earlier runs, on code unchanged since; each names \
+     the code that settled it. Do not report one again unless you show that code does not \
+     hold:";
 
 /// What a forked hunter gets instead of recon's report, which is already in
 /// its session. Recon's pass is shallow, so it is steered back at the code.
@@ -50,6 +61,8 @@ struct HunterOutput {
     #[serde(default)]
     findings: Vec<RawFinding>,
     #[serde(default)]
+    cleared: Vec<RawCleared>,
+    #[serde(default)]
     gaps: Vec<RawGap>,
     #[serde(default)]
     wishes: Vec<RawWish>,
@@ -58,9 +71,10 @@ struct HunterOutput {
 impl HunterOutput {
     /// Every `file:line` the answer stakes a claim on.
     fn cited(&self) -> impl Iterator<Item = &str> {
-        self.findings.iter().flat_map(|f| {
+        let findings = self.findings.iter().flat_map(|f| {
             std::iter::once(f.location.as_str()).chain(f.trace.iter().map(|s| s.location.as_str()))
-        })
+        });
+        findings.chain(self.cleared.iter().map(|c| c.guard.as_str()))
     }
 }
 
@@ -100,7 +114,14 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .context("the run has no id")?;
     let recon_session = recon_session(ctx);
     let target = ctx.config.run.target_dir.clone();
-    let prompt = HuntPrompt::new(ctx, recon_session.is_some(), filed_reports(ctx));
+    // Without a commit, a cleared claim could never be checked for change.
+    let head = head_commit(&target);
+    let prompt = HuntPrompt::new(
+        ctx,
+        recon_session.is_some(),
+        filed_reports(ctx),
+        ruled_out_claims(ctx, head.as_deref())?,
+    );
 
     let slots = Arc::new(Semaphore::new(ctx.config.run.concurrency));
     let stagger = Duration::from_millis(ctx.config.run.hunter_stagger_ms);
@@ -127,7 +148,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
                     break slot.expect("hunt semaphore is never closed");
                 }
                 Some(done) = running.join_next() => {
-                    record(&ctx.artifacts, &run_id, done.context("hunter task panicked")?, &mut tally)?;
+                    let done = done.context("hunter task panicked")?;
+                    record(&ctx.artifacts, &run_id, head.as_deref(), done, &mut tally)?;
                     if limited.load(Ordering::Relaxed) {
                         break 'spawn;
                     }
@@ -166,12 +188,8 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         spawned += 1;
     }
     while let Some(done) = running.join_next().await {
-        record(
-            &ctx.artifacts,
-            &run_id,
-            done.context("hunter task panicked")?,
-            &mut tally,
-        )?;
+        let done = done.context("hunter task panicked")?;
+        record(&ctx.artifacts, &run_id, head.as_deref(), done, &mut tally)?;
     }
 
     let skipped = total - spawned;
@@ -234,9 +252,9 @@ fn recon_session(ctx: &StageCtx) -> Option<String> {
 /// Reports the sink already holds, so hunters skip known bugs instead of
 /// re-finding them for skip-reported to prune. Hunting goes on without them
 /// when the sink cannot list.
-fn filed_reports(ctx: &StageCtx) -> Vec<FiledReport> {
+fn filed_reports(ctx: &StageCtx) -> Vec<Precedent> {
     match build_sink(&ctx.config.report).and_then(|sink| sink.existing_reports()) {
-        Ok(existing) => existing.iter().map(FiledReport::new).collect(),
+        Ok(existing) => existing.iter().map(Precedent::filed).collect(),
         Err(e) => {
             warn!(
                 error = format!("{e:#}"),
@@ -247,14 +265,26 @@ fn filed_reports(ctx: &StageCtx) -> Vec<FiledReport> {
     }
 }
 
-/// A filed report as a hunter sees it, with the tokens it is ranked by.
-struct FiledReport {
+/// Claims earlier runs ruled out on code unchanged since `head`; none for a
+/// target that is no git checkout.
+fn ruled_out_claims(ctx: &StageCtx, head: Option<&str>) -> Result<Vec<Precedent>> {
+    let Some(head) = head else {
+        return Ok(Vec::new());
+    };
+    let entries: Vec<RuledOut> = ctx.artifacts.read_jsonl(names::RULED_OUT)?;
+    let holding = ruled_out::holding(entries, &ctx.config.run.target_dir, head);
+    Ok(holding.iter().map(Precedent::ruled_out).collect())
+}
+
+/// A past record as a hunter sees it (a filed report, a ruled-out claim),
+/// with the tokens it is ranked by.
+struct Precedent {
     line: String,
     tokens: HashSet<String>,
 }
 
-impl FiledReport {
-    fn new(e: &ExistingReport) -> Self {
+impl Precedent {
+    fn filed(e: &ExistingReport) -> Self {
         let line = if e.location.is_empty() {
             format!("- {}", e.title)
         } else {
@@ -265,11 +295,22 @@ impl FiledReport {
             tokens: tokenize(&report_signature(e)),
         }
     }
+
+    fn ruled_out(r: &RuledOut) -> Self {
+        let mut line = format!("- {} (`{}`)", r.claim, r.location);
+        if !r.reason.is_empty() {
+            line = format!("{line}: {}", r.reason);
+        }
+        Self {
+            line,
+            tokens: tokenize(&format!("{} {}", r.claim, r.location)),
+        }
+    }
 }
 
-/// The filed reports closest to `task`, most similar first; empty when none
-/// overlap it.
-fn filed_block(task: &Task, filed: &[FiledReport]) -> String {
+/// Under `intro`, the `cap` precedents closest to `task`, most similar first;
+/// empty when none overlap it.
+fn closest_block(task: &Task, precedents: &[Precedent], cap: usize, intro: &str) -> String {
     let task_tokens = tokenize(&format!(
         "{} {} {} {}",
         task.attack_class,
@@ -277,7 +318,7 @@ fn filed_block(task: &Task, filed: &[FiledReport]) -> String {
         scope_line(task),
         task.targets.join(" ")
     ));
-    let mut ranked: Vec<(f64, &str)> = filed
+    let mut ranked: Vec<(f64, &str)> = precedents
         .iter()
         .map(|r| (jaccard(&task_tokens, &r.tokens), r.line.as_str()))
         .filter(|&(score, _)| score > 0.0)
@@ -286,12 +327,8 @@ fn filed_block(task: &Task, filed: &[FiledReport]) -> String {
         return String::new();
     }
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let lines: Vec<&str> = ranked
-        .into_iter()
-        .take(FILED_SHOWN)
-        .map(|(_, line)| line)
-        .collect();
-    format!("{FILED_INTRO}\n{}\n\n", lines.join("\n"))
+    let lines: Vec<&str> = ranked.into_iter().take(cap).map(|(_, line)| line).collect();
+    format!("{intro}\n{}\n\n", lines.join("\n"))
 }
 
 /// The run-wide parts of a hunter prompt.
@@ -302,11 +339,12 @@ struct HuntPrompt {
     poc: PocText,
     use_skills: bool,
     suffix: String,
-    filed: Vec<FiledReport>,
+    filed: Vec<Precedent>,
+    ruled_out: Vec<Precedent>,
 }
 
 impl HuntPrompt {
-    fn new(ctx: &StageCtx, forked: bool, filed: Vec<FiledReport>) -> Self {
+    fn new(ctx: &StageCtx, forked: bool, filed: Vec<Precedent>, ruled_out: Vec<Precedent>) -> Self {
         let architecture = if forked {
             FORKED_CONTEXT.to_string()
         } else {
@@ -321,6 +359,7 @@ impl HuntPrompt {
             use_skills: ctx.config.run.use_skills,
             suffix: prompt::reference_note(&ctx.config) + prompt::skills_directive(&ctx.config),
             filed,
+            ruled_out,
         }
     }
 
@@ -340,9 +379,15 @@ impl HuntPrompt {
             // After poc_intro, which may embed it.
             .replace("{scratch_dir}", &scratch_dir.to_string_lossy())
             .replace("{architecture}", &self.architecture)
-            // Last, so no placeholder in a filed title is ever substituted.
-            .replace("{filed}", &filed_block(task, &self.filed))
+            // Last, so no placeholder in a filed title or claim is ever substituted.
+            .replace("{precedents}", &self.precedents(task))
             + &self.suffix
+    }
+
+    /// The filed reports and ruled-out claims closest to `task`.
+    fn precedents(&self, task: &Task) -> String {
+        closest_block(task, &self.filed, FILED_SHOWN, FILED_INTRO)
+            + &closest_block(task, &self.ruled_out, RULED_OUT_SHOWN, RULED_OUT_INTRO)
     }
 }
 
@@ -435,10 +480,17 @@ struct Tally {
     wishes: usize,
 }
 
-/// Persist one hunter's findings (PoCs copied out of scratch), gaps, and
-/// wishes, then its ledger entry. A failed hunter is not marked, so the next
-/// pass retries it.
-fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally) -> Result<()> {
+/// Persist one hunter's findings (PoCs copied out of scratch), cleared
+/// hypotheses (stamped with the `head` commit, if any), gaps, and wishes,
+/// then its ledger entry. A failed hunter is not marked, so the next pass
+/// retries it.
+fn record(
+    artifacts: &Artifacts,
+    run_id: &str,
+    head: Option<&str>,
+    done: Finished,
+    tally: &mut Tally,
+) -> Result<()> {
     let Finished {
         task,
         scratch_dir,
@@ -478,6 +530,15 @@ fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally
         };
         artifacts.append_jsonl(names::CANDIDATES, &finding)?;
         tally.findings += 1;
+    }
+    if let Some(head) = head {
+        for entry in output
+            .cleared
+            .into_iter()
+            .filter_map(|c| c.into_ruled_out(head))
+        {
+            artifacts.append_jsonl(names::CLEARED, &entry)?;
+        }
     }
     for g in output.gaps {
         let marker = GapMarker {
@@ -618,14 +679,18 @@ mod tests {
         assert_eq!(scope_line(&t), "lnwallet/, htlcswitch/");
     }
 
-    fn filed(title: &str, location: &str) -> FiledReport {
-        FiledReport::new(&ExistingReport {
+    fn filed(title: &str, location: &str) -> Precedent {
+        Precedent::filed(&ExistingReport {
             id: String::new(),
             title: title.into(),
             location: location.into(),
             attack_class: String::new(),
             text: String::new(),
         })
+    }
+
+    fn filed_block(task: &Task, filed: &[Precedent]) -> String {
+        closest_block(task, filed, FILED_SHOWN, FILED_INTRO)
     }
 
     #[test]
@@ -643,6 +708,7 @@ mod tests {
                 filed("HTLC dust overflow in lnwallet", "lnwallet/channel.go:9"),
             ],
         );
+        assert!(block.starts_with(FILED_INTRO));
         let closest = block.find("- HTLC dust overflow in lnwallet (`lnwallet/channel.go:9`)");
         let next = block.find("- Dust limit check");
         assert!(closest.unwrap() < next.unwrap(), "{block}");
@@ -656,7 +722,7 @@ mod tests {
             hypothesis: "dust".into(),
             ..fixtures::task("T-0001")
         };
-        let many: Vec<FiledReport> = (0..FILED_SHOWN + 5)
+        let many: Vec<Precedent> = (0..FILED_SHOWN + 5)
             .map(|i| filed(&format!("dust bug {i}"), ""))
             .collect();
         let block = filed_block(&t, &many);
@@ -667,13 +733,45 @@ mod tests {
     }
 
     #[test]
-    fn cited_covers_findings_and_their_traces() {
+    fn ruled_out_claims_show_their_settling_code_and_reason() {
+        let entry = |reason: &str| RuledOut {
+            claim: "dust sum overflows".into(),
+            location: "lnwallet/channel.go:88".into(),
+            reason: reason.into(),
+            commit: "c1".into(),
+        };
+        let t = Task {
+            hypothesis: "dust overflow".into(),
+            ..fixtures::task("T-0001")
+        };
+        let block = closest_block(
+            &t,
+            &[Precedent::ruled_out(&entry("capped by maxDust"))],
+            RULED_OUT_SHOWN,
+            RULED_OUT_INTRO,
+        );
+        assert!(block.starts_with(RULED_OUT_INTRO));
+        assert!(
+            block.contains("- dust sum overflows (`lnwallet/channel.go:88`): capped by maxDust")
+        );
+        assert_eq!(
+            Precedent::ruled_out(&entry("")).line,
+            "- dust sum overflows (`lnwallet/channel.go:88`)"
+        );
+    }
+
+    #[test]
+    fn cited_covers_findings_their_traces_and_cleared_guards() {
         let out: HunterOutput = serde_json::from_str(
             r#"{"findings": [{"title": "t", "severity": "high", "location": "a.go:1",
-                "description": "d", "trace": [{"kind": "sink", "location": "b.go:2"}]}]}"#,
+                "description": "d", "trace": [{"kind": "sink", "location": "b.go:2"}]}],
+                "cleared": [{"claim": "c", "guard": "c.go:3"}]}"#,
         )
         .unwrap();
-        assert_eq!(out.cited().collect::<Vec<_>>(), ["a.go:1", "b.go:2"]);
+        assert_eq!(
+            out.cited().collect::<Vec<_>>(),
+            ["a.go:1", "b.go:2", "c.go:3"]
+        );
     }
 
     #[test]
@@ -685,13 +783,14 @@ mod tests {
             use_skills: false,
             suffix: String::new(),
             filed: Vec::new(),
+            ruled_out: Vec::new(),
         };
         let t = task("dust overflow", &[], &[]);
-        assert!(!p.render(&t, Path::new("/s")).contains("{filed}"));
+        assert!(!p.render(&t, Path::new("/s")).contains("{precedents}"));
         p.filed = vec![filed("Dust overflow", "a.go:1")];
         let rendered = p.render(&t, Path::new("/s"));
         assert!(rendered.contains("- Dust overflow (`a.go:1`)"));
-        assert!(!rendered.contains("{filed}"));
+        assert!(!rendered.contains("{precedents}"));
     }
 
     #[test]
@@ -703,6 +802,7 @@ mod tests {
             use_skills: false,
             suffix: String::new(),
             filed: Vec::new(),
+            ruled_out: Vec::new(),
         };
         let rendered = p.render(&task("dust overflow", &[], &[]), Path::new("/s"));
         assert!(rendered.contains(prompt::severity_scale()));
@@ -720,6 +820,7 @@ mod tests {
             use_skills: true,
             suffix: String::new(),
             filed: vec![filed("Dust overflow", "a.go:1")],
+            ruled_out: Vec::new(),
         };
         let a = p.render(
             &task("overflow", &["a.go:1"], &["sharp-edges"]),

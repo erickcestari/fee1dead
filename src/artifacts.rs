@@ -28,8 +28,12 @@ pub mod names {
     pub const FINDINGS_JSONL: &str = "findings.jsonl";
     /// Task ids Hunt has processed, so hunting is incremental.
     pub const HUNTED: &str = "hunted.jsonl";
+    /// Hypotheses hunters disproved this run, each with the code that did.
+    pub const CLEARED: &str = "cleared.jsonl";
     /// Cross-run feedback memory; never reset.
     pub const SEEDS: &str = "feedback-seeds.jsonl";
+    /// Cross-run memory of claims code settled as not bugs; never reset.
+    pub const RULED_OUT: &str = "ruled-out.jsonl";
     /// Recon's session id, for hunters to fork. One line of text.
     pub const RECON_SESSION: &str = "recon-session.txt";
     /// Prefixed to finding ids, which would otherwise repeat across runs.
@@ -47,6 +51,7 @@ pub mod names {
         QUEUE,
         CANDIDATES,
         GAPS,
+        CLEARED,
         DUPLICATES,
         WISHLIST,
         VALIDATED,
@@ -283,15 +288,18 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_the_run_but_keeps_the_seeds() {
+    fn reset_clears_the_run_but_keeps_the_cross_run_memory() {
         let (_dir, art) = artifacts();
-        art.write_text(names::QUEUE, "{}").unwrap();
-        art.write_text(names::SEEDS, "{}").unwrap();
+        let durable = [names::SEEDS, names::RULED_OUT];
+        for name in durable.iter().chain(&[names::QUEUE, names::CLEARED]) {
+            art.write_text(name, "{}").unwrap();
+        }
         std::fs::create_dir_all(art.log_path("x").parent().unwrap()).unwrap();
         art.reset_run().unwrap();
         assert!(!art.exists(names::QUEUE));
+        assert!(!art.exists(names::CLEARED));
         assert!(!art.exists(names::LOGS));
-        assert!(art.exists(names::SEEDS));
+        assert!(durable.iter().all(|name| art.exists(name)));
     }
 
     #[test]

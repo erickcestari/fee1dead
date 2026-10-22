@@ -41,7 +41,9 @@ schema-validated findings. See `README.md` for the user-facing overview.
   lacks (`wishlist.jsonl`), the agents' channel back to the operator.
   `feedback.rs` is a cross-run memory (no consumer repos): it writes durable
   seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
-  leads (and consumes). `citation.rs` checks that every `file:line` a hunter
+  leads (and consumes); it also keeps `ruled-out.jsonl` (`ruled_out.rs`:
+  claims code settled, shown to hunters until the settling file changes).
+  `citation.rs` checks that every `file:line` a hunter
   cites exists, so a bad one gets a repair turn. `salvage.rs` gives an agent
   whose answer does not parse, or that timed out, one repair turn in its own
   session. Add a stage:
@@ -61,13 +63,13 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `run_setup` (the `setup` subcommand) runs `[target].setup`; the container
   entrypoint calls it as root before the firewall.
 - `src/domain.rs` — the inter-stage data contract (`Task`, `Finding`,
-  `Validation`, `GapMarker`, `Wish`, `Severity`). Change here ripples to
+  `Validation`, `GapMarker`, `RuledOut`, `Wish`, `Severity`). Change here ripples to
   artifacts.
 - `src/artifacts.rs` — JSON/JSONL stage IO. **Stages communicate ONLY through
   artifacts** in `out_dir` (`queue.jsonl`, `candidates.jsonl`, `gaps.jsonl`,
-  `duplicates.jsonl`, `wishlist.jsonl`, `validated.jsonl`, `findings.json`,
-  `hunted.jsonl`, `recon.json`, `run-id.txt`, `run-meta.json`, plus the `logs/` and `pocs/`
-  dirs), never by calling each other. Keep it that way: it is what makes stages
+  `cleared.jsonl`, `duplicates.jsonl`, `wishlist.jsonl`, `validated.jsonl`,
+  `findings.json`, `hunted.jsonl`, `recon.json`, `run-id.txt`, `run-meta.json`,
+  plus the `logs/` and `pocs/` dirs), never by calling each other. Keep it that way: it is what makes stages
   decoupled and runs resumable. `aggregate.rs` joins the hunters' raw output
   into the single reviewable `findings.json` with no agent call, and is also
   exposed as the `fee1dead aggregate` subcommand for compiling a partial run
@@ -91,9 +93,9 @@ schema-validated findings. See `README.md` for the user-facing overview.
   ids in `hunted.jsonl`. Never truncate `candidates.jsonl`/`gaps.jsonl` from a
   stage that can run more than once.
 - A recon-led run resets per-run artifacts (`artifacts::names::PER_RUN`) at
-  startup; `feedback-seeds.jsonl` (`SEEDS`) is deliberately excluded so the
-  cross-run memory persists. If you add a durable artifact, keep it out of
-  `PER_RUN`. `run --resume` skips recon and resets nothing.
+  startup; `feedback-seeds.jsonl` and `ruled-out.jsonl` are deliberately
+  excluded so the cross-run memory persists. If you add a durable artifact,
+  keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
 - Every agent gets its own `output_dir` (a scratch dir) for its answer file;
   never share one between agents, or one can read another's answer.
 - The container is the security boundary. The agent runs

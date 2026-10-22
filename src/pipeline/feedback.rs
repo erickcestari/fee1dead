@@ -1,16 +1,18 @@
-//! Feedback stage: distil this run into seed tasks for the next one: variant
-//! hunts around real bugs, and the gaps hunters left that no follow-up hunt
-//! covered. The next recon reads them as leads. Deduped and capped at
-//! `feedback.max_seeds`, newest first.
+//! Feedback stage: distil this run into memory for the next one. Seed tasks
+//! (variant hunts around real bugs, and the gaps hunters left that no
+//! follow-up hunt covered) reach the next recon as leads, deduped and capped
+//! at `feedback.max_seeds`, newest first. Claims code settled as not bugs
+//! reach the next hunters.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use tracing::info;
 
-use super::StageCtx;
+use super::{StageCtx, ruled_out};
 use crate::artifacts::names;
-use crate::domain::{Finding, GapMarker, Priority, Task, TaskOrigin, Validation};
+use crate::domain::{Finding, GapMarker, Priority, RuledOut, Task, TaskOrigin, Validation};
+use crate::target::head_commit;
 
 pub fn run(ctx: &StageCtx) -> Result<()> {
     let candidates: Vec<Finding> = ctx.artifacts.read_jsonl(names::CANDIDATES)?;
@@ -40,7 +42,32 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
     );
 
     info!(seeds = merged.len(), "feedback updated cross-run memory");
-    ctx.artifacts.write_jsonl(names::SEEDS, &merged)
+    ctx.artifacts.write_jsonl(names::SEEDS, &merged)?;
+    remember_ruled_out(ctx, &candidates, &validations)
+}
+
+/// Fold this run's cleared hypotheses and likely false positives into the
+/// ruled-out memory, ahead of earlier entries; any whose file changed since
+/// it was settled is dropped.
+fn remember_ruled_out(
+    ctx: &StageCtx,
+    candidates: &[Finding],
+    validations: &[Validation],
+) -> Result<()> {
+    let target = &ctx.config.run.target_dir;
+    let Some(head) = head_commit(target) else {
+        info!("the target is no git checkout; nothing is remembered as ruled out");
+        return Ok(());
+    };
+    let mut entries: Vec<RuledOut> = ctx.artifacts.read_jsonl(names::CLEARED)?;
+    entries.extend(ruled_out::false_positives(candidates, validations, &head));
+    entries.extend(ctx.artifacts.read_jsonl::<RuledOut>(names::RULED_OUT)?);
+    let kept = ruled_out::dedupe_and_cap(
+        ruled_out::holding(entries, target, &head),
+        ctx.config.feedback.max_ruled_out,
+    );
+    info!(entries = kept.len(), "feedback updated ruled-out memory");
+    ctx.artifacts.write_jsonl(names::RULED_OUT, &kept)
 }
 
 /// Gaps no hunted gapfill task covers. The task a gap came from does not
