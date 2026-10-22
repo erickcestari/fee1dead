@@ -82,8 +82,12 @@ pub struct Finding {
     pub title: String,
     pub attack_class: String,
     pub severity: Severity,
-    /// `path/to/file.rs:120`.
+    /// The root cause as `path/to/file.rs:120`: the line a fix changes.
     pub location: String,
+    /// The data path from the attacker's input to the damage. Empty for a
+    /// finding from before hunters traced one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace: Vec<TraceStep>,
     pub description: String,
     /// How an attacker runs the exploit: the actors, the steps, and what the
     /// attack needs and risks. Empty when the hunter gave none.
@@ -105,11 +109,58 @@ pub(crate) fn default_confidence() -> f64 {
 impl Finding {
     /// The file of [`Finding::location`], line stripped.
     pub fn file(&self) -> &str {
-        self.location
-            .rsplit_once(':')
-            .map_or(self.location.as_str(), |(file, _line)| file)
-            .trim()
+        split_location(&self.location).0
     }
+
+    /// Where the trace ends in damage, if the hunter traced one.
+    pub fn sink(&self) -> Option<&str> {
+        self.trace
+            .iter()
+            .rev()
+            .find(|s| s.kind == TraceKind::Sink)
+            .map(|s| s.location.as_str())
+    }
+}
+
+/// `path:line` into its path and line. Splits at the first colon, so a
+/// trailing `:column` or `:Func` never ends up in the path; the line is the
+/// leading digits after it (`120` of `120-130`), `None` when there are none.
+pub fn split_location(location: &str) -> (&str, Option<usize>) {
+    let Some((file, rest)) = location.trim().split_once(':') else {
+        return (location.trim(), None);
+    };
+    let digits = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    (file.trim(), rest[..digits].parse().ok())
+}
+
+/// One hop of a finding's data path, as the hunter traced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceStep {
+    #[serde(default)]
+    pub kind: TraceKind,
+    /// `path/to/file.rs:120`, absolute for code outside the target.
+    pub location: String,
+    /// What the code does with the attacker's value here.
+    #[serde(default)]
+    pub what: String,
+    /// Inferred rather than read in code, so a reviewer checks it first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceKind {
+    /// Where the attacker's input enters.
+    Entrypoint,
+    /// Where the value does damage.
+    Sink,
+    /// Also any kind an agent made up, so one odd label never voids its answer.
+    #[default]
+    #[serde(other)]
+    Propagation,
 }
 
 /// A finding Dedupe collapsed into another with the same root cause. Kept so a
@@ -294,6 +345,7 @@ pub(crate) mod fixtures {
             attack_class: "c".into(),
             severity: Severity::High,
             location: "a.rs:1".into(),
+            trace: Vec::new(),
             description: "d".into(),
             attack_scenario: String::new(),
             confidence: default_confidence(),
@@ -408,6 +460,34 @@ mod tests {
         assert_eq!(f.file(), "src/a.rs");
         f.location = "src/a.rs".into();
         assert_eq!(f.file(), "src/a.rs");
+        f.location = "src/a.rs:12:5".into();
+        assert_eq!(f.file(), "src/a.rs");
+    }
+
+    #[test]
+    fn split_location_reads_the_leading_line_number() {
+        assert_eq!(split_location("a.go:120"), ("a.go", Some(120)));
+        assert_eq!(split_location(" a.go:120-130 "), ("a.go", Some(120)));
+        assert_eq!(split_location("a.go:12:5"), ("a.go", Some(12)));
+        assert_eq!(split_location("a.go:Decode"), ("a.go", None));
+        assert_eq!(split_location("a.go"), ("a.go", None));
+    }
+
+    #[test]
+    fn the_sink_is_the_last_sink_step_and_odd_kinds_read_as_propagation() {
+        let trace: Vec<TraceStep> = serde_json::from_str(
+            r#"[{"kind": "entrypoint", "location": "a.go:1"},
+                {"kind": "hop", "location": "a.go:5"},
+                {"kind": "sink", "location": "b.go:9"}]"#,
+        )
+        .unwrap();
+        assert_eq!(trace[1].kind, TraceKind::Propagation);
+        let f = Finding {
+            trace,
+            ..fixtures::finding("F")
+        };
+        assert_eq!(f.sink(), Some("b.go:9"));
+        assert_eq!(fixtures::finding("F").sink(), None);
     }
 
     #[test]

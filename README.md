@@ -12,11 +12,11 @@ findings. The orchestrator never hunts bugs itself.
 | Stage | What it does |
 |-------|--------------|
 | `recon` | Reads the repo and writes a threat model (`recon.json`). Its `hunt_tasks` become the queue. Leads from past runs must pass the same bar. |
-| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports closest to its task, so it skips known bugs. Emits findings, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. Incremental: only unhunted tasks run. |
+| `hunt` | One agent per task (attack class, scope, falsifiable hypothesis, start points), run concurrently in priority order. Hunters fork recon's session to reuse its context (`run.fork_hunters`). Each sees the 30 filed reports closest to its task, so it skips known bugs. Emits findings with a traced data path, gaps, and [wishes](#wishlist); PoC sources are copied to `pocs/<finding id>/`. Incremental: only unhunted tasks run. |
 | `gapfill` | Re-queues areas hunters flagged as under-covered. Run `hunt` again after it. |
-| `dedupe` | Collapses findings with one root cause (same file and attack class, and the same line or a similar title). The most severe survives; the rest go to `duplicates.jsonl`. |
+| `dedupe` | Collapses findings with one root cause (same file, and the same root-cause line, the same sink, or a similar title under the same attack class). The most severe survives; the rest go to `duplicates.jsonl`. |
 | `skip-reported` | Drops candidates the sink already holds (filed GitHub issues) before validate spends tokens on them. Token overlap settles clear cases; cheap judges take the ambiguous ones concurrently (`run.concurrency`) and fail open. |
-| `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
+| `validate` | Reviewers re-read the code in batches of up to 8 findings grouped by file, check each hop of the hunter's trace, and tag each `confirmed`, `downgraded`, `likely_false_positive`, or `needs_review`, writing its impact and recommendation. Nothing is dropped. |
 | `report` | Writes every finding but `likely_false_positive` to the sink, with its verdict. |
 | `feedback` | Turns real bugs (as variant hunts) and gaps no follow-up hunt covered into `feedback-seeds.jsonl` for the next run's recon. |
 | `aggregate` | Compiles everything into one reviewable `findings.json`, most severe first and likely false positives last. |

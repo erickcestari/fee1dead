@@ -209,6 +209,7 @@ fn issue_payload(id: &str, finding: &Value) -> Value {
     }
     section("Attack class", get("attack_class"));
     section("Description", get("description"));
+    section("Trace", get("trace"));
     section("Attack scenario", get("attack_scenario"));
     section("Impact", get("impact"));
     section("Recommendation", get("recommendation"));
@@ -246,6 +247,7 @@ mod tests {
             "location": "src/net.rs:42",
             "commit": "abc123",
             "description": "length is added without a bounds check",
+            "trace": "1. sink `src/net.rs:42`: the length sizes an allocation",
             "attack_scenario": "1. Mallory sends a frame with a huge length.",
             "impact": "attacker crashes the node",
             "recommendation": "validate length before alloc",
@@ -261,6 +263,7 @@ mod tests {
         assert!(body.contains("## Impact"));
         assert!(body.contains("attacker crashes the node"));
         assert!(body.contains("## Attack scenario\n\n1. Mallory sends"));
+        assert!(body.contains("## Trace\n\n1. sink `src/net.rs:42`"));
         assert!(body.contains("## Commit\n\n`abc123`"));
         assert!(body.contains(&marker("F-1")));
     }

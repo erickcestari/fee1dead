@@ -1,9 +1,11 @@
 //! Dedupe stage: collapse findings that share a root cause into one record.
 //!
-//! Same root cause means same file and attack class, AND the same location or
-//! a restated title. File and class alone are too coarse: a finding inherits
-//! its hunter's class, so one hunter's distinct bugs in a file would collapse.
-//! The most severe survives; the rest go to `duplicates.jsonl`, never deleted.
+//! Same root cause means the same file, and the same root-cause line, or the
+//! same sink, or a restated title under the same attack class. A finding
+//! inherits its task's free-form class, so class cannot gate the line or sink
+//! match (one bug two tasks found carries two classes), but it must gate the
+//! title match (one hunter's distinct bugs in a file share a class). The most
+//! severe survives; the rest go to `duplicates.jsonl`, never deleted.
 
 use anyhow::Result;
 use tracing::info;
@@ -36,10 +38,12 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
 }
 
 fn same_root_cause(a: &Finding, b: &Finding) -> bool {
+    let same = |x: &str, y: &str| x.trim().eq_ignore_ascii_case(y.trim());
     a.file().eq_ignore_ascii_case(b.file())
-        && a.attack_class.to_lowercase() == b.attack_class.to_lowercase()
-        && (a.location.trim().eq_ignore_ascii_case(b.location.trim())
-            || jaccard(&tokenize(&a.title), &tokenize(&b.title)) >= SAME_TITLE)
+        && (same(&a.location, &b.location)
+            || a.sink().zip(b.sink()).is_some_and(|(x, y)| same(x, y))
+            || (same(&a.attack_class, &b.attack_class)
+                && jaccard(&tokenize(&a.title), &tokenize(&b.title)) >= SAME_TITLE))
 }
 
 /// One representative per cluster (most severe, first seen on ties), in
@@ -79,7 +83,7 @@ fn dedupe_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Duplicate>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Severity, fixtures};
+    use crate::domain::{Severity, TraceKind, TraceStep, fixtures};
 
     fn finding(id: &str, title: &str, location: &str, class: &str, sev: Severity) -> Finding {
         Finding {
@@ -165,11 +169,90 @@ mod tests {
         assert_eq!(dups[0].duplicate_of, "a");
     }
 
+    fn sinking_at(f: Finding, sink: &str) -> Finding {
+        let step = |kind, location: &str| TraceStep {
+            kind,
+            location: location.into(),
+            what: String::new(),
+            assumed: false,
+        };
+        Finding {
+            trace: vec![
+                step(TraceKind::Entrypoint, "src/wire.rs:3"),
+                step(TraceKind::Sink, sink),
+            ],
+            ..f
+        }
+    }
+
     #[test]
-    fn different_attack_class_not_merged() {
+    fn one_bug_two_tasks_found_collapses_despite_their_classes() {
         let input = vec![
-            finding("a", "t", "src/p.rs:10", "overflow", Severity::Low),
-            finding("b", "t", "src/p.rs:10", "path traversal", Severity::Low),
+            finding(
+                "a",
+                "Length wraps",
+                "src/p.rs:10",
+                "integer-overflow",
+                Severity::High,
+            ),
+            finding(
+                "b",
+                "Remote panic",
+                "src/p.rs:10",
+                "panic-dos",
+                Severity::Medium,
+            ),
+        ];
+        let (kept, dups) = dedupe_findings(input);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dups[0].duplicate_of, "a");
+    }
+
+    #[test]
+    fn a_shared_sink_collapses_only_within_one_file() {
+        let a = finding(
+            "a",
+            "Length wraps",
+            "src/p.rs:10",
+            "overflow",
+            Severity::High,
+        );
+        let b = finding(
+            "b",
+            "Remote panic",
+            "src/p.rs:14",
+            "panic-dos",
+            Severity::Low,
+        );
+        let c = finding("c", "Unchecked count", "src/q.rs:7", "dos", Severity::Low);
+        let input = vec![
+            sinking_at(a, "src/p.rs:20"),
+            sinking_at(b, "src/p.rs:20"),
+            sinking_at(c, "src/p.rs:20"),
+        ];
+        let (kept, dups) = dedupe_findings(input);
+        let ids: Vec<&str> = kept.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+        assert_eq!(dups[0].finding.id, "b");
+    }
+
+    #[test]
+    fn a_restated_title_under_another_class_is_kept() {
+        let input = vec![
+            finding(
+                "a",
+                "Unbounded resize in decode",
+                "src/p.rs:10",
+                "dos",
+                Severity::Low,
+            ),
+            finding(
+                "b",
+                "Unbounded resize in decode",
+                "src/p.rs:40",
+                "auth",
+                Severity::Low,
+            ),
         ];
         let (kept, dups) = dedupe_findings(input);
         assert_eq!(kept.len(), 2);

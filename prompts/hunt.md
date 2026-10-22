@@ -126,7 +126,12 @@ and no prose around it. Shape:
       "severity": "info|low|medium|high|critical",
       "confidence": 0.0,
       "location": "path/to/file.ext:LINE",
-      "description": "the bug, the data flow from source to sink, the reachability, and the impact, marking any step assumed rather than read",
+      "trace": [
+        {"kind": "entrypoint", "location": "path/to/file.ext:LINE", "what": "where the attacker's input enters"},
+        {"kind": "propagation", "location": "path/to/file.ext:LINE", "what": "what the code does with it", "assumed": true},
+        {"kind": "sink", "location": "path/to/file.ext:LINE", "what": "where it does damage"}
+      ],
+      "description": "the bug, its reachability, and its impact, in prose a maintainer can follow",
       "attack_scenario": "the exploit as the attacker runs it: actors, numbered steps, then what it needs and risks",
       "poc_path": "relative/path/in/scratch"
     }
@@ -139,6 +144,13 @@ and no prose around it. Shape:
   ]
 }
 ```
+
+`location` is the root cause: the line a fix would change, such as the missing
+or wrong check. `trace` is the data path from where the attacker's input enters
+(`entrypoint`) through each hop (`propagation`) to where it does damage
+(`sink`); set `"assumed": true` on a hop you inferred rather than read. Paths
+are relative to the target repository, except code outside it (a dependency,
+the reference), which takes an absolute path.
 
 `attack_scenario` is how an attacker exploits the bug, written so a maintainer
 can replay the attack without the code open. Name the actors and their roles

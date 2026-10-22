@@ -63,7 +63,8 @@ downgrade a rating the trace does not support.
 
 ```
 - [ ] Restate the claim; if it does not cohere, likely_false_positive
-- [ ] Trace the complete path from untrusted source to sink
+- [ ] Trace the complete path from untrusted source to sink, checking each
+      hop of the hunter's `trace` in code, first any marked `assumed`
 - [ ] Grep the chain for a guard the hunter missed (validate/verify/check/
       bounds/len/< Max). Framework guarantees count.
 - [ ] Decide reachability with a concrete, attacker-controlled input

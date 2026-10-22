@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use super::{StageCtx, run_meta};
 use crate::artifacts::names;
 use crate::config::ReportConfig;
-use crate::domain::{Finding, Validation};
+use crate::domain::{Finding, TraceStep, Validation};
 use crate::store::{JsonlSink, ReportRecord, ReportSink, build_sink};
 
 const SCHEMA_SRC: &str = include_str!("../../schema/finding.schema.json");
@@ -111,6 +111,9 @@ fn report_records(
             if !f.attack_scenario.is_empty() {
                 payload["attack_scenario"] = json!(f.attack_scenario);
             }
+            if !f.trace.is_empty() {
+                payload["trace"] = json!(trace_text(&f.trace));
+            }
             if let Some(commit) = commit {
                 payload["commit"] = json!(commit);
             }
@@ -123,6 +126,30 @@ fn report_records(
             })
         })
         .collect()
+}
+
+/// A numbered list, so an issue reads it without the JSON.
+fn trace_text(trace: &[TraceStep]) -> String {
+    trace
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let kind = serde_json::to_value(step.kind).expect("an enum always serializes");
+            let assumed = if step.assumed {
+                " (assumed, not read)"
+            } else {
+                ""
+            };
+            format!(
+                "{}. {} `{}`: {}{assumed}",
+                i + 1,
+                kind.as_str().unwrap_or_default(),
+                step.location,
+                step.what
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn or_not_assessed<'a>(text: &'a str, fallback: &'a str) -> &'a str {
@@ -163,6 +190,11 @@ mod tests {
             Finding {
                 attack_scenario: "1. Mallory sends a frame.".into(),
                 poc_path: Some("pocs/F-4/poc.go".into()),
+                trace: serde_json::from_str(
+                    r#"[{"kind": "entrypoint", "location": "wire.rs:3", "what": "frame read"},
+                        {"kind": "sink", "location": "a.rs:1", "what": "alloc", "assumed": true}]"#,
+                )
+                .unwrap(),
                 ..finding("F-4")
             },
         ];
@@ -186,7 +218,12 @@ mod tests {
         assert!(records.iter().all(|r| r.payload["commit"] == "abc123"));
         assert_eq!(p(2)["poc_path"], "pocs/F-4/poc.go");
         assert_eq!(p(2)["attack_scenario"], "1. Mallory sends a frame.");
+        assert_eq!(
+            p(2)["trace"],
+            "1. entrypoint `wire.rs:3`: frame read\n2. sink `a.rs:1`: alloc (assumed, not read)"
+        );
         assert!(p(0).get("poc_path").is_none() && p(0).get("attack_scenario").is_none());
+        assert!(p(0).get("trace").is_none());
         let schema = compile_schema().unwrap();
         assert!(
             records

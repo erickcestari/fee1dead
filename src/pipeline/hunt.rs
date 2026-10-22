@@ -22,7 +22,7 @@ use super::wishlist::{self, RawWish};
 use super::{StageCtx, prompt};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
-use crate::domain::{Finding, GapMarker, Severity, Task, default_confidence};
+use crate::domain::{Finding, GapMarker, Severity, Task, TraceStep, default_confidence};
 use crate::json_block;
 use crate::provider::{ResumeSession, is_usage_limited};
 use crate::store::{ExistingReport, build_sink};
@@ -60,6 +60,8 @@ struct RawFinding {
     title: String,
     severity: Severity,
     location: String,
+    #[serde(default)]
+    trace: Vec<TraceStep>,
     description: String,
     #[serde(default)]
     attack_scenario: String,
@@ -455,6 +457,7 @@ fn record(artifacts: &Artifacts, run_id: &str, done: Finished, tally: &mut Tally
             attack_class: task.attack_class.clone(),
             severity: rf.severity,
             location: rf.location,
+            trace: rf.trace,
             description: rf.description,
             attack_scenario: rf.attack_scenario,
             confidence: rf.confidence,

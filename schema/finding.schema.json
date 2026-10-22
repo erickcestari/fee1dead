@@ -45,6 +45,11 @@
       "type": "string",
       "minLength": 1
     },
+    "trace": {
+      "type": "string",
+      "description": "The data path from the attacker's input to the damage, one numbered step per line.",
+      "minLength": 1
+    },
     "attack_scenario": {
       "type": "string",
       "description": "How an attacker exploits it: actors, steps, preconditions, and cost.",

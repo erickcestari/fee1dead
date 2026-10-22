@@ -189,7 +189,7 @@ fn review_input(batch: &[Finding]) -> String {
     let items: Vec<_> = batch
         .iter()
         .map(|f| {
-            json!({
+            let mut item = json!({
                 "finding_id": f.id,
                 "title": f.title,
                 "attack_class": f.attack_class,
@@ -197,7 +197,11 @@ fn review_input(batch: &[Finding]) -> String {
                 "location": f.location,
                 "description": f.description,
                 "attack_scenario": f.attack_scenario,
-            })
+            });
+            if !f.trace.is_empty() {
+                item["trace"] = json!(f.trace);
+            }
+            item
         })
         .collect();
     serde_json::to_string_pretty(&items).expect("a json array always serializes")
@@ -307,6 +311,17 @@ mod tests {
         assert_eq!(input[0]["finding_id"], "F-1");
         assert_eq!(input[0]["severity"], "high");
         assert!(input[0].get("confidence").is_none());
+        assert!(input[0].get("trace").is_none());
+    }
+
+    #[test]
+    fn review_input_carries_the_trace() {
+        let f = Finding {
+            trace: serde_json::from_str(r#"[{"kind": "sink", "location": "a.rs:9"}]"#).unwrap(),
+            ..finding("F-1")
+        };
+        let input: Vec<serde_json::Value> = serde_json::from_str(&review_input(&[f])).unwrap();
+        assert_eq!(input[0]["trace"][0]["kind"], "sink");
     }
 
     #[test]
