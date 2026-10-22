@@ -61,17 +61,21 @@ pub enum TaskOrigin {
     Feedback,
     /// Proposed by the coverage critic for attack surface the queue missed.
     Critic,
+    /// Harness-made exploration of a module no other task scoped.
+    Wildcard,
 }
 
 impl TaskOrigin {
     /// The tiebreak within a [`Priority`]; lower is scheduled first. A task a
     /// hunter surfaced is narrower than recon's sweep, but never outranks a
     /// higher priority, since only recon's tasks passed its admission bar.
+    /// A wildcard has no lead at all, so a usage limit cuts it first.
     pub fn hunt_rank(self) -> u8 {
         match self {
             TaskOrigin::Gapfill => 0,
             TaskOrigin::Feedback => 1,
             TaskOrigin::Recon | TaskOrigin::Critic => 2,
+            TaskOrigin::Wildcard => 3,
         }
     }
 }
@@ -266,9 +270,14 @@ impl Task {
     /// overlapping area. The class counts because a gap usually names a
     /// *different* class in an area a hunter covered.
     pub fn covers(&self, gap: &GapMarker) -> bool {
-        let area = gap.area.trim().to_lowercase();
         self.attack_class.to_lowercase() == gap.follow_up_class().to_lowercase()
-            && self.scopes().any(|scope| overlaps(&scope, &area))
+            && self.touches(&gap.area)
+    }
+
+    /// Whether a scope of this task overlaps `area`, a path or path prefix.
+    pub fn touches(&self, area: &str) -> bool {
+        let area = area.trim().to_lowercase();
+        self.scopes().any(|scope| overlaps(&scope, &area))
     }
 
     /// Non-empty scopes, lowercased: recon's path prefixes, else the hint.
@@ -469,6 +478,7 @@ mod tests {
         assert!(Priority::Medium.hunt_rank() < Priority::Low.hunt_rank());
         assert!(TaskOrigin::Gapfill.hunt_rank() < TaskOrigin::Feedback.hunt_rank());
         assert!(TaskOrigin::Feedback.hunt_rank() < TaskOrigin::Recon.hunt_rank());
+        assert!(TaskOrigin::Recon.hunt_rank() < TaskOrigin::Wildcard.hunt_rank());
     }
 
     #[test]

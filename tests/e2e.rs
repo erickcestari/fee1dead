@@ -634,6 +634,31 @@ async fn critic_tasks_feed_the_next_hunt_pass() {
     );
 }
 
+/// `run.wildcard_tasks` queues a lead-less hunt over the largest module no
+/// recon task scopes.
+#[tokio::test]
+async fn wildcard_tasks_cover_an_untasked_module() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup_with(tmp.path(), r#""recon", "hunt""#, "wildcard_tasks = 1");
+    let lib = tmp.path().join("target/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("codec.rs"), "// codec\n".repeat(150)).unwrap();
+    let runner = Arc::new(MockRunner::new(replies()));
+    run_with(cfg, runner.clone()).await.unwrap();
+
+    let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
+    let ids: Vec<&str> = queue.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["T-0001", "W-0002"]);
+    assert_eq!(queue[1].scope_paths, ["lib/"]);
+    let seen = runner.seen.lock().unwrap();
+    let hunters: Vec<&String> = seen
+        .iter()
+        .filter(|p| p.contains("You are a Hunter"))
+        .collect();
+    assert_eq!(hunters.len(), 2);
+    assert!(hunters[1].contains("Attack class: wildcard"));
+}
+
 /// The prompts `runner` saw so far, without holding its lock.
 fn snapshot(runner: &MockRunner) -> Vec<String> {
     runner.seen.lock().unwrap().iter().cloned().collect()

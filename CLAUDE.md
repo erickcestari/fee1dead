@@ -44,11 +44,11 @@ schema-validated findings. See `README.md` for the user-facing overview.
   leads (and consumes); it also keeps `ruled-out.jsonl` (`ruled_out.rs`:
   claims code settled, shown to hunters until the settling file changes) and
   `audited-commit.txt`, where the next recon's history starts. `critic.rs` is
-  an opt-in agent that queues attack surface the queue missed.
-  `citation.rs` checks that every `file:line` a hunter
-  cites exists, so a bad one gets a repair turn. `salvage.rs` gives an agent
-  whose answer does not parse, or that timed out, one repair turn in its own
-  session. Add a stage:
+  an opt-in agent that queues attack surface the queue missed; `wildcard.rs`
+  plans the lead-less tasks recon appends (`run.wildcard_tasks`).
+  `citation.rs` checks that every `file:line` a hunter cites exists, so a bad
+  one gets a repair turn. `salvage.rs` gives an agent whose answer does not
+  parse, or that timed out, one repair turn in its own session. Add a stage:
   create the file, add a variant to `config::Stage`, and the compiler points at
   the `run_stage` match.
 - `src/store/` — `ReportSink` trait + sqlite/jsonl/http/github sinks. New sinks
@@ -96,8 +96,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
   stage that can run more than once.
 - A recon-led run resets per-run artifacts (`artifacts::names::PER_RUN`) at
   startup; `feedback-seeds.jsonl`, `ruled-out.jsonl`, and `audited-commit.txt`
-  are deliberately excluded so the cross-run memory persists. If you add a durable artifact,
-  keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
+  are deliberately excluded so the cross-run memory persists. If you add a
+  durable artifact, keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
 - Every agent gets its own `output_dir` (a scratch dir) for its answer file;
   never share one between agents, or one can read another's answer.
 - The container is the security boundary. The agent runs

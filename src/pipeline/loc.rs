@@ -1,7 +1,7 @@
 //! A rough line count of a repo's source. Approximate by design: it only has
-//! to pick recon's size tier.
+//! to pick recon's size tier and rank modules for wildcard tasks.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Never counted, on top of any dot-directory: dependencies and build output.
 const SKIP_DIRS: &[&str] = &[
@@ -20,8 +20,9 @@ const SRC_EXTS: &[&str] = &[
     "cs",
 ];
 
-pub(super) fn count(root: &Path) -> u64 {
-    let mut total = 0;
+/// Each source file under `root`, relative to it, with its line count.
+pub(super) fn files(root: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -40,12 +41,17 @@ pub(super) fn count(root: &Path) -> u64 {
             } else if ft.is_file()
                 && is_source(&path)
                 && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(relative) = path.strip_prefix(root)
             {
-                total += content.lines().count() as u64;
+                out.push((relative.to_path_buf(), content.lines().count() as u64));
             }
         }
     }
-    total
+    out
+}
+
+pub(super) fn total(files: &[(PathBuf, u64)]) -> u64 {
+    files.iter().map(|(_, lines)| lines).sum()
 }
 
 fn is_source(path: &Path) -> bool {
@@ -72,6 +78,12 @@ mod tests {
         std::fs::write(root.join("node_modules").join("dep.js"), "z\nz\nz\n").unwrap();
         std::os::unix::fs::symlink(root.join("src"), root.join("loop")).unwrap();
 
-        assert_eq!(count(root), 5);
+        let mut found = files(root);
+        found.sort();
+        assert_eq!(
+            found,
+            [(PathBuf::from("a.rs"), 3), (PathBuf::from("src/b.go"), 2)]
+        );
+        assert_eq!(total(&found), 5);
     }
 }

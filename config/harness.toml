@@ -19,6 +19,9 @@ fork_hunters = true
 require_poc = false
 # Let agents use the vendored Trail of Bits skills.
 use_skills = true
+# Lead-less hunts over the largest modules no recon task scopes, so code
+# outside recon's threat model still gets a look. Each costs a hunter.
+wildcard_tasks = 1
 
 # Clone the target instead of mounting it. The git host must be in
 # [firewall].allow. Omit to use a mounted target_dir.

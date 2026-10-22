@@ -60,6 +60,10 @@ pub struct RunConfig {
     /// Whether agents may use the vendored skills.
     #[serde(default = "enabled")]
     pub use_skills: bool,
+    /// Lead-less hunts recon appends, one per module no task scopes. Off by
+    /// default: each costs a hunter.
+    #[serde(default)]
+    pub wildcard_tasks: usize,
 }
 
 impl RunConfig {
@@ -319,6 +323,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
         assert_eq!(cfg.feedback.max_ruled_out, 300);
+        assert_eq!(cfg.run.wildcard_tasks, 0);
         assert!(cfg.target.prepare.is_empty());
         assert!(cfg.target.setup.is_none());
         assert!(cfg.reference.active_dir().is_none());

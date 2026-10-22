@@ -3,6 +3,7 @@
 //!
 //! Feedback seeds enter as leads, not tasks: the code may have changed, so
 //! each must pass recon's admission bar. Recon then consumes the seed file.
+//! The harness appends `run.wildcard_tasks` wildcard tasks to the queue.
 
 use std::path::Path;
 
@@ -11,7 +12,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::salvage::run_parsed;
-use super::{StageCtx, loc, prompt};
+use super::{StageCtx, loc, prompt, wildcard};
 use crate::artifacts::names;
 use crate::config::Stage;
 use crate::domain::{Priority, Task, TaskOrigin};
@@ -64,7 +65,8 @@ impl HuntTask {
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let cfg = &ctx.config;
     let target = &cfg.run.target_dir;
-    let loc = loc::count(target);
+    let files = loc::files(target);
+    let loc = loc::total(&files);
     let seeds: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
     let audited = ctx
         .artifacts
@@ -109,13 +111,16 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     if let Some(session_id) = &session_id {
         ctx.artifacts.write_text(names::RECON_SESSION, session_id)?;
     }
-    let tasks = into_queue(report.hunt_tasks);
+    let mut tasks = into_queue(report.hunt_tasks);
+    let wildcards = wildcard::plan(&files, &tasks, cfg.run.wildcard_tasks);
     info!(
         loc,
         tasks = tasks.len(),
+        wildcards = wildcards.len(),
         leads = seeds.len(),
         "recon assembled hunt queue"
     );
+    tasks.extend(wildcards);
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
     ctx.artifacts.write_jsonl::<Task>(names::SEEDS, &[])?;
     Ok(())

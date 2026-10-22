@@ -18,6 +18,7 @@ mod salvage;
 mod similarity;
 mod skip_reported;
 mod validate;
+mod wildcard;
 mod wishlist;
 
 use std::path::{Path, PathBuf};
