@@ -59,6 +59,8 @@ pub enum TaskOrigin {
     Recon,
     Gapfill,
     Feedback,
+    /// Proposed by the coverage critic for attack surface the queue missed.
+    Critic,
 }
 
 impl TaskOrigin {
@@ -69,7 +71,7 @@ impl TaskOrigin {
         match self {
             TaskOrigin::Gapfill => 0,
             TaskOrigin::Feedback => 1,
-            TaskOrigin::Recon => 2,
+            TaskOrigin::Recon | TaskOrigin::Critic => 2,
         }
     }
 }

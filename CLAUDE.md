@@ -43,7 +43,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
   seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
   leads (and consumes); it also keeps `ruled-out.jsonl` (`ruled_out.rs`:
   claims code settled, shown to hunters until the settling file changes) and
-  `audited-commit.txt`, where the next recon's history starts.
+  `audited-commit.txt`, where the next recon's history starts. `critic.rs` is
+  an opt-in agent that queues attack surface the queue missed.
   `citation.rs` checks that every `file:line` a hunter
   cites exists, so a bad one gets a repair turn. `salvage.rs` gives an agent
   whose answer does not parse, or that timed out, one repair turn in its own

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum Stage {
     Recon,
     Hunt,
+    Critic,
     Gapfill,
     Dedupe,
     SkipReported,
@@ -19,9 +20,10 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub const ALL: [Stage; 9] = [
+    pub const ALL: [Stage; 10] = [
         Stage::Recon,
         Stage::Hunt,
+        Stage::Critic,
         Stage::Gapfill,
         Stage::Dedupe,
         Stage::SkipReported,
@@ -35,6 +37,7 @@ impl Stage {
         match self {
             Stage::Recon => "recon",
             Stage::Hunt => "hunt",
+            Stage::Critic => "critic",
             Stage::Gapfill => "gapfill",
             Stage::Dedupe => "dedupe",
             Stage::SkipReported => "skip-reported",
@@ -49,7 +52,7 @@ impl Stage {
     pub fn runs_agent(self) -> bool {
         matches!(
             self,
-            Stage::Recon | Stage::Hunt | Stage::Validate | Stage::SkipReported
+            Stage::Recon | Stage::Hunt | Stage::Critic | Stage::Validate | Stage::SkipReported
         )
     }
 }

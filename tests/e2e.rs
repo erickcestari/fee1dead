@@ -572,6 +572,68 @@ async fn a_citation_the_target_lacks_is_sent_back_for_repair() {
     assert_eq!(candidates[0]["location"], "src/parse.rs:42");
 }
 
+/// The critic queues attack surface the queue missed; the next hunt pass
+/// hunts it, and a resumed run does not ask the critic again.
+#[tokio::test]
+async fn critic_tasks_feed_the_next_hunt_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "critic", "hunt""#);
+    let mut replies = replies();
+    replies.push(CannedReply {
+        match_substr: Some("coverage critic".into()),
+        stdout: r#"{"hunt_tasks": [{"attack_class": "auth-bypass", "scope_paths": ["src/rpc.rs"],
+            "hypothesis": "The admin RPC skips the macaroon check.", "priority": "high"}]}"#
+            .into(),
+        session_id: None,
+        render: None,
+    });
+    let runner = Arc::new(MockRunner::new(replies.clone()));
+    run_with(cfg, runner.clone()).await.unwrap();
+
+    let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
+    let ids: Vec<&str> = queue.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["T-0001", "C-0002"]);
+    let seen = snapshot(&runner);
+    let critic = seen.iter().find(|p| p.contains("coverage critic")).unwrap();
+    assert!(
+        critic.contains("- T-0001 [hunted]: integer overflow"),
+        "{critic}"
+    );
+    assert!(
+        critic.contains("src/parse.rs error path"),
+        "gaps are listed"
+    );
+    let hunters: Vec<&String> = seen
+        .iter()
+        .filter(|p| p.contains("You are a Hunter"))
+        .collect();
+    assert_eq!(hunters.len(), 2);
+    assert!(hunters[1].contains("Attack class: auth-bypass"));
+    assert!(
+        runner
+            .seen_resume
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.as_deref() == Some(RECON_SESSION_ID))
+            .count()
+            == 3,
+        "both hunters and the critic fork recon's session"
+    );
+
+    let (cfg, _) = setup(tmp.path(), r#""critic""#);
+    let runner = Arc::new(MockRunner::new(replies));
+    Pipeline::with_runner(cfg, runner.clone())
+        .unwrap()
+        .resume()
+        .await
+        .unwrap();
+    assert!(
+        runner.seen.lock().unwrap().is_empty(),
+        "the critic runs once per run"
+    );
+}
+
 /// The prompts `runner` saw so far, without holding its lock.
 fn snapshot(runner: &MockRunner) -> Vec<String> {
     runner.seen.lock().unwrap().iter().cloned().collect()

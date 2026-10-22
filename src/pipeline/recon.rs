@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::salvage::run_parsed;
 use super::{StageCtx, loc, prompt};
@@ -32,10 +32,10 @@ struct ReconReport {
     hunt_tasks: Vec<HuntTask>,
 }
 
-/// A task as recon emits it; any `id` it adds is ignored.
+/// A task as recon (or the critic) emits it; any `id` it adds is ignored.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct HuntTask {
+pub(super) struct HuntTask {
     attack_class: String,
     scope_paths: Vec<String>,
     targets: Vec<String>,
@@ -45,7 +45,7 @@ struct HuntTask {
 }
 
 impl HuntTask {
-    fn into_task(self, id: String) -> Task {
+    pub(super) fn into_task(self, id: String, origin: TaskOrigin) -> Task {
         Task {
             id,
             attack_class: self.attack_class,
@@ -56,7 +56,7 @@ impl HuntTask {
             targets: self.targets,
             suggested_skills: self.suggested_skills,
             priority: self.priority,
-            origin: TaskOrigin::Recon,
+            origin,
         }
     }
 }
@@ -125,8 +125,26 @@ fn into_queue(hunt_tasks: Vec<HuntTask>) -> Vec<Task> {
     hunt_tasks
         .into_iter()
         .enumerate()
-        .map(|(i, t)| t.into_task(format!("T-{:04}", i + 1)))
+        .map(|(i, t)| t.into_task(format!("T-{:04}", i + 1), TaskOrigin::Recon))
         .collect()
+}
+
+/// Recon's session for `stage`'s agents to fork, when forking is on and
+/// recon left one.
+pub(super) fn forkable_session(ctx: &StageCtx, stage: Stage) -> Option<String> {
+    if !ctx.config.run.fork_hunters {
+        return None;
+    }
+    let session = ctx.artifacts.read_line(names::RECON_SESSION)?;
+    info!(%stage, "forking recon's session");
+    if ctx.config.stage_model(stage) != ctx.config.stage_model(Stage::Recon) {
+        warn!(
+            %stage,
+            "this stage and recon run on different models; a fork cannot reuse \
+             recon's prompt cache and pays full input price for its session"
+        );
+    }
+    Some(session)
 }
 
 /// The `git log` range for recent changes, and a note on the last audit: the

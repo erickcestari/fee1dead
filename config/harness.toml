@@ -100,7 +100,8 @@ max_seeds = 200
 max_ruled_out = 300
 
 [stages]
-# Run in order; a stage may repeat (hunt again after gapfill).
+# Run in order; a stage may repeat (hunt again after gapfill). Add "critic"
+# before "gapfill" to queue attack surface the first hunt pass missed.
 enabled = ["recon", "hunt", "gapfill", "hunt", "dedupe", "skip-reported", "validate", "report", "feedback", "aggregate"]
 
 # Per-stage model; unset stages use the provider's model. Keep hunt and recon

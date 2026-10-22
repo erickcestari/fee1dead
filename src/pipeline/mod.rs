@@ -3,6 +3,7 @@
 
 mod aggregate;
 mod citation;
+mod critic;
 mod dedupe;
 mod feedback;
 mod gapfill;
@@ -69,11 +70,11 @@ pub struct StageCtx {
 }
 
 /// The reasoning effort a stage's agents run at; `None` for a stage without
-/// agents. Hunters fork recon's session at recon's effort: another effort
-/// misses the prompt cache and re-bills the whole session per hunter.
+/// agents. Hunters and the critic fork recon's session at recon's effort:
+/// another effort misses the prompt cache and re-bills the whole session.
 fn stage_effort(stage: Stage) -> Option<Effort> {
     match stage {
-        Stage::Recon | Stage::Hunt => Some(Effort::Xhigh),
+        Stage::Recon | Stage::Hunt | Stage::Critic => Some(Effort::Xhigh),
         Stage::Validate => Some(Effort::High),
         Stage::SkipReported => Some(Effort::Low),
         Stage::Gapfill | Stage::Dedupe | Stage::Report | Stage::Feedback | Stage::Aggregate => None,
@@ -222,6 +223,7 @@ async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<()> {
     match stage {
         Stage::Recon => recon::run(ctx).await,
         Stage::Hunt => hunt::run(ctx).await,
+        Stage::Critic => critic::run(ctx).await,
         Stage::Gapfill => gapfill::run(ctx),
         Stage::Dedupe => dedupe::run(ctx),
         Stage::SkipReported => skip_reported::run(ctx).await,

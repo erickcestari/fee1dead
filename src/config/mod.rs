@@ -45,8 +45,8 @@ pub struct RunConfig {
     pub concurrency: usize,
     #[serde(default = "default_timeout_secs")]
     pub agent_timeout_secs: u64,
-    /// Fork each hunter from recon's session so it inherits recon's context as
-    /// a cached prefix instead of reading `recon.json`.
+    /// Fork each hunter, and the critic, from recon's session so it inherits
+    /// recon's context as a cached prefix instead of reading `recon.json`.
     #[serde(default = "enabled")]
     pub fork_hunters: bool,
     /// Have hunters write and run proof-of-concept code. Off by default: the

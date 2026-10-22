@@ -21,7 +21,7 @@ use super::ruled_out::{self, RawCleared};
 use super::salvage::run_parsed;
 use super::similarity::{jaccard, report_signature, tokenize};
 use super::wishlist::{self, RawWish};
-use super::{StageCtx, citation, prompt};
+use super::{StageCtx, citation, prompt, recon};
 use crate::artifacts::{Artifacts, names};
 use crate::config::Stage;
 use crate::domain::{Finding, GapMarker, RuledOut, Severity, Task, TraceStep, default_confidence};
@@ -112,7 +112,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .artifacts
         .read_line(names::RUN_ID)
         .context("the run has no id")?;
-    let recon_session = recon_session(ctx);
+    let recon_session = recon::forkable_session(ctx, Stage::Hunt);
     let target = ctx.config.run.target_dir.clone();
     // Without a commit, a cleared claim could never be checked for change.
     let head = head_commit(&target);
@@ -231,22 +231,6 @@ fn pending_tasks(artifacts: &Artifacts) -> Result<Vec<Task>> {
 /// Most valuable first, since a usage limit can cut the tail. Stable.
 fn spawn_order(tasks: &mut [Task]) {
     tasks.sort_by_key(|t| (t.priority.hunt_rank(), t.origin.hunt_rank()));
-}
-
-/// Recon's session, when hunters should fork it.
-fn recon_session(ctx: &StageCtx) -> Option<String> {
-    if !ctx.config.run.fork_hunters {
-        return None;
-    }
-    let session = ctx.artifacts.read_line(names::RECON_SESSION)?;
-    info!("hunters will fork from recon's session");
-    if ctx.config.stage_model(Stage::Hunt) != ctx.config.stage_model(Stage::Recon) {
-        warn!(
-            "hunt and recon run on different models; forked hunters cannot reuse \
-             recon's prompt cache and pay full input price for its session"
-        );
-    }
-    Some(session)
 }
 
 /// Reports the sink already holds, so hunters skip known bugs instead of
