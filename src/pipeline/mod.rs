@@ -16,6 +16,7 @@ mod ruled_out;
 mod run_meta;
 mod salvage;
 mod similarity;
+mod skills;
 mod skip_reported;
 mod validate;
 mod wildcard;
@@ -68,6 +69,8 @@ pub struct StageCtx {
     pub artifacts: Artifacts,
     pub scratch: ScratchRoot,
     pub runner: Arc<dyn AgentRunner>,
+    /// Found once per run, so every stage names the same set.
+    skills: Vec<skills::Skill>,
 }
 
 /// The reasoning effort a stage's agents run at; `None` for a stage without
@@ -132,12 +135,15 @@ impl Pipeline {
 
     /// A pipeline over a caller-supplied runner, e.g. the mock provider.
     pub fn with_runner(config: Config, runner: Arc<dyn AgentRunner>) -> Result<Self> {
+        let skills = skills::installed(config.run.skills_dir.as_deref());
+        info!(skills = skills.len(), "skills found");
         Ok(Self {
             ctx: StageCtx {
                 artifacts: Artifacts::new(&config.run.out_dir)?,
                 scratch: ScratchRoot::new(&config.run.scratch_root)?,
                 runner: Arc::new(RetryOnRateLimit::new(runner)),
                 config,
+                skills,
             },
         })
     }

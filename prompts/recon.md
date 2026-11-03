@@ -110,20 +110,18 @@ For each task emit:
 - `scope_paths`: 1–3 repo-relative path prefixes the task is confined to.
 - `targets`: optional `file:func` or `file:line` entries to start from.
 - `hypothesis`: one falsifiable sentence, prefixed with the `INV-N` it maps to when it maps to one.
-- `suggested_skills`: 0–2 values from `audit-context-building`, `differential-review`, `variant-analysis`, `constant-time-analysis`, `insecure-defaults`, `sharp-edges`, `spec-to-code-compliance`, `property-based-testing`, `manual`.
+- `suggested_skills`: 0–2 names from the installed skills listed at the end, chosen for the attack class; empty when none fits.
 - `priority`: `high` for fund loss, auth bypass, memory safety, or RCE at a real trust boundary; `medium` for material impact with a narrower blast radius or a harder-to-reach path. Do not emit `low`: a task whose honest rank is low (unlikely precondition, limited blast radius, latent path) has not cleared the bar, so drop it. If everything is `high`, nothing is.
 
-Attack classes and the skills that fit them, as a menu to specialize or go beyond:
+Attack classes, as a menu to specialize or go beyond:
 
-| Attack class | Skills |
-|--------------|--------|
-| insecure defaults, fail-open config, hardcoded secrets | `insecure-defaults`, `sharp-edges` |
-| cryptographic misuse, timing side channels, nonce reuse, weak RNG | `constant-time-analysis` |
-| protocol-spec compliance: MUST/SHALL clauses honored in code | `spec-to-code-compliance` |
-| fund safety, input validation, DoS, concurrency, access control, info disclosure | `manual`, `variant-analysis` |
-| fund loss via resolution gaps: state signed but not recorded where the watcher looks; an output or forwarded-HTLC leg the victim fails to claim, learn, or settle | `manual`, `spec-to-code-compliance` |
-| under-covered paths (utilities, middleware, init, error paths), only with a concrete lead at a named function | `manual` |
-| chains where two weaker defects combine into material impact | `manual`, `property-based-testing` |
+- insecure defaults, fail-open config, hardcoded secrets
+- cryptographic misuse, timing side channels, nonce reuse, weak RNG
+- protocol-spec compliance: MUST/SHALL clauses honored in code
+- fund safety, input validation, DoS, concurrency, access control, info disclosure
+- fund loss via resolution gaps: state signed but not recorded where the watcher looks; an output or forwarded-HTLC leg the victim fails to claim, learn, or settle
+- under-covered paths (utilities, middleware, init, error paths), only with a concrete lead at a named function
+- chains where two weaker defects combine into material impact
 </phase_f>
 
 <output>
@@ -175,7 +173,7 @@ Your entire final answer is a single JSON object, with no prose and no markdown 
       "scope_paths": ["lnwallet/"],
       "targets": ["lnwallet/channel.go:ReceiveRevocation"],
       "hypothesis": "INV-1: channel state advances before signature verification on a peer-supplied revocation",
-      "suggested_skills": ["manual", "variant-analysis"],
+      "suggested_skills": [],
       "priority": "high"
     }
   ],

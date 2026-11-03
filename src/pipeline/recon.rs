@@ -88,7 +88,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .replace("$SINCE", &since)
         .replace("$LEADS", &leads_block(&seeds))
         + &prompt::reference_recon_directive(cfg)
-        + prompt::skills_directive(cfg);
+        + &prompt::skills_note(&ctx.skills);
 
     let req = AgentRequest {
         working_dir: target.clone(),
@@ -266,14 +266,14 @@ mod tests {
                 "scope_paths":["src/a.rs"],
                 "hypothesis":"len added without bounds check",
                 "targets":["src/a.rs:decode","src/a.rs:42"],
-                "suggested_skills":["sharp-edges"],
+                "suggested_skills":["unsafe-audit"],
                 "priority":"high"
             }]}"#,
         );
         assert_eq!(tasks[0].id, "T-0001");
         assert_eq!(tasks[0].hypothesis, "len added without bounds check");
         assert_eq!(tasks[0].targets, vec!["src/a.rs:decode", "src/a.rs:42"]);
-        assert_eq!(tasks[0].suggested_skills, vec!["sharp-edges"]);
+        assert_eq!(tasks[0].suggested_skills, vec!["unsafe-audit"]);
         assert_eq!(tasks[0].priority, Priority::High);
         assert_eq!(
             queue(r#"{"hunt_tasks":[{"attack_class":"c"}]}"#)[0].priority,

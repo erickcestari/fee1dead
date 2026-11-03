@@ -79,15 +79,12 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - `prompts/`, `schema/finding.schema.json` — embedded into the binary via
   `include_str!`; editing them changes the build.
 - Skills are routed per task, not per stage: recon emits `suggested_skills` on
-  each `Task` (from the vendored suite), and `hunt.rs` names them in the hunter
-  prompt. Skills reach the agent through prompt text, not a CLI flag.
-- `skills/` — vendored Trail of Bits plugin suite (a plugin marketplace:
-  `plugins/<plugin>/skills/<skill>/SKILL.md`). The container registers only the
-  pipeline's allow-list of skills as personal skills under `~/.claude/skills/<skill>`
-  (see the loop in `docker/Dockerfile`) so `claude` exposes them by name; the rest
-  of the suite stays in `/opt/skills` for reference. The allow-list must stay in
-  sync with the recon suggestion list in `prompts/recon.md`. Do not edit the
-  vendored skills unless updating the vendor copy.
+  each `Task`, and `hunt.rs` names the installed ones in the hunter prompt.
+  Skills reach the agent through prompt text, not a CLI flag.
+- Skills are the operator's, never vendored: `pipeline/skills.rs` finds each
+  `<name>/SKILL.md` in `run.skills_dir` once per run, and recon and validate are
+  shown that list (`prompt::skills_note`). No prompt may name a specific skill,
+  since none is guaranteed to be installed.
 
 ## Conventions
 

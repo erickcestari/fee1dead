@@ -112,7 +112,6 @@ fn variant_seed(f: &Finding) -> Task {
         ),
         hypothesis: format!("a variant of \"{}\" exists nearby", f.title),
         targets: vec![f.location.clone()],
-        suggested_skills: vec!["variant-analysis".to_string()],
         priority: Priority::High,
         origin: TaskOrigin::Feedback,
         ..Task::default()
@@ -212,6 +211,5 @@ mod tests {
         let s = variant_seed(&fixtures::finding("F-1"));
         assert_eq!(s.targets, vec!["a.rs:1"]);
         assert_eq!(s.priority, Priority::High);
-        assert_eq!(s.suggested_skills, vec!["variant-analysis"]);
     }
 }

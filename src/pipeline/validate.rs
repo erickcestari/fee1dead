@@ -146,7 +146,7 @@ fn review_request(ctx: &StageCtx, batch: &[Finding]) -> Result<AgentRequest> {
         &cfg.run.out_dir,
         batch,
     ) + &prompt::reference_note(cfg)
-        + prompt::skills_directive(cfg);
+        + &prompt::skills_note(&ctx.skills);
     // The reviewer reads from the target; its own dir stays its scratch.
     req.working_dir = cfg.run.target_dir.clone();
     Ok(req)

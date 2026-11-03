@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/local/bin/python
 
-# Several Trail of Bits skills invoke `uv run`.
+# Many skills invoke `uv run`.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 ARG CLAUDE_CODE_VERSION=2.1.280
@@ -70,27 +70,6 @@ RUN groupadd -o -g ${HOST_GID} agent && \
     useradd -o -u ${HOST_UID} -g ${HOST_GID} --create-home --shell /bin/bash agent && \
     mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build && \
     chown -R agent:agent /home/agent
-
-# Register the pipeline's skills as personal skills so `claude` exposes them by
-# name. Only these: each one adds to every agent's system prompt. Keep the list
-# in sync with the allow-list in prompts/recon.md (plus fp-check for validate).
-COPY skills /opt/skills
-RUN mkdir -p /home/agent/.claude/skills && \
-    for skill in \
-        audit-context-building \
-        fp-check \
-        sharp-edges \
-        insecure-defaults \
-        constant-time-analysis \
-        spec-to-code-compliance \
-        differential-review \
-        variant-analysis \
-        property-based-testing; do \
-        d="$(find /opt/skills/plugins -type d -path "*/skills/$skill" -print -quit)"; \
-        [ -n "$d" ] || { echo "skill not found in vendored suite: $skill" >&2; exit 1; }; \
-        ln -sfn "$d" "/home/agent/.claude/skills/$skill"; \
-    done && \
-    chown -R agent:agent /home/agent/.claude
 
 # Installs rtk's Bash rewrite hook into the agent's Claude Code config.
 RUN gosu agent env HOME=/home/agent rtk init -g --auto-patch && \

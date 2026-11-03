@@ -57,9 +57,10 @@ pub struct RunConfig {
     /// session do not hit the API as one rate-limited burst.
     #[serde(default = "default_hunter_stagger_ms")]
     pub hunter_stagger_ms: u64,
-    /// Whether agents may use the vendored skills.
-    #[serde(default = "enabled")]
-    pub use_skills: bool,
+    /// The operator's skills, one `<name>/SKILL.md` each. Unset, or empty,
+    /// means agents use none.
+    #[serde(default)]
+    pub skills_dir: Option<PathBuf>,
     /// Lead-less hunts recon appends, one per module no task scopes. Off by
     /// default: each costs a hunter.
     #[serde(default)]
@@ -319,7 +320,7 @@ enabled = ["recon", "hunt", "validate", "report"]
         assert_eq!(cfg.run.agent_timeout_secs, 1800);
         assert!(cfg.run.fork_hunters);
         assert!(!cfg.run.require_poc);
-        assert!(cfg.run.use_skills);
+        assert!(cfg.run.skills_dir.is_none());
         assert_eq!(cfg.run.hunter_stagger_ms, 750);
         assert_eq!(cfg.feedback.max_seeds, 200);
         assert_eq!(cfg.feedback.max_ruled_out, 300);

@@ -212,6 +212,7 @@ enabled = ["skip-reported"]
                 reply(Some("Unbounded allocation"), "{\"duplicate\": true}"),
                 reply(None, "{\"duplicate\": false}"),
             ])),
+            skills: Vec::new(),
         };
         let existing = [ExistingReport {
             id: "old".into(),

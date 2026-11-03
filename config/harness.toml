@@ -17,8 +17,9 @@ fork_hunters = true
 # Hunters compile and run PoCs. Off by default: it is the most token-hungry
 # part of hunting.
 require_poc = false
-# Let agents use the vendored Trail of Bits skills.
-use_skills = true
+# Your skills, one <name>/SKILL.md each; `just` mounts ./skills here, where
+# claude-code loads them. Agents use none when it is unset or empty.
+skills_dir = "/home/agent/.claude/skills"
 # Lead-less hunts over the largest modules no recon task scopes, so code
 # outside recon's threat model still gets a look. Each costs a hunter.
 wildcard_tasks = 1

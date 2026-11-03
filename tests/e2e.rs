@@ -34,7 +34,7 @@ fn replies() -> Vec<CannedReply> {
   "invariants": [{"id": "INV-1", "statement": "length is bounds-checked before alloc", "relevant_modules": ["src/parse.rs"], "adversary": "file author", "how_to_falsify": "find an alloc before the check", "tags": ["deserialization"]}],
   "priority_targets": [{"file": "src/parse.rs", "function": "decode", "tied_to": ["INV-1"], "risk": "deserialization", "reason": "length math before bounds check"}],
   "protocol_specs": [],
-  "hunt_tasks": [{"attack_class": "integer overflow", "scope_paths": ["src/parse.rs"], "targets": ["src/parse.rs:42"], "hypothesis": "INV-1: length added without bounds check", "suggested_skills": ["sharp-edges"], "priority": "high"}],
+  "hunt_tasks": [{"attack_class": "integer overflow", "scope_paths": ["src/parse.rs"], "targets": ["src/parse.rs:42"], "hypothesis": "INV-1: length added without bounds check", "suggested_skills": ["unsafe-audit"], "priority": "high"}],
   "recent_changes": [],
   "notes": "mock recon report"
 }"#
@@ -758,4 +758,58 @@ async fn cleared_claims_and_the_audited_commit_reach_the_next_run() {
         .find(|p| p.contains("You are a Hunter"))
         .unwrap();
     assert!(!hunter.contains("decode trusts the length prefix"));
+}
+
+/// Recon is shown the skills in `run.skills_dir`, and a hunter is pointed at
+/// the installed ones its task suggests.
+#[tokio::test]
+async fn installed_skills_reach_recon_and_the_hunter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skills = tmp.path().join("skills");
+    for name in ["unsafe-audit", "poc-review"] {
+        std::fs::create_dir_all(skills.join(name)).unwrap();
+        std::fs::write(
+            skills.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: The {name} method.\n---\n"),
+        )
+        .unwrap();
+    }
+    let (cfg, _) = setup_with(
+        tmp.path(),
+        r#""recon", "hunt""#,
+        &format!("skills_dir = {skills:?}"),
+    );
+    let runner = Arc::new(MockRunner::new(replies()));
+    run_with(cfg, runner.clone()).await.unwrap();
+
+    let seen = snapshot(&runner);
+    assert!(seen[0].contains("- `poc-review` ("), "{}", seen[0]);
+    assert!(seen[0].contains("The unsafe-audit method."));
+    let hunter = seen
+        .iter()
+        .find(|p| p.contains("You are a Hunter"))
+        .unwrap();
+    let path = skills.join("unsafe-audit/SKILL.md");
+    assert!(hunter.contains(&format!(
+        "Skills:       unsafe-audit (`{}`)",
+        path.display()
+    )));
+    assert!(!hunter.contains("No skills are installed"));
+}
+
+#[tokio::test]
+async fn without_skills_no_agent_is_told_to_use_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, _) = setup(tmp.path(), r#""recon", "hunt""#);
+    let runner = Arc::new(MockRunner::new(replies()));
+    run_with(cfg, runner.clone()).await.unwrap();
+
+    let seen = snapshot(&runner);
+    assert!(seen.iter().all(|p| p.contains("No skills are installed")));
+    let hunter = seen
+        .iter()
+        .find(|p| p.contains("You are a Hunter"))
+        .unwrap();
+    assert!(hunter.contains("Skills:       (none installed"));
+    assert!(!hunter.contains("unsafe-audit"));
 }

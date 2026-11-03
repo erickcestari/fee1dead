@@ -10,6 +10,8 @@ target := justfile_directory() / "target-repo"
 out := justfile_directory() / "out"
 # Mounted, so edits need no rebuild.
 config := justfile_directory() / "config" / "harness.toml"
+# Your skills, mounted read-only where the agents load them, if present.
+skills := justfile_directory() / "skills"
 # `-e VAR` forwards only what is set.
 auth := "-e ANTHROPIC_API_KEY -e CLAUDE_CODE_OAUTH_TOKEN"
 
@@ -35,6 +37,7 @@ check:
 
 # opencode's credentials and cache; empty with claude-code.
 opencode_mounts := '-v "$HOME/.local/share/opencode":/home/agent/.local/share/opencode -v "$HOME/.cache/opencode":/home/agent/.cache/opencode'
+skills_mount := '$([ -d "' + skills + '" ] && echo "-v $(realpath "' + skills + '"):/home/agent/.claude/skills:ro")'
 
 # Build the image with the host uid/gid, so out/ stays yours. The dirty check
 # covers the same inputs as build.rs.
@@ -56,6 +59,7 @@ run: image
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
       {{opencode_mounts}} \
+      {{skills_mount}} \
       {{image}}
 
 # Run against a repo the harness clones itself (needs [target].repo in config).
@@ -67,6 +71,7 @@ run-clone: image
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
       {{opencode_mounts}} \
+      {{skills_mount}} \
       {{image}}
 
 # Continue the last run in `out`, skipping recon. Mounts `target` if present.
@@ -79,6 +84,7 @@ resume: image
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
       {{opencode_mounts}} \
+      {{skills_mount}} \
       {{image}} run --resume --config /opt/fee1dead/config/harness.toml
 
 # Run with the egress firewall disabled (local debugging only).
@@ -93,6 +99,7 @@ run-nofw: image
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
       {{opencode_mounts}} \
+      {{skills_mount}} \
       {{image}}
 
 # Open an interactive shell in the image (firewall not started).
@@ -104,6 +111,7 @@ shell: image
       -v "$(realpath '{{out}}')":/work/out \
       -v "$(realpath '{{config}}')":/opt/fee1dead/config/harness.toml:ro \
       {{opencode_mounts}} \
+      {{skills_mount}} \
       --entrypoint /bin/bash \
       {{image}}
 

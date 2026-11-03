@@ -168,7 +168,7 @@ For opencode:
 | Forked hunters | yes | yes |
 | Tool deny-list | enforced | ignored |
 | Reasoning effort | set per stage | fixed `variant` from config |
-| Trail of Bits skills | registered | not registered; found under `/opt/skills` |
+| [Skills](#skills) | loaded natively | read from the `SKILL.md` path in the prompt |
 | `max_weekly_usage_pct` | yes (subscription auth) | no |
 | `skip-reported` default model | `claude-haiku-4-5` | the provider's `model` |
 
@@ -210,8 +210,27 @@ dir  = "/work/reference"   # default
 
 A reference is a spec or known-good implementation that recon, hunt, and
 validate treat as ground truth. With one set, recon also emits
-`spec-to-code-compliance` tasks, each pairing a spec clause with the code that
+`spec-compliance` tasks, each pairing a spec clause with the code that
 implements it.
+
+### Skills
+
+fee1dead ships no skills; bring your own. Put each in `./skills/<name>/SKILL.md`
+and the `just` recipes mount it read-only at `run.skills_dir`
+(`/home/agent/.claude/skills`), where claude-code loads skills. Copy skills in
+rather than symlinking them, since a link out of the directory breaks in the
+container.
+
+Recon sees each skill's name and description and suggests up to two per task.
+A hunter is pointed at the suggested skills that are installed, by `SKILL.md`
+path. A reviewer follows a false-positive check skill when one is installed.
+Without skills, agents are told to use none.
+
+The prompts were tuned with these from
+[Trail of Bits](https://github.com/trailofbits/skills): `audit-context-building`,
+`fp-check`, `sharp-edges`, `insecure-defaults`, `constant-time-analysis`,
+`spec-to-code-compliance`, `differential-review`, `variant-analysis`, and
+`property-based-testing`.
 
 ### Sinks
 

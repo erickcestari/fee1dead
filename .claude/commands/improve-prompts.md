@@ -82,6 +82,6 @@ Per file, output a compact summary:
 - 3–6 bullets, each `<what changed> — <why it helps results or saves tokens>`.
 - Any constraint you deliberately left untouched and why.
 
-Do not touch the vendored `skills/`, config, or Rust source except to **read** the
+Do not touch config or Rust source except to **read** the
 pipeline file for the contract. Show the diff-worthy changes; make no edit you
 cannot tie to better results or fewer tokens.

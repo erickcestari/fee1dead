@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use super::ruled_out::{self, RawCleared};
 use super::salvage::run_parsed;
 use super::similarity::{jaccard, report_signature, tokenize};
+use super::skills::Skill;
 use super::wishlist::{self, RawWish};
 use super::{StageCtx, citation, prompt, recon};
 use crate::artifacts::{Artifacts, names};
@@ -321,7 +322,7 @@ struct HuntPrompt {
     /// Recon's report for a cold hunter, or [`FORKED_CONTEXT`].
     architecture: String,
     poc: PocText,
-    use_skills: bool,
+    skills: Vec<Skill>,
     suffix: String,
     filed: Vec<Precedent>,
     ruled_out: Vec<Precedent>,
@@ -340,8 +341,14 @@ impl HuntPrompt {
             target_dir: ctx.config.run.target_dir.to_string_lossy().into_owned(),
             architecture,
             poc: PocText::new(ctx.config.run.require_poc),
-            use_skills: ctx.config.run.use_skills,
-            suffix: prompt::reference_note(&ctx.config) + prompt::skills_directive(&ctx.config),
+            skills: ctx.skills.clone(),
+            // With skills installed, the task's own skills line says which to use.
+            suffix: prompt::reference_note(&ctx.config)
+                + if ctx.skills.is_empty() {
+                    prompt::NO_SKILLS
+                } else {
+                    ""
+                },
             filed,
             ruled_out,
         }
@@ -353,7 +360,7 @@ impl HuntPrompt {
             .replace("{scope}", &scope_line(task))
             .replace("{hypothesis}", &hypothesis_line(task))
             .replace("{targets}", &targets_block(task))
-            .replace("{skills}", &skills_line(task, self.use_skills))
+            .replace("{skills}", &skills_line(task, &self.skills))
             .replace("{target_dir}", &self.target_dir)
             .replace("{poc_intro}", self.poc.intro)
             .replace("{poc_rule}", self.poc.rule)
@@ -435,13 +442,22 @@ fn targets_block(task: &Task) -> String {
     }
 }
 
-fn skills_line(task: &Task, use_skills: bool) -> String {
-    if !use_skills {
-        "(disabled for this run — use judgment)".to_string()
-    } else if task.suggested_skills.is_empty() {
-        "(none suggested — use judgment)".to_string()
+/// The task's suggested skills that are installed, with where to read each;
+/// a name recon made up is dropped rather than sent to the hunter.
+fn skills_line(task: &Task, installed: &[Skill]) -> String {
+    if installed.is_empty() {
+        return "(none installed, use judgment)".to_string();
+    }
+    let usable: Vec<String> = task
+        .suggested_skills
+        .iter()
+        .filter_map(|name| installed.iter().find(|s| &s.name == name))
+        .map(|s| format!("{} (`{}`)", s.name, s.path.display()))
+        .collect();
+    if usable.is_empty() {
+        "(none suggested, use judgment)".to_string()
     } else {
-        task.suggested_skills.join(", ")
+        usable.join(", ")
     }
 }
 
@@ -629,30 +645,40 @@ mod tests {
         assert_ne!(a, finding_id("20260902T000000Z", "T-0001", 0));
     }
 
+    fn skill(name: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: String::new(),
+            path: format!("/skills/{name}/SKILL.md").into(),
+        }
+    }
+
     #[test]
-    fn steering_uses_given_hypothesis_targets_and_skills() {
+    fn steering_uses_given_hypothesis_targets_and_installed_skills() {
         let t = task(
             "len added unchecked",
             &["src/a.rs:decode", "src/a.rs:42"],
-            &["sharp-edges", "spec-to-code-compliance"],
+            &["unsafe-audit", "made-up", "poc-review"],
         );
         assert_eq!(hypothesis_line(&t), "len added unchecked");
         assert_eq!(targets_block(&t), "- src/a.rs:decode\n- src/a.rs:42");
         assert_eq!(
-            skills_line(&t, true),
-            "sharp-edges, spec-to-code-compliance"
+            skills_line(&t, &[skill("poc-review"), skill("unsafe-audit")]),
+            "unsafe-audit (`/skills/unsafe-audit/SKILL.md`), poc-review (`/skills/poc-review/SKILL.md`)"
         );
     }
 
     #[test]
-    fn steering_falls_back_when_unset_or_disabled() {
+    fn steering_falls_back_when_unset_or_not_installed() {
         let t = task("   ", &[], &[]);
         assert!(hypothesis_line(&t).contains("form your own"));
         assert!(targets_block(&t).contains("locate the relevant code"));
-        assert!(skills_line(&t, true).contains("use judgment"));
-        let t = task("x", &[], &["sharp-edges"]);
-        let line = skills_line(&t, false);
-        assert!(line.contains("disabled") && !line.contains("sharp-edges"));
+        assert!(skills_line(&t, &[skill("unsafe-audit")]).contains("none suggested"));
+        let t = task("x", &[], &["made-up"]);
+        assert!(skills_line(&t, &[skill("unsafe-audit")]).contains("none suggested"));
+        let t = task("x", &[], &["unsafe-audit"]);
+        let line = skills_line(&t, &[]);
+        assert!(line.contains("none installed") && !line.contains("unsafe-audit"));
     }
 
     #[test]
@@ -764,7 +790,7 @@ mod tests {
             target_dir: "/t".into(),
             architecture: String::new(),
             poc: PocText::new(false),
-            use_skills: false,
+            skills: Vec::new(),
             suffix: String::new(),
             filed: Vec::new(),
             ruled_out: Vec::new(),
@@ -783,7 +809,7 @@ mod tests {
             target_dir: "/t".into(),
             architecture: String::new(),
             poc: PocText::new(false),
-            use_skills: false,
+            skills: Vec::new(),
             suffix: String::new(),
             filed: Vec::new(),
             ruled_out: Vec::new(),
@@ -801,13 +827,13 @@ mod tests {
             target_dir: "/t".into(),
             architecture: "RECON REPORT".into(),
             poc: PocText::new(true),
-            use_skills: true,
+            skills: vec![skill("unsafe-audit")],
             suffix: String::new(),
             filed: vec![filed("Dust overflow", "a.go:1")],
             ruled_out: Vec::new(),
         };
         let a = p.render(
-            &task("overflow", &["a.go:1"], &["sharp-edges"]),
+            &task("overflow", &["a.go:1"], &["unsafe-audit"]),
             Path::new("/s1"),
         );
         let b = p.render(&task("dust overflow", &["b.go:2"], &[]), Path::new("/s2"));
