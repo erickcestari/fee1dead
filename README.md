@@ -4,7 +4,8 @@ fee1dead is a vulnerability discovery harness. It drives AI coding CLIs
 (Claude Code, opencode, or any CLI described in config) through a staged
 pipeline, runs many narrow agent tasks in parallel, and turns their output into
 schema-validated findings. The orchestrator schedules agents and never hunts
-bugs itself.
+bugs itself. It is based on Cloudflare's
+[Build your own vulnerability harness](https://blog.cloudflare.com/build-your-own-vulnerability-harness/).
 
 ## Run
 
