@@ -68,12 +68,12 @@ ARG HOST_UID=1000
 ARG HOST_GID=1000
 RUN groupadd -o -g ${HOST_GID} agent && \
     useradd -o -u ${HOST_UID} -g ${HOST_GID} --create-home --shell /bin/bash agent && \
-    mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build && \
+    mkdir -p /home/agent/go/pkg/mod /home/agent/.cache/go-build /home/agent/.claude && \
     chown -R agent:agent /home/agent
 
-# Installs rtk's Bash rewrite hook into the agent's Claude Code config.
-RUN gosu agent env HOME=/home/agent rtk init -g --auto-patch && \
-    chown -R agent:agent /home/agent/.claude
+# Installs rtk's Bash rewrite hook into the agent's Claude Code config; rtk
+# does not create ~/.claude itself.
+RUN gosu agent env HOME=/home/agent rtk init -g --auto-patch
 
 COPY --from=builder /usr/local/bin/fee1dead /usr/local/bin/fee1dead
 COPY config /opt/fee1dead/config
