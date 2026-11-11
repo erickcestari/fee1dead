@@ -32,14 +32,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Many skills invoke `uv run`.
 RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
-ARG CLAUDE_CODE_VERSION=2.1.280
+ARG CLAUDE_CODE_VERSION=latest
+ADD https://registry.npmjs.org/@anthropic-ai/claude-code/latest /tmp/claude-code-latest.json
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 ARG OPENCODE_VERSION=1.18.11
 RUN npm install -g opencode-ai@${OPENCODE_VERSION}
 
 # rtk compresses dev-command output to cut agent tokens; wired in below.
-ARG RTK_VERSION=v0.43.0
+ARG RTK_VERSION=v1.2.0
 RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh \
       | env RTK_INSTALL_DIR=/usr/local/bin RTK_VERSION=${RTK_VERSION} sh
 
