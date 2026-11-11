@@ -25,9 +25,12 @@ defect, if real, lives there, then widen within scope. Hunt, don't re-orient. Th
 hypothesis is a lead: confirm or disprove it from the code and report what you
 actually found.
 
-{precedents}{poc_intro}Invoke the suggested skills when they fit; otherwise
-analyze manually. For a `spec-compliance` task, check the code against
-the cited spec clause and report where it deviates.
+{precedents}{poc_intro}Before hunting, read each suggested skill's `SKILL.md`
+and any reference it points to for this task's attack class and scope, then
+apply its checks to the code in scope. Do this even if this session read the
+skill before: recon read it to plan, not to check this code. With no skill
+suggested, analyze manually. For a `spec-compliance` task, check the code
+against the cited spec clause and report where it deviates.
 
 Batch independent tool calls (reads, greps) into one response instead of one per
 turn. You run unattended and nobody can answer questions, so end your turn only
@@ -100,6 +103,7 @@ with the final JSON.
 
 ```
 Hunt progress:
+- [ ] Read the suggested skills' guidance for this attack class and scope
 - [ ] Read the targets, trace untrusted input to the sink, then follow the
       impact to the asset's final owner
 - [ ] Read the sibling paths to the same effect and try the edge inputs

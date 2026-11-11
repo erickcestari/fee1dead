@@ -224,8 +224,10 @@ container.
 
 Recon sees each skill's name and description and suggests up to two per task.
 A hunter is pointed at the suggested skills that are installed, by `SKILL.md`
-path. A reviewer follows a false-positive check skill when one is installed.
-Without skills, agents are told to use none.
+path, and reads their guidance for its task before hunting. A gapfill task
+keeps the skills of the task whose hunter raised the gap. A reviewer follows a
+false-positive check skill when one is installed. Without skills, agents are
+told to use none.
 
 The prompts were tuned with these from
 [Trail of Bits](https://github.com/trailofbits/skills): `audit-context-building`,
