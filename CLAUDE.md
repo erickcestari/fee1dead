@@ -79,7 +79,8 @@ schema-validated findings. See `README.md` for the user-facing overview.
 - `prompts/`, `schema/finding.schema.json` — embedded into the binary via
   `include_str!`; editing them changes the build.
 - Skills are routed per task, not per stage: recon emits `suggested_skills` on
-  each `Task`, and `hunt.rs` names the installed ones in the hunter prompt.
+  each `Task`, gapfill copies them from the task that raised the gap, and
+  `hunt.rs` names the installed ones in the hunter prompt.
   Skills reach the agent through prompt text, not a CLI flag.
 - Skills are the operator's, never vendored: `pipeline/skills.rs` finds each
   `<name>/SKILL.md` in `run.skills_dir` once per run, and recon and validate are

@@ -32,7 +32,18 @@ fn plan_gapfill(queue: &[Task], gaps: Vec<GapMarker>) -> Vec<Task> {
         if queue.iter().chain(&new_tasks).any(|t| t.covers(&gap)) {
             continue;
         }
-        new_tasks.push(gap.to_task(format!("G-{next:04}"), TaskOrigin::Gapfill));
+        // Only recon routes skills; a gap lies where its hunter was sent, so
+        // that task's skills carry over rather than leaving none.
+        let skills = queue
+            .iter()
+            .chain(&new_tasks)
+            .find(|t| t.id == gap.task_id)
+            .map(|t| t.suggested_skills.clone())
+            .unwrap_or_default();
+        new_tasks.push(Task {
+            suggested_skills: skills,
+            ..gap.to_task(format!("G-{next:04}"), TaskOrigin::Gapfill)
+        });
         next += 1;
     }
     new_tasks
@@ -53,7 +64,7 @@ mod tests {
 
     fn gap(area: &str, class: &str, reason: &str) -> GapMarker {
         GapMarker {
-            task_id: "T".into(),
+            task_id: "T-0001".into(),
             area: area.into(),
             attack_class: class.into(),
             reason: reason.into(),
@@ -69,6 +80,34 @@ mod tests {
         assert_eq!(plan[0].attack_class, "auth-bypass");
         assert_eq!(plan[0].origin, TaskOrigin::Gapfill);
         assert_eq!(plan[0].hypothesis, "untouched");
+    }
+
+    #[test]
+    fn a_gap_task_inherits_the_skills_of_the_task_that_raised_it() {
+        let routed = Task {
+            suggested_skills: vec!["ln-model".into()],
+            ..task("T-0001", "overflow", "src/a.rs")
+        };
+        let plan = plan_gapfill(&[routed], vec![gap("src/b.rs", "dos", "x")]);
+        assert_eq!(plan[0].suggested_skills, ["ln-model"]);
+        // Across passes too: a gap raised by a gapfill hunter.
+        let next = plan_gapfill(
+            &plan,
+            vec![GapMarker {
+                task_id: plan[0].id.clone(),
+                ..gap("src/c.rs", "race", "y")
+            }],
+        );
+        assert_eq!(next[0].suggested_skills, ["ln-model"]);
+        let orphan = GapMarker {
+            task_id: "T-9999".into(),
+            ..gap("src/d.rs", "dos", "z")
+        };
+        assert!(
+            plan_gapfill(&[], vec![orphan])[0]
+                .suggested_skills
+                .is_empty()
+        );
     }
 
     #[test]
