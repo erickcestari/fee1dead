@@ -67,6 +67,8 @@ const DISABLED_TOOLS: &[&str] = &[
 pub struct StageCtx {
     pub config: Config,
     pub artifacts: Artifacts,
+    /// This project's cross-run memory, which feedback keeps.
+    pub memory: Artifacts,
     pub scratch: ScratchRoot,
     pub runner: Arc<dyn AgentRunner>,
     /// Found once per run, so every stage names the same set.
@@ -137,9 +139,11 @@ impl Pipeline {
     pub fn with_runner(config: Config, runner: Arc<dyn AgentRunner>) -> Result<Self> {
         let skills = skills::installed(config.run.skills_dir.as_deref());
         info!(skills = skills.len(), "skills found");
+        let artifacts = Artifacts::new(&config.run.out_dir)?;
         Ok(Self {
             ctx: StageCtx {
-                artifacts: Artifacts::new(&config.run.out_dir)?,
+                memory: artifacts.memory(&config.project())?,
+                artifacts,
                 scratch: ScratchRoot::new(&config.run.scratch_root)?,
                 runner: Arc::new(RetryOnRateLimit::new(runner)),
                 config,

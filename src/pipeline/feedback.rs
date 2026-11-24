@@ -1,8 +1,9 @@
-//! Feedback stage: distil this run into memory for the next one. Seed tasks
-//! (variant hunts around real bugs, and the gaps hunters left that no
-//! follow-up hunt covered) reach the next recon as leads, deduped and capped
-//! at `feedback.max_seeds`, newest first. Claims code settled as not bugs
-//! reach the next hunters, and the audited commit the next recon's history.
+//! Feedback stage: distil this run into its project's memory for the next run
+//! of that project. Seed tasks (variant hunts around real bugs, and the gaps
+//! hunters left that no follow-up hunt covered) reach the next recon as leads,
+//! deduped and capped at `feedback.max_seeds`, newest first. Claims code
+//! settled as not bugs reach the next hunters, and the audited commit the next
+//! recon's history. Each cap holds per project.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,7 +26,7 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
         .into_iter()
         .collect();
     // Unconsumed seeds, from a `--resume` or a run whose recon never ran.
-    let existing: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
+    let existing: Vec<Task> = ctx.memory.read_jsonl(names::SEEDS)?;
 
     let by_id: HashMap<&str, &Finding> = candidates.iter().map(|f| (f.id.as_str(), f)).collect();
     let variants = validations
@@ -42,7 +43,7 @@ pub fn run(ctx: &StageCtx) -> Result<()> {
     );
 
     info!(seeds = merged.len(), "feedback updated cross-run memory");
-    ctx.artifacts.write_jsonl(names::SEEDS, &merged)?;
+    ctx.memory.write_jsonl(names::SEEDS, &merged)?;
     remember_ruled_out(ctx, &candidates, &validations)?;
     remember_audited_commit(ctx)
 }
@@ -62,13 +63,13 @@ fn remember_ruled_out(
     };
     let mut entries: Vec<RuledOut> = ctx.artifacts.read_jsonl(names::CLEARED)?;
     entries.extend(ruled_out::false_positives(candidates, validations, &head));
-    entries.extend(ctx.artifacts.read_jsonl::<RuledOut>(names::RULED_OUT)?);
+    entries.extend(ctx.memory.read_jsonl::<RuledOut>(names::RULED_OUT)?);
     let kept = ruled_out::dedupe_and_cap(
         ruled_out::holding(entries, target, &head),
         ctx.config.feedback.max_ruled_out,
     );
     info!(entries = kept.len(), "feedback updated ruled-out memory");
-    ctx.artifacts.write_jsonl(names::RULED_OUT, &kept)
+    ctx.memory.write_jsonl(names::RULED_OUT, &kept)
 }
 
 /// The commit this run audited, for the next recon to diff against.
@@ -79,7 +80,7 @@ fn remember_audited_commit(ctx: &StageCtx) -> Result<()> {
         .flatten()
         .and_then(|meta| meta.target.commit);
     match commit {
-        Some(commit) => ctx.artifacts.write_text(names::AUDITED_COMMIT, &commit),
+        Some(commit) => ctx.memory.write_text(names::AUDITED_COMMIT, &commit),
         None => Ok(()),
     }
 }

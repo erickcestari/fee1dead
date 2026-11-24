@@ -204,9 +204,11 @@ enabled = ["skip-reported"]
             session_id: None,
             render: None,
         };
+        let artifacts = Artifacts::new(dir.path().join("out")).unwrap();
         let ctx = StageCtx {
             config,
-            artifacts: Artifacts::new(dir.path().join("out")).unwrap(),
+            memory: artifacts.memory("target").unwrap(),
+            artifacts,
             scratch: ScratchRoot::new(dir.path().join("scratch")).unwrap(),
             runner: Arc::new(MockRunner::new(vec![
                 reply(Some("Unbounded allocation"), "{\"duplicate\": true}"),

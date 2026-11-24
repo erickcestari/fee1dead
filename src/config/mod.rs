@@ -6,7 +6,7 @@ mod report;
 mod stage;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -106,6 +106,10 @@ pub struct TargetConfig {
     /// Shell commands run once in the target before any stage, e.g. to warm a
     /// package cache while the network is reachable. A failure only warns.
     pub prepare: Vec<String>,
+    /// The project's name, which keys its cross-run memory. Defaults to the
+    /// basename of `repo`, else of `run.target_dir`; set it for a mounted
+    /// target, whose dir name is the same for every project.
+    pub name: Option<String>,
 }
 
 /// A spec or known-good implementation cloned into `dir` and given to the
@@ -203,6 +207,11 @@ impl Config {
             self.feedback.max_ruled_out >= 1,
             "feedback.max_ruled_out must be >= 1"
         );
+        let project = self.project();
+        ensure!(
+            is_dir_name(&project),
+            "the project name {project:?} is not a plain directory name; set [target].name"
+        );
         for (stage, model) in &self.stages.models {
             ensure!(
                 stage.runs_agent(),
@@ -219,6 +228,26 @@ impl Config {
             }
         }
         self.report.validate()
+    }
+
+    /// The name the project's cross-run memory is kept under: `[target].name`,
+    /// else the clone URL's basename, else the target dir's.
+    pub fn project(&self) -> String {
+        if let Some(name) = &self.target.name {
+            return name.clone();
+        }
+        let from_url = self.target.repo.as_deref().and_then(|repo| {
+            let trimmed = repo.trim_end_matches('/');
+            let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+            trimmed.rsplit('/').next().filter(|name| !name.is_empty())
+        });
+        match from_url {
+            Some(name) => name.to_string(),
+            None => self.run.target_dir.file_name().map_or_else(
+                || "target".to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+        }
     }
 
     pub fn default_provider(&self) -> &ProviderConfig {
@@ -240,6 +269,12 @@ impl Config {
             _ => None,
         }
     }
+}
+
+/// One normal path component, so it names a dir under `out_dir` and no other.
+fn is_dir_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 fn agent_stage_names() -> String {
@@ -409,6 +444,36 @@ enabled = ["recon", "hunt", "validate", "report"]
             cfg.target.setup.as_deref(),
             Some("apt-get install -y jq\ngo build ./...\n")
         );
+    }
+
+    #[test]
+    fn the_project_is_named_by_target_name_then_repo_then_target_dir() {
+        let project =
+            |target: &str| load(&format!("{VALID}\n[target]\n{target}\n")).map(|c| c.project());
+        assert_eq!(load(VALID).unwrap().project(), "target");
+        assert_eq!(
+            project("repo = \"https://github.com/lightningnetwork/lnd.git/\"").unwrap(),
+            "lnd"
+        );
+        assert_eq!(
+            project("repo = \"https://github.com/o/lnd\"").unwrap(),
+            "lnd"
+        );
+        assert_eq!(project("repo = \"\"").unwrap(), "target");
+        assert_eq!(
+            project("repo = \"https://github.com/o/lnd.git\"\nname = \"lnd-taproot\"").unwrap(),
+            "lnd-taproot"
+        );
+    }
+
+    #[test]
+    fn rejects_a_project_name_that_is_not_one_dir() {
+        for name in ["", ".", "..", "a/b", "/abs"] {
+            let bad = format!("{VALID}\n[target]\nname = {name:?}\n");
+            assert!(load_err(&bad).contains("[target].name"), "{name:?}");
+        }
+        let bad = format!("{VALID}\n[target]\nrepo = \"https://x/..\"\n");
+        assert!(load_err(&bad).contains("[target].name"));
     }
 
     #[test]

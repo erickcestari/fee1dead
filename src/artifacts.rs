@@ -30,12 +30,14 @@ pub mod names {
     pub const HUNTED: &str = "hunted.jsonl";
     /// Hypotheses hunters disproved this run, each with the code that did.
     pub const CLEARED: &str = "cleared.jsonl";
-    /// Cross-run feedback memory; never reset.
+    /// The cross-run memory, one dir per project; never reset.
+    pub const MEMORY: &str = "feedback";
+    /// In a project's memory: seed tasks for its next recon.
     pub const SEEDS: &str = "feedback-seeds.jsonl";
-    /// Cross-run memory of claims code settled as not bugs; never reset.
+    /// In a project's memory: claims code settled as not bugs.
     pub const RULED_OUT: &str = "ruled-out.jsonl";
-    /// The target commit the last run audited, for the next recon to diff
-    /// against; never reset.
+    /// In a project's memory: the commit its last run audited, for the next
+    /// recon to diff against.
     pub const AUDITED_COMMIT: &str = "audited-commit.txt";
     /// Recon's session id, for hunters to fork. One line of text.
     pub const RECON_SESSION: &str = "recon-session.txt";
@@ -109,11 +111,17 @@ impl Artifacts {
         Ok(files)
     }
 
+    /// The cross-run memory of `project`, a single dir name, so projects
+    /// sharing an `out_dir` neither see nor evict each other's entries.
+    pub fn memory(&self, project: &str) -> Result<Self> {
+        Self::new(self.path(names::MEMORY).join(project))
+    }
+
     pub fn exists(&self, name: &str) -> bool {
         self.path(name).exists()
     }
 
-    /// Clear the previous run's artifacts, keeping the durable feedback seeds.
+    /// Clear the previous run's artifacts, keeping the cross-run memory.
     pub fn reset_run(&self) -> Result<()> {
         for name in names::PER_RUN {
             let path = self.path(name);
@@ -293,8 +301,12 @@ mod tests {
     #[test]
     fn reset_clears_the_run_but_keeps_the_cross_run_memory() {
         let (_dir, art) = artifacts();
+        let memory = art.memory("lnd").unwrap();
         let durable = [names::SEEDS, names::RULED_OUT, names::AUDITED_COMMIT];
-        for name in durable.iter().chain(&[names::QUEUE, names::CLEARED]) {
+        for name in durable {
+            memory.write_text(name, "{}").unwrap();
+        }
+        for name in [names::QUEUE, names::CLEARED] {
             art.write_text(name, "{}").unwrap();
         }
         std::fs::create_dir_all(art.log_path("x").parent().unwrap()).unwrap();
@@ -302,7 +314,21 @@ mod tests {
         assert!(!art.exists(names::QUEUE));
         assert!(!art.exists(names::CLEARED));
         assert!(!art.exists(names::LOGS));
-        assert!(durable.iter().all(|name| art.exists(name)));
+        assert!(durable.iter().all(|name| memory.exists(name)));
+    }
+
+    #[test]
+    fn each_project_keeps_its_own_memory() {
+        let (_dir, art) = artifacts();
+        let (lnd, cln) = (art.memory("lnd").unwrap(), art.memory("lightning").unwrap());
+        lnd.write_text(names::AUDITED_COMMIT, "abc").unwrap();
+        assert_eq!(lnd.read_line(names::AUDITED_COMMIT).as_deref(), Some("abc"));
+        assert_eq!(cln.read_line(names::AUDITED_COMMIT), None);
+        assert!(
+            art.path("feedback/lnd")
+                .join(names::AUDITED_COMMIT)
+                .exists()
+        );
     }
 
     #[test]

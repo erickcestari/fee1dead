@@ -39,8 +39,9 @@ schema-validated findings. See `README.md` for the user-facing overview.
   `prompt.rs` holds the prompt fragments several stages append.
   `wishlist.rs` owns the wish hunters and reviewers emit for what the sandbox
   lacks (`wishlist.jsonl`), the agents' channel back to the operator.
-  `feedback.rs` is a cross-run memory (no consumer repos): it writes durable
-  seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
+  `feedback.rs` is a cross-run memory (no consumer repos), kept per project in
+  `feedback/<project>/` (`StageCtx::memory`, keyed by `Config::project`): it
+  writes durable seed tasks to `feedback-seeds.jsonl`, which the next run's recon reads as
   leads (and consumes); it also keeps `ruled-out.jsonl` (`ruled_out.rs`:
   claims code settled, shown to hunters until the settling file changes) and
   `audited-commit.txt`, where the next recon's history starts. `critic.rs` is
@@ -93,9 +94,9 @@ schema-validated findings. See `README.md` for the user-facing overview.
   ids in `hunted.jsonl`. Never truncate `candidates.jsonl`/`gaps.jsonl` from a
   stage that can run more than once.
 - A recon-led run resets per-run artifacts (`artifacts::names::PER_RUN`) at
-  startup; `feedback-seeds.jsonl`, `ruled-out.jsonl`, and `audited-commit.txt`
-  are deliberately excluded so the cross-run memory persists. If you add a
-  durable artifact, keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
+  startup; the cross-run memory lives in `feedback/<project>/`, outside it, so
+  it persists. If you add a durable artifact, write it through `ctx.memory`
+  and keep it out of `PER_RUN`. `run --resume` skips recon and resets nothing.
 - Every agent gets its own `output_dir` (a scratch dir) for its answer file;
   never share one between agents, or one can read another's answer.
 - The container is the security boundary. The agent runs

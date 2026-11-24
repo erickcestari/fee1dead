@@ -256,7 +256,7 @@ fn ruled_out_claims(ctx: &StageCtx, head: Option<&str>) -> Result<Vec<Precedent>
     let Some(head) = head else {
         return Ok(Vec::new());
     };
-    let entries: Vec<RuledOut> = ctx.artifacts.read_jsonl(names::RULED_OUT)?;
+    let entries: Vec<RuledOut> = ctx.memory.read_jsonl(names::RULED_OUT)?;
     let holding = ruled_out::holding(entries, &ctx.config.run.target_dir, head);
     Ok(holding.iter().map(Precedent::ruled_out).collect())
 }

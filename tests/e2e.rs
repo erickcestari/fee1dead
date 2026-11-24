@@ -147,6 +147,12 @@ async fn run_with(cfg: Config, runner: Arc<dyn AgentRunner>) -> anyhow::Result<(
     Pipeline::with_runner(cfg, runner).unwrap().run().await
 }
 
+/// The cross-run memory of the project `setup` configures, named after its
+/// target dir.
+fn memory(out: &Path) -> PathBuf {
+    out.join("feedback/target")
+}
+
 fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -208,16 +214,26 @@ async fn full_pipeline_reports_one_finding() {
     assert!(payloads[0].get("commit").is_none());
 }
 
-/// Run 1 writes seeds; run 2's recon sees them as leads and consumes them.
+/// Run 1 writes seeds; another project's recon sees none of them; the same
+/// project's next recon sees them as leads and consumes them.
 #[tokio::test]
 async fn feedback_seeds_reach_the_next_recon_as_leads() {
     let tmp = tempfile::tempdir().unwrap();
     let (cfg, out) = setup(tmp.path(), r#""recon", "hunt", "validate", "feedback""#);
+    let seeds_path = memory(&out).join("feedback-seeds.jsonl");
     run_with(cfg, Arc::new(MockRunner::new(replies())))
         .await
         .unwrap();
-    let seeds: Vec<Task> = read_jsonl(&out.join("feedback-seeds.jsonl"));
+    let seeds: Vec<Task> = read_jsonl(&seeds_path);
     assert_eq!(seeds.len(), 2, "expected one variant seed + one gap seed");
+
+    let (mut cfg, _) = setup(tmp.path(), r#""recon""#);
+    cfg.target.name = Some("other".into());
+    let runner = Arc::new(MockRunner::new(replies()));
+    run_with(cfg, runner.clone()).await.unwrap();
+    assert!(!runner.seen.lock().unwrap()[0].contains("src/parse.rs error path"));
+    let kept: Vec<Task> = read_jsonl(&seeds_path);
+    assert_eq!(kept.len(), 2, "another project leaves the seeds alone");
 
     let (cfg, _) = setup(tmp.path(), r#""recon""#);
     let runner = Arc::new(MockRunner::new(replies()));
@@ -232,7 +248,7 @@ async fn feedback_seeds_reach_the_next_recon_as_leads() {
     assert!(recon_prompt.contains("variant"), "variant seed missing");
     let queue: Vec<Task> = read_jsonl(&out.join("queue.jsonl"));
     assert_eq!(queue.len(), 1, "only recon's own tasks are queued");
-    let left: Vec<Task> = read_jsonl(&out.join("feedback-seeds.jsonl"));
+    let left: Vec<Task> = read_jsonl(&seeds_path);
     assert!(left.is_empty(), "recon consumes the seeds it was shown");
 }
 
@@ -457,7 +473,7 @@ async fn a_failed_stage_does_not_stop_the_rest() {
         .unwrap_err();
     assert!(err.to_string().contains("validate"), "got: {err}");
     // Feedback still recorded the hunter's gap for the next run.
-    let seeds: Vec<Value> = read_jsonl(&out.join("feedback-seeds.jsonl"));
+    let seeds: Vec<Value> = read_jsonl(&memory(&out).join("feedback-seeds.jsonl"));
     assert_eq!(seeds.len(), 1);
 }
 
@@ -717,11 +733,11 @@ async fn cleared_claims_and_the_audited_commit_reach_the_next_run() {
     run_with(cfg, Arc::new(MockRunner::new(replies.clone())))
         .await
         .unwrap();
-    let ruled_out: Vec<Value> = read_jsonl(&out.join("ruled-out.jsonl"));
+    let ruled_out: Vec<Value> = read_jsonl(&memory(&out).join("ruled-out.jsonl"));
     assert_eq!(ruled_out.len(), 1);
     assert_eq!(ruled_out[0]["commit"], audited);
     assert_eq!(
-        std::fs::read_to_string(out.join("audited-commit.txt"))
+        std::fs::read_to_string(memory(&out).join("audited-commit.txt"))
             .unwrap()
             .trim(),
         audited

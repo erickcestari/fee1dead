@@ -5,8 +5,6 @@
 //! each must pass recon's admission bar. Recon then consumes the seed file.
 //! The harness appends `run.wildcard_tasks` wildcard tasks to the queue.
 
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -67,9 +65,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     let target = &cfg.run.target_dir;
     let files = loc::files(target);
     let loc = loc::total(&files);
-    let seeds: Vec<Task> = ctx.artifacts.read_jsonl(names::SEEDS)?;
+    let seeds: Vec<Task> = ctx.memory.read_jsonl(names::SEEDS)?;
     let audited = ctx
-        .artifacts
+        .memory
         .read_line(names::AUDITED_COMMIT)
         .filter(|commit| has_commit(target, commit));
     let (since, last_audit) = history_range(audited.as_deref(), &target.to_string_lossy());
@@ -80,7 +78,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         .unwrap_or_default();
     let prompt = PROMPT
         .replace("$REPO_PATH", &target.to_string_lossy())
-        .replace("$REPO_NAME", &repo_name(cfg.target.repo.as_deref(), target))
+        .replace("$REPO_NAME", &cfg.project())
         .replace("$REPO_SIZE", size_tier(loc))
         .replace("$LOC", &loc.to_string())
         .replace("$SPEC_PATH", &spec_path)
@@ -122,7 +120,7 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     );
     tasks.extend(wildcards);
     ctx.artifacts.write_jsonl(names::QUEUE, &tasks)?;
-    ctx.artifacts.write_jsonl::<Task>(names::SEEDS, &[])?;
+    ctx.memory.write_jsonl::<Task>(names::SEEDS, &[])?;
     Ok(())
 }
 
@@ -201,22 +199,6 @@ fn leads_block(seeds: &[Task]) -> String {
          They are hypotheses, not findings, and the code may have changed since.\n{}\n</leads>\n",
         lines.join("\n")
     )
-}
-
-/// The clone URL's basename when a repo is configured, else the dir's name.
-fn repo_name(repo: Option<&str>, target_dir: &Path) -> String {
-    let from_url = repo.and_then(|repo| {
-        let trimmed = repo.trim_end_matches('/');
-        let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-        trimmed.rsplit('/').next().filter(|name| !name.is_empty())
-    });
-    match from_url {
-        Some(name) => name.to_string(),
-        None => target_dir.file_name().map_or_else(
-            || "target".to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -307,14 +289,5 @@ mod tests {
             "- panic-dos: src/net.rs:decode; hypothesis: truncated frames not traced; \
              targets: src/net.rs:decode\n</leads>"
         ));
-    }
-
-    #[test]
-    fn repo_name_prefers_the_clone_url() {
-        let dir = Path::new("/work/target");
-        assert_eq!(repo_name(Some("https://github.com/o/lnd.git/"), dir), "lnd");
-        assert_eq!(repo_name(Some("https://github.com/o/lnd"), dir), "lnd");
-        assert_eq!(repo_name(None, dir), "target");
-        assert_eq!(repo_name(Some(""), Path::new("/")), "target");
     }
 }

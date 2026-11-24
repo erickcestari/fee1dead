@@ -109,7 +109,13 @@ their cost and token usage per stage under `summary.cost`.
 
 ### Cross-run memory
 
-Feedback writes three files that survive the next run's reset:
+Feedback writes three files to `feedback/<project>/` in `out_dir`. They
+survive the next run's reset, and only a run of the same project reads them,
+so one `out_dir` can serve several projects, each within the
+`[feedback]` caps. The project is `[target].name`, else the basename of
+`[target].repo` (`https://github.com/lightningnetwork/lnd.git` is `lnd`), else
+of `run.target_dir`. Set `name` for a mounted target, since every mount
+lands at `/work/target`.
 
 | File | Read by | Holds |
 |------|---------|-------|
@@ -179,6 +185,7 @@ For opencode:
 [target]
 repo    = "https://github.com/org/name.git"   # clone instead of mounting
 ref     = "main"
+name    = "name"                               # keys the cross-run memory; defaults to repo's basename
 prepare = ["go mod download"]
 setup   = '''
 apt-get update && apt-get install -y --no-install-recommends protobuf-compiler

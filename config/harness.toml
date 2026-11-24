@@ -29,6 +29,9 @@ wildcard_tasks = 1
 # [target]
 # repo = "https://github.com/org/name.git"
 # ref  = "main"
+# Keys the cross-run memory (out_dir/feedback/<name>). Defaults to repo's
+# basename, else target_dir's; set it for a mounted target.
+# name = "name"
 # Run in target_dir before any stage, behind the firewall. A failure warns.
 # prepare = ["go mod download"]
 # Bash script run as root before the firewall, with open egress. A failing
